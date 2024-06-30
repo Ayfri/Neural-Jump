@@ -1,0 +1,21 @@
+### PyCharm configuration
+
+.idea
+
+### Python compiled files
+
+__pycache__/
+*.pyc
+
+### Python environment
+
+.venv/
+venv/
+
+### Jupyter Notebook
+
+.ipynb_checkpoints/
+
+### Environment variables
+
+.env
