@@ -19,3 +19,7 @@ venv/
 ### Environment variables
 
 .env
+
+### Weights
+
+weights/
