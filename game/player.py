@@ -150,6 +150,10 @@ class Player(Sprite):
 				x = (self.rect.x // TILE_SIZE) + dx
 				y = (self.rect.y // TILE_SIZE) + dy
 				if 0 <= x < self.level.width and 0 <= y < self.level.height:
+					# check if not index out of range
+					if y >= len(self.level.tile_map) or x >= len(self.level.tile_map[y]):
+						row += [{}]
+						continue
 					tile = self.level.tile_map[y][x]
 					row += [tile]
 				else:

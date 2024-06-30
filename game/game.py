@@ -1,7 +1,9 @@
+from functools import cache
 from pprint import pprint
 
 import pygame
 from pygame import Surface
+from pygame.font import Font
 from pygame.sprite import Group
 from pygame.time import Clock
 
@@ -24,11 +26,15 @@ class Game:
 		self.screen: Surface | None = None
 		self.running = False
 		self.display_window = display_window
+		self.additional_draws = list[tuple[Surface, tuple[int, int]]]()
 
-	def handle_inputs(self) -> None:
+	def handle_inputs(self, movement: bool = True) -> None:
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				pygame.quit()
+
+			if not movement:
+				continue
 			if event.type == pygame.KEYDOWN:
 				if event.key == pygame.K_LEFT:
 					self.player.go_left()
@@ -46,8 +52,17 @@ class Game:
 			if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
 				self.level.restart()
 
+	@cache
+	def _get_font(self, font_size: int) -> Font:
+		return pygame.font.SysFont('Arial', font_size)
+
+	def draw_text(self, text: str, x: int, y: int, font_size: int = 20, color: tuple[int, int, int] = (0, 0, 0)) -> None:
+		font = self._get_font(font_size)
+		text_surface = font.render(text, True, color)
+		self.additional_draws += [(text_surface, (x, y))]
+
 	def init_window(self) -> None:
-		self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+		self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), vsync=True)
 		pygame.display.set_caption("Mario-Like")
 
 	def start(self) -> None:
@@ -70,6 +85,9 @@ class Game:
 	def draw(self) -> None:
 		self.level.draw(self.screen)
 		self.active_sprite_list.draw(self.screen)
+		for surface, destination in self.additional_draws.copy():
+			self.screen.blit(surface, destination)
+		self.additional_draws = []
 		pygame.display.flip()
 
 	def tick(self) -> None:

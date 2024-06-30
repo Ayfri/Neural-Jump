@@ -15,7 +15,7 @@ def _search_maps_folder(folder: str) -> str:
 	Returns the absolute path to the maps folder.
 	Search into the folder of the current script, then goes into parent folder until root folder.
 	"""
-	current_folder = os.path.dirname(os.path.abspath(__file__))
+	current_folder: str = os.path.dirname(os.path.abspath(__file__))
 	while current_folder != '/':
 		if folder in os.listdir(current_folder):
 			return os.path.join(current_folder, folder)
