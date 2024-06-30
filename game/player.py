@@ -1,5 +1,3 @@
-# player.py
-
 import pygame
 from pygame.sprite import Sprite
 
@@ -16,6 +14,7 @@ from game.settings import (
 	SHIFT_THRESHOLD_X,
 	SHIFT_THRESHOLD_Y
 )
+from game.tiles import Tile
 
 
 class Player(Sprite):
@@ -91,7 +90,7 @@ class Player(Sprite):
 			self.change_y = 0
 			self.rect.y = SCREEN_HEIGHT - self.rect.height
 
-	def jump(self):
+	def jump(self) -> None:
 		self.rect.y += 2
 		platform_hit_list = pygame.sprite.spritecollide(self, self.level.solid_platforms, False)
 		self.rect.y -= 2
@@ -107,3 +106,32 @@ class Player(Sprite):
 
 	def stop(self) -> None:
 		self.change_x = 0
+
+	def get_surrounding_grid(self) -> list[list[Tile]]:
+		grid: list[list[Tile]] = []
+		for dy in range(-3, 4):
+			row: list[Tile] = []
+			for dx in range(-3, 4):
+				x = (self.rect.x // TILE_SIZE) + dx
+				y = (self.rect.y // TILE_SIZE) + dy
+				if 0 <= x < self.level.width and 0 <= y < self.level.height:
+					tile = self.level.tile_map[y][x]
+					row += [tile]
+				else:
+					row += [{}]
+			grid += [row]
+		return grid
+
+	def execute_move(self, direction: int):
+		"""
+		Exécute le mouvement basé sur la direction fournie par l'agent.
+		:param direction: Direction du mouvement (0: haut, 1: bas, 2: gauche, 3: droite)
+		"""
+		if direction == 0:  # Haut
+			self.jump()
+		elif direction == 1:  # Bas
+			self.change_y += 1  # Pas de mouvement spécifique vers le bas
+		elif direction == 2:  # Gauche
+			self.go_left()
+		elif direction == 3:  # Droite
+			self.go_right()

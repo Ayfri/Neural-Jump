@@ -1,12 +1,11 @@
 import os
 
-import pygame
 from pygame import Surface
 from pygame.sprite import Group
 
 from game.platform import Platform
 from game.settings import SCREEN_HEIGHT, TILE_SIZE, WHITE
-from game.tiles import TILES
+from game.tiles import Tile, TILES
 
 
 def _search_maps_folder(folder: str) -> str:
@@ -28,6 +27,9 @@ class Level:
 		self.player = player
 		self.world_shift = (0, 0)
 		self.map: str | None = None
+		self.width = 0
+		self.height = 0
+		self.tile_map: list[list[Tile]] = []
 		player.level = self
 
 	@property
@@ -52,19 +54,25 @@ class Level:
 			lines = file.readlines()
 
 		self.map = map_path
+		self.width = len(lines[0].strip())
+		self.height = len(lines)
 
 		offset_y = SCREEN_HEIGHT - (len(lines) * TILE_SIZE)
 
 		for y, line in enumerate(lines):
+			row: list[Tile] = []
 			for x, char in enumerate(line.strip()):
 				if char in TILES:
 					tile_data = TILES[char]
+					row += [tile_data]
 					if tile_data.get('is_player', False):
 						self.player.rect.x = x * TILE_SIZE
 						self.player.rect.y = y * TILE_SIZE + offset_y
 					else:
 						block = Platform(x * TILE_SIZE, y * TILE_SIZE + offset_y, tile_data)
 						self.platform_list.add(block)
+
+			self.tile_map += [row]
 
 	def shift_world(self, shift_x: int, shift_y: int) -> None:
 		self.world_shift += (shift_x, shift_y)
