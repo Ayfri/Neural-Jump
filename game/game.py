@@ -63,7 +63,7 @@ class Game:
 
 	def init_window(self) -> None:
 		self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), vsync=True)
-		pygame.display.set_caption("Mario-Like")
+		pygame.display.set_caption("Neural-Jump")
 
 	def start(self) -> None:
 		pygame.init()
