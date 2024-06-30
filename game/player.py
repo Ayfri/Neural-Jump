@@ -2,8 +2,9 @@ import pygame
 from pygame.sprite import Sprite
 
 from game.level import Level
+from game.platform import Platform
 from game.settings import (
-	PLAYER_WIDTH,
+	PLAYER_SPEED, PLAYER_WIDTH,
 	PLAYER_HEIGHT,
 	PLAYER_COLOR,
 	PLAYER_GRAVITY,
@@ -30,31 +31,50 @@ class Player(Sprite):
 		self.change_x = 0
 		self.change_y = 0
 		self.dead = False
+		self.finished_reward: int | None = None
 
 	def update(self) -> None:
-		if self.dead:
+		if self.dead or self.level.finished:
 			return
 
 		self.calc_grav()
 		self.rect.x += self.change_x
 
 		# Check for horizontal collisions
-		block_hit_list = pygame.sprite.spritecollide(self, self.level.solid_platforms, False)
+		block_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
 		for block in block_hit_list:
-			if self.change_x > 0:
-				self.rect.right = block.rect.left
-			elif self.change_x < 0:
-				self.rect.left = block.rect.right
+			if isinstance(block, Platform):
+				if block.tile_data.get('reward', False):
+					self.finished_reward = block.tile_data['reward']
+					self.level.finished = True
+					break
+
+				if not block.tile_data.get('is_solid', False):
+					continue
+
+				if self.change_x > 0:
+					self.rect.right = block.rect.left
+				elif self.change_x < 0:
+					self.rect.left = block.rect.right
 
 		self.rect.y += self.change_y
 
 		# Check for vertical collisions
-		block_hit_list = pygame.sprite.spritecollide(self, self.level.solid_platforms, False)
+		block_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
 		for block in block_hit_list:
-			if self.change_y > 0:
-				self.rect.bottom = block.rect.top
-			elif self.change_y < 0:
-				self.rect.top = block.rect.bottom
+			if isinstance(block, Platform):
+				if block.tile_data.get('reward', False):
+					self.finished_reward = block.tile_data['reward']
+					self.level.finished = True
+					break
+
+				if not block.tile_data.get('is_solid', False):
+					continue
+
+				if self.change_y > 0:
+					self.rect.bottom = block.rect.top
+				elif self.change_y < 0:
+					self.rect.top = block.rect.bottom
 
 			self.change_y = 0
 
@@ -101,17 +121,17 @@ class Player(Sprite):
 
 	def jump(self) -> None:
 		self.rect.y += 2
-		platform_hit_list = pygame.sprite.spritecollide(self, self.level.solid_platforms, False)
+		platform_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
 		self.rect.y -= 2
 
 		if len(platform_hit_list) > 0 or self.rect.bottom >= SCREEN_HEIGHT:
 			self.change_y = PLAYER_JUMP_STRENGTH
 
 	def go_left(self) -> None:
-		self.change_x = -6
+		self.change_x = -PLAYER_SPEED
 
 	def go_right(self) -> None:
-		self.change_x = 6
+		self.change_x = PLAYER_SPEED
 
 	def stop(self) -> None:
 		self.change_x = 0
@@ -119,6 +139,8 @@ class Player(Sprite):
 	def revive(self) -> None:
 		self.dead = False
 		self.image.set_alpha(255)
+		self.change_x = 0
+		self.change_y = 0
 
 	def get_surrounding_grid(self) -> list[list[Tile]]:
 		grid: list[list[Tile]] = []

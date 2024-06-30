@@ -1,4 +1,6 @@
 import os
+from functools import cached_property
+from time import sleep
 
 from pygame import Surface
 from pygame.sprite import Group
@@ -30,15 +32,12 @@ class Level:
 		self.width = 0
 		self.height = 0
 		self.tile_map: list[list[Tile]] = []
+		self.finished = False
 		player.level = self
 
 	@property
 	def platforms(self) -> list[Platform]:
 		return self.platform_list.sprites()
-
-	@property
-	def solid_platforms(self) -> Group:
-		return Group(platform for platform in self.platforms if platform.tile_data.get('is_solid', False))
 
 	def update(self) -> None:
 		self.platform_list.update()
@@ -76,7 +75,7 @@ class Level:
 
 	def shift_world(self, shift_x: int, shift_y: int) -> None:
 		self.world_shift = (self.world_shift[0] + shift_x, self.world_shift[1] + shift_y)
-		for platform in self.platform_list:
+		for platform in self.platforms:
 			platform.shift(shift_x, shift_y)
 
 	def restart(self) -> None:
@@ -84,5 +83,6 @@ class Level:
 			return
 		self.platform_list.empty()
 		self.load_map(self.map)
+		self.finished = False
 		self.world_shift = (0, 0)
 		self.player.revive()

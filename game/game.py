@@ -1,3 +1,5 @@
+from pprint import pprint
+
 import pygame
 from pygame import Surface
 from pygame.sprite import Group
