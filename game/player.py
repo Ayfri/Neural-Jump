@@ -29,8 +29,12 @@ class Player(Sprite):
 		self.rect.y = y
 		self.change_x = 0
 		self.change_y = 0
+		self.dead = False
 
 	def update(self) -> None:
+		if self.dead:
+			return
+
 		self.calc_grav()
 		self.rect.x += self.change_x
 
@@ -80,6 +84,11 @@ class Player(Sprite):
 			self.rect.bottom = SCREEN_HEIGHT - SHIFT_THRESHOLD_Y
 			self.level.shift_world(0, -diff)
 
+		# check if player is below the screen
+		if self.level.world_shift[1] < -SCREEN_HEIGHT / 2:
+			self.dead = True
+			self.image.set_alpha(64)
+
 	def calc_grav(self) -> None:
 		if self.change_y == 0:
 			self.change_y = 1
@@ -106,6 +115,10 @@ class Player(Sprite):
 
 	def stop(self) -> None:
 		self.change_x = 0
+
+	def revive(self) -> None:
+		self.dead = False
+		self.image.set_alpha(255)
 
 	def get_surrounding_grid(self) -> list[list[Tile]]:
 		grid: list[list[Tile]] = []

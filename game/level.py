@@ -75,7 +75,7 @@ class Level:
 			self.tile_map += [row]
 
 	def shift_world(self, shift_x: int, shift_y: int) -> None:
-		self.world_shift += (shift_x, shift_y)
+		self.world_shift = (self.world_shift[0] + shift_x, self.world_shift[1] + shift_y)
 		for platform in self.platform_list:
 			platform.shift(shift_x, shift_y)
 
@@ -84,3 +84,5 @@ class Level:
 			return
 		self.platform_list.empty()
 		self.load_map(self.map)
+		self.world_shift = (0, 0)
+		self.player.revive()

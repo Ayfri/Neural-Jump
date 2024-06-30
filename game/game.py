@@ -14,6 +14,7 @@ class Game:
 		self.level = Level(self.player)
 		self.level.load_map('maps/level_1.txt')
 		self.player.level = self.level
+		self.player.revive()
 		self.tick_rate = tick_rate
 		self.active_sprite_list = Group()
 		self.active_sprite_list.add(self.player)
