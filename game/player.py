@@ -15,7 +15,7 @@ from game.settings import (
 	SHIFT_THRESHOLD_X,
 	SHIFT_THRESHOLD_Y
 )
-from game.tiles import Tile
+from game.tiles import Tile, TILES
 
 
 class Player(Sprite):
@@ -79,13 +79,12 @@ class Player(Sprite):
 			self.change_y = 0
 
 		# Horizontal shift
-		if self.rect.right >= SCREEN_WIDTH - SHIFT_THRESHOLD_X:
+		if self.rect.right > SCREEN_WIDTH - SHIFT_THRESHOLD_X:
 			diff = self.rect.right - (SCREEN_WIDTH - SHIFT_THRESHOLD_X)
-			self.rect.right = SCREEN_WIDTH - SHIFT_THRESHOLD_X
-			self.level.shift_world(-diff, 0)
+			if diff > 1:
+				self.rect.right = SCREEN_WIDTH - SHIFT_THRESHOLD_X
+				self.level.shift_world(round(-diff), 0)
 		elif self.rect.left <= SHIFT_THRESHOLD_X:
-			# 	self.rect.left = SHIFT_THRESHOLD_X
-
 			diff = SHIFT_THRESHOLD_X - self.rect.left
 			# if level is at the left edge of the screen, do not shift
 			if self.level.world_shift[0] > 0:
@@ -147,15 +146,17 @@ class Player(Sprite):
 		for dy in range(-3, 4):
 			row: list[Tile] = []
 			for dx in range(-3, 4):
-				x = (self.rect.x // TILE_SIZE) + dx
-				y = (self.rect.y // TILE_SIZE) + dy
+				x = ((self.rect.centerx - self.level.world_shift[0]) // TILE_SIZE) + dx
+				y = ((self.rect.centery - self.level.world_shift[1]) // TILE_SIZE) + dy
 				if 0 <= x < self.level.width and 0 <= y < self.level.height:
 					# check if not index out of range
 					if y >= len(self.level.tile_map) or x >= len(self.level.tile_map[y]):
 						row += [{}]
 						continue
-					tile = self.level.tile_map[y][x]
-					row += [tile]
+
+					tile = self.level.tile_map[round(y)][round(x)]
+					tile_data = TILES[tile]
+					row += [tile_data]
 				else:
 					row += [{}]
 			grid += [row]
@@ -168,9 +169,7 @@ class Player(Sprite):
 		"""
 		if direction == 0:  # Haut
 			self.jump()
-		elif direction == 1:  # Bas
-			self.change_y += 1  # Pas de mouvement spécifique vers le bas
-		elif direction == 2:  # Gauche
+		elif direction == 1:  # Gauche
 			self.go_left()
-		elif direction == 3:  # Droite
+		elif direction == 2:  # Droite
 			self.go_right()

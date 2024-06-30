@@ -1,6 +1,4 @@
 import os
-from functools import cached_property
-from time import sleep
 
 from pygame import Surface
 from pygame.sprite import Group
@@ -31,7 +29,7 @@ class Level:
 		self.map: str | None = None
 		self.width = 0
 		self.height = 0
-		self.tile_map: list[list[Tile]] = []
+		self.tile_map: list[list[str]] = []
 		self.finished = False
 		player.level = self
 
@@ -63,11 +61,12 @@ class Level:
 			for x, char in enumerate(line.strip()):
 				if char in TILES:
 					tile_data = TILES[char]
-					row += [tile_data]
+					row += [char]
 					if tile_data.get('is_player', False):
 						self.player.rect.x = x * TILE_SIZE
 						self.player.rect.y = y * TILE_SIZE + offset_y
-					else:
+					elif not tile_data.get('is_air', False):
+
 						block = Platform(x * TILE_SIZE, y * TILE_SIZE + offset_y, tile_data)
 						self.platform_list.add(block)
 
