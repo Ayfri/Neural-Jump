@@ -61,14 +61,18 @@ class Game:
 		text_surface = font.render(text, True, color)
 		self.additional_draws += [(text_surface, (x, y))]
 
-	def init_window(self) -> None:
+	def init(self) -> None:
+		if not self.display_window:
+			import os
+			os.environ["SDL_VIDEODRIVER"] = "dummy"
+
+		pygame.init()
+		pygame.font.init()
 		self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), vsync=True)
 		pygame.display.set_caption("Neural-Jump")
 
 	def start(self) -> None:
-		pygame.init()
-		if self.display_window:
-			self.init_window()
+		self.init()
 
 		self.running = True
 

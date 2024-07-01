@@ -128,10 +128,7 @@ class Agent:
 		self.playing = True
 		game = Game(display_window=self.show_window, tick_rate=self.tick_rate)
 
-		if game.display_window:
-			pygame.init()
-			pygame.font.init()
-			game.init_window()
+		game.init()
 
 		# Time limit for the game in seconds
 		time_limit = self.running_time
@@ -157,7 +154,7 @@ class Agent:
 				elapsed_time = tick / 1000
 				game.draw_text(f"Agent: {self.generation.agents.index(self) + 1}/{self.generation.population_size}, Generation: {self.generation.generation}", 10, 10, font_size=24, color=BLACK)
 
-				game.draw_text(f"FPS: {1000 / game.clock.get_time():.1f}", 10, 70, font_size=24, color=BLACK)
+				game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
 				game.draw_text(f"Time: {elapsed_time:.2f}/{time_limit}", 10, 100, font_size=24, color=BLACK)
 				game.draw_text(f"Player: X: {game.player.rect.x}, Y: {game.player.rect.y}", 10, 130, font_size=24, color=BLACK)
 				game.draw_text(f"Reward: {self.calculate_reward(game):.2f}", 10, 160, font_size=24, color=BLACK)
