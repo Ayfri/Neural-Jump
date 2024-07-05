@@ -29,7 +29,7 @@ class Generation:
 		self.mutation_rate = mutation_rate
 		self.tick_rate = 2000
 		self.show_window = True
-		self.running_time = 25  # Time in seconds to run the game
+		self.running_time = 35  # Time in seconds to run the game
 		self.generation = 1
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]
 
