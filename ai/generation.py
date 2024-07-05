@@ -18,13 +18,13 @@ class Generation:
 	def __init__(
 		self,
 		population_size: int,
-		elite_fraction: float = 0.2,
+		elite_count: int = 2,
 		mutation_rate: float = 0.01,
 		mutation_strength: float = 0.1,
 		load_latest_generation_weights: bool = False
 	) -> None:
 		self.population_size = population_size
-		self.elite_fraction = elite_fraction
+		self.elite_count = elite_count
 		self.mutation_strength = mutation_strength
 		self.mutation_rate = mutation_rate
 		self.tick_rate = 2000
@@ -42,8 +42,8 @@ class Generation:
 		"""
 		# Sort agents in descending order of reward and select the best agent
 		self.agents.sort(key=lambda agent: agent.current_reward, reverse=True)
-		num_elites = max(2, int(self.elite_fraction * self.population_size))
-		elites = self.agents[:num_elites]
+		elites = self.agents[:self.elite_count]
+		print(f"Selected {len(elites)} elites: {[agent.current_reward for agent in elites]}")
 
 		# Ensure we have at least one elite to be preserved without mutation
 		new_agents = elites[:]
