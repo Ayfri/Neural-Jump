@@ -93,7 +93,7 @@ class Player(Sprite):
 	def check_death(self) -> bool:
 		if self.rect.top >= (self.level.height - 2) * TILE_SIZE:
 			self.dead = True
-			self.image.set_alpha(64)
+			self.image.set_alpha(40)
 			return True
 
 		return False
