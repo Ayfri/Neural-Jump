@@ -5,7 +5,7 @@ import torch.nn as nn
 class NeuralNetwork(nn.Module):
 	def __init__(self) -> None:
 		super(NeuralNetwork, self).__init__()
-		self.fc1 = nn.Linear(7 * 7 * 3, 128)
+		self.fc1 = nn.Linear(7 * 7 * 2, 128)
 		self.fc2 = nn.Linear(128, 64)
 		self.fc3 = nn.Linear(64, 3)  # 3 directions: up, left, right
 

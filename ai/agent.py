@@ -37,7 +37,7 @@ class Agent:
 		:return: Direction of movement (0: up, 1: down, 2: left, 3: right)
 		"""
 		input_data = np.array(
-			[[tile.get('reward', 0), tile.get('is_solid', 0), tile.get('is_player', 0)] for row in grid for tile in row],
+			[[tile.get('reward', 0), tile.get('is_solid', 0)] for row in grid for tile in row],
 			dtype=np.float32
 		)
 		input_data = input_data.flatten()
