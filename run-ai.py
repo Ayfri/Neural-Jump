@@ -5,8 +5,8 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 
 def main() -> None:
-	generation = Generation(30,  mutation_rate=0.2, mutation_strength=0.008, load_latest_generation_weights=True)
-	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate} ---")
+	generation = Generation(30,  mutation_rate=0.06, mutation_strength=0.025, load_latest_generation_weights=True)
+	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate} - mutation strength: {generation.mutation_strength} ---")
 	while True:
 		generation.play_agents()
 		best_agent = generation.get_best_agent()
