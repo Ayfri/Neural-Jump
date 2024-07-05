@@ -31,10 +31,10 @@ TILES: dict[str, Tile] = {
 	},
 	'F': {
 		'color': AQUA,
-		'reward': 100,
+		'reward': 500,
 	},
 	'R': {
 		'color': GREEN,
-		'reward': 200,
+		'reward': 800,
 	},
 }
