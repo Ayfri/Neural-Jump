@@ -125,10 +125,11 @@ class Player(Sprite):
 		self.change_y = 0
 
 	def get_surrounding_tiles(self) -> list[list[Tile]]:
+		DISTANCE = 4
 		grid: list[list[Tile]] = []
-		for dy in range(-3, 4):
+		for dy in range(-DISTANCE, DISTANCE + 1):
 			row: list[Tile] = []
-			for dx in range(-3, 4):
+			for dx in range(-DISTANCE, DISTANCE + 1):
 				x = (self.rect.centerx // TILE_SIZE) + dx
 				y = (self.rect.centery // TILE_SIZE) + dy
 				if 0 <= x < self.level.width and 0 <= y < self.level.height:
