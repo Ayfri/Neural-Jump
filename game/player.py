@@ -4,16 +4,13 @@ from pygame.sprite import Sprite
 from game.level import Level
 from game.platform import Platform
 from game.settings import (
-	PLAYER_SPEED, PLAYER_WIDTH,
+	BLACK, PLAYER_SPEED, PLAYER_WIDTH,
 	PLAYER_HEIGHT,
 	PLAYER_COLOR,
 	PLAYER_GRAVITY,
 	PLAYER_JUMP_STRENGTH,
 	SCREEN_HEIGHT,
-	SCREEN_WIDTH,
 	TILE_SIZE,
-	SHIFT_THRESHOLD_X,
-	SHIFT_THRESHOLD_Y
 )
 from game.tiles import Tile, TILES
 
@@ -24,21 +21,26 @@ class Player(Sprite):
 	def __init__(self, x: int, y: int) -> None:
 		super().__init__()
 		self.image = pygame.Surface((PLAYER_WIDTH, PLAYER_HEIGHT))
-		self.image.fill(PLAYER_COLOR)
+		self.image.fill(BLACK)
+		self.image.fill(PLAYER_COLOR, rect=self.image.get_rect().inflate(-5, -5))
 		self.rect = self.image.get_rect()
 		self.rect.x = x
 		self.rect.y = y
 		self.change_x = 0
 		self.change_y = 0
 		self.dead = False
+		self.win = False
 		self.finished_reward: int | None = None
 
 	def update(self) -> None:
-		if self.dead or self.level.finished:
+		if self.dead or self.win:
 			return
 
 		self.calc_grav()
 		self.rect.x += self.change_x
+
+		if self.check_death():
+			return
 
 		# Check for horizontal collisions
 		block_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
@@ -46,7 +48,7 @@ class Player(Sprite):
 			if isinstance(block, Platform):
 				if block.tile_data.get('reward', False):
 					self.finished_reward = block.tile_data['reward']
-					self.level.finished = True
+					self.win = True
 					break
 
 				if not block.tile_data.get('is_solid', False):
@@ -78,47 +80,24 @@ class Player(Sprite):
 
 			self.change_y = 0
 
-		# Horizontal shift
-		if self.rect.right > SCREEN_WIDTH - SHIFT_THRESHOLD_X:
-			diff = self.rect.right - (SCREEN_WIDTH - SHIFT_THRESHOLD_X)
-			if diff > 1:
-				self.rect.right = SCREEN_WIDTH - SHIFT_THRESHOLD_X
-				self.level.shift_world(round(-diff), 0)
-		elif self.rect.left <= SHIFT_THRESHOLD_X:
-			diff = SHIFT_THRESHOLD_X - self.rect.left
-			# if level is at the left edge of the screen, do not shift
-			if self.level.world_shift[0] > 0:
-				self.rect.left = TILE_SIZE
-				self.level.shift_world(diff, 0)
-			else:
-				self.rect.left = max(0, self.rect.left)
-
-		# Vertical shift
-		if self.rect.top <= SHIFT_THRESHOLD_Y:
-			diff = SHIFT_THRESHOLD_Y - self.rect.top
-			self.rect.top = SHIFT_THRESHOLD_Y
-			self.level.shift_world(0, diff)
-		elif self.rect.bottom >= SCREEN_HEIGHT - SHIFT_THRESHOLD_Y:
-			diff = self.rect.bottom - (SCREEN_HEIGHT - SHIFT_THRESHOLD_Y)
-			self.rect.bottom = SCREEN_HEIGHT - SHIFT_THRESHOLD_Y
-			self.level.shift_world(0, -diff)
-
-		# check if player is below the screen
-		if self.level.world_shift[1] < -SCREEN_HEIGHT / 2:
-			self.dead = True
-			self.image.set_alpha(64)
-
 	def calc_grav(self) -> None:
 		if self.change_y == 0:
 			self.change_y = 1
 		else:
 			self.change_y += PLAYER_GRAVITY
 
-		if self.rect.y >= SCREEN_HEIGHT - self.rect.height and self.change_y >= 0:
-			self.change_y = 0
-			self.rect.y = SCREEN_HEIGHT - self.rect.height
+	def check_death(self) -> bool:
+		if self.rect.top >= (self.level.height - 2) * TILE_SIZE:
+			self.dead = True
+			self.image.set_alpha(64)
+			return True
+
+		return False
 
 	def jump(self) -> None:
+		if self.check_death():
+			return
+
 		self.rect.y += 2
 		platform_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
 		self.rect.y -= 2
@@ -146,8 +125,8 @@ class Player(Sprite):
 		for dy in range(-3, 4):
 			row: list[Tile] = []
 			for dx in range(-3, 4):
-				x = ((self.rect.centerx - self.level.world_shift[0]) // TILE_SIZE) + dx
-				y = ((self.rect.centery - self.level.world_shift[1]) // TILE_SIZE) + dy
+				x = (self.rect.centerx // TILE_SIZE) + dx
+				y = (self.rect.centery // TILE_SIZE) + dy
 				if 0 <= x < self.level.width and 0 <= y < self.level.height:
 					# check if not index out of range
 					if y >= len(self.level.tile_map) or x >= len(self.level.tile_map[y]):

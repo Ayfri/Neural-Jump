@@ -1,10 +1,11 @@
 import os
 
+import pygame
 from pygame import Surface
 from pygame.sprite import Group
 
 from game.platform import Platform
-from game.settings import SCREEN_HEIGHT, TILE_SIZE, WHITE
+from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, SHIFT_THRESHOLD_X, TILE_SIZE, WHITE
 from game.tiles import Tile, TILES
 
 
@@ -22,16 +23,14 @@ def _search_maps_folder(folder: str) -> str:
 
 
 class Level:
-	def __init__(self, player: 'game.Player') -> None:
+	def __init__(self) -> None:
+		self.camera = pygame.Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
 		self.platform_list = Group()
-		self.player = player
-		self.world_shift = (0, 0)
 		self.map: str | None = None
-		self.width = 0
 		self.height = 0
+		self.width = 0
 		self.tile_map: list[list[str]] = []
-		self.finished = False
-		player.level = self
+		self.spawn_point = (0, 0)
 
 	@property
 	def platforms(self) -> list[Platform]:
@@ -63,25 +62,26 @@ class Level:
 					tile_data = TILES[char]
 					row += [char]
 					if tile_data.get('is_player', False):
-						self.player.rect.x = x * TILE_SIZE
-						self.player.rect.y = y * TILE_SIZE + offset_y
+						spawn_point_x = x * TILE_SIZE
+						spawn_point_y = y * TILE_SIZE + offset_y
+						self.spawn_point = (spawn_point_x, spawn_point_y)
 					elif not tile_data.get('is_air', False):
-
 						block = Platform(x * TILE_SIZE, y * TILE_SIZE + offset_y, tile_data)
 						self.platform_list.add(block)
 
 			self.tile_map += [row]
 
-	def shift_world(self, shift_x: int, shift_y: int) -> None:
-		self.world_shift = (self.world_shift[0] + shift_x, self.world_shift[1] + shift_y)
-		for platform in self.platforms:
-			platform.shift(shift_x, shift_y)
+	def follow_player(self, player: 'Player'):
+		"""
+		Shift the world according to the player's position.
+		:param player: The player object
+		"""
+		self.camera.centerx = player.rect.centerx
+		self.camera.centery = TILE_SIZE * 12
+		return
 
 	def restart(self) -> None:
 		if self.map is None:
 			return
 		self.platform_list.empty()
 		self.load_map(self.map)
-		self.finished = False
-		self.world_shift = (0, 0)
-		self.player.revive()

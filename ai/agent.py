@@ -6,6 +6,7 @@ from torch import nn, optim
 
 from ai.neural_network import NeuralNetwork
 from game.game import Game
+from game.player import Player
 from game.settings import BLACK
 from game.tiles import Tile
 
@@ -22,8 +23,12 @@ class Agent:
 		self.criterion = nn.MSELoss()
 		self.current_reward = 0
 		self.playing = False
-
+		self.player: Player | None = None
 		self.screen: Surface | None = None
+
+	@property
+	def current_index(self) -> int:
+		return self.generation.agents.index(self)
 
 	def calculate_move(self, grid: list[list[Tile]]) -> int:
 		"""
@@ -105,70 +110,16 @@ class Agent:
 
 		self.screen = minimap
 
-	def calculate_reward(self, game: Game) -> float:
+	def calculate_reward(self) -> float:
 		"""
 		Calculate the reward based on the game outcome.
-		:param game: The game object
 		:return: The reward value
 		"""
-		if game.player.finished_reward is not None:
-			return game.player.finished_reward
+		if self.player.finished_reward is not None:
+			return self.player.finished_reward
 		else:
-			player_reward = game.player.rect.x / 100  # Reward based on how far the player has moved right
-			level_reward = -game.level.world_shift[0] / 100  # Reward based on how far the player has moved right
-			if game.player.dead:
+			player_reward = self.player.rect.x / 100  # Reward based on how far the player has moved right
+			if self.player.dead:
 				player_reward -= 10
 
-			return player_reward + level_reward
-
-	def play_game(self) -> float:
-		"""
-		Plays a game using the agent's current weights and returns the reward earned.
-		"""
-		self.playing = True
-		game = Game(display_window=self.show_window, tick_rate=self.tick_rate)
-
-		game.init()
-
-		# Time limit for the game in seconds
-		time_limit = self.running_time
-
-		# Start timer
-		tick = 0
-
-		while not game.level.finished and not game.player.dead and tick / 1000 < time_limit:
-			# Get the surrounding grid
-			grid = game.player.get_surrounding_grid()
-
-			# Calculate the move using the agent
-			direction = self.calculate_move(grid)
-
-			# Execute the move
-			game.player.execute_move(direction)
-			game.handle_inputs(movement=False)
-			game.update()
-			tick += game.clock.get_time()
-
-			# Display the timer
-			if game.display_window:
-				elapsed_time = tick / 1000
-				game.draw_text(f"Agent: {self.generation.agents.index(self) + 1}/{self.generation.population_size}, Generation: {self.generation.generation}", 10, 10, font_size=24, color=BLACK)
-
-				game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
-				game.draw_text(f"Time: {elapsed_time:.2f}/{time_limit}", 10, 100, font_size=24, color=BLACK)
-				game.draw_text(f"Player: X: {game.player.rect.x}, Y: {game.player.rect.y}", 10, 130, font_size=24, color=BLACK)
-				game.draw_text(f"Reward: {self.calculate_reward(game):.2f}", 10, 160, font_size=24, color=BLACK)
-				game.draw_text(f"Level World Shift: X: {game.level.world_shift[0]:.2f}, Y: {game.level.world_shift[1]:.2f}", 10, 190, font_size=24, color=BLACK)
-
-				self.draw_minimap(game, grid, direction)
-
-				game.additional_draws += [(self.screen, (game.screen.get_width() - self.screen.get_width(), 0))]
-				game.draw()
-
-		# Update the agent's reward based on the game outcome
-		reward = self.calculate_reward(game)
-
-		game.quit()
-		self.playing = False
-		self.current_reward = reward
-		return reward
+			return player_reward

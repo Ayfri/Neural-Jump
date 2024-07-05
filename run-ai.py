@@ -1,9 +1,11 @@
-# main.py
-
+import os
 from ai.generation import Generation
 
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+
+
 def main() -> None:
-	generation = Generation(8, mutation_rate=0.08, mutation_strength=0.25, load_latest_generation_weights=True)
+	generation = Generation(30,  mutation_rate=0.2, mutation_strength=0.008, load_latest_generation_weights=True)
 	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate} ---")
 	while True:
 		generation.play_agents()
