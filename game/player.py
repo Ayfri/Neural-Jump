@@ -32,6 +32,8 @@ class Player(Sprite):
 		self.win = False
 		self.finished_reward: int | None = None
 
+		self._near_platforms = list[Sprite]()
+
 	def update(self) -> None:
 		if self.dead or self.win:
 			return
@@ -42,8 +44,10 @@ class Player(Sprite):
 		if self.check_death():
 			return
 
+		self.calculate_near_platforms()
+
 		# Check for horizontal collisions
-		block_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
+		block_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		for block in block_hit_list:
 			if isinstance(block, Platform):
 				if block.tile_data.get('reward', False):
@@ -62,7 +66,7 @@ class Player(Sprite):
 		self.rect.y += self.change_y
 
 		# Check for vertical collisions
-		block_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
+		block_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		for block in block_hit_list:
 			if isinstance(block, Platform):
 				if block.tile_data.get('reward', False):
@@ -99,7 +103,7 @@ class Player(Sprite):
 			return
 
 		self.rect.y += 2
-		platform_hit_list = pygame.sprite.spritecollide(self, self.level.platform_list, False)
+		platform_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		self.rect.y -= 2
 
 		if len(platform_hit_list) > 0 or self.rect.bottom >= SCREEN_HEIGHT:
@@ -120,7 +124,7 @@ class Player(Sprite):
 		self.change_x = 0
 		self.change_y = 0
 
-	def get_surrounding_grid(self) -> list[list[Tile]]:
+	def get_surrounding_tiles(self) -> list[list[Tile]]:
 		grid: list[list[Tile]] = []
 		for dy in range(-3, 4):
 			row: list[Tile] = []
@@ -141,14 +145,24 @@ class Player(Sprite):
 			grid += [row]
 		return grid
 
+	def calculate_near_platforms(self) -> None:
+		"""
+		Collects platforms near the player.
+		"""
+		DISTANCE = 400
+		self._near_platforms = [
+			platform for platform in self.level.platform_list
+			if abs(platform.rect.centerx - self.rect.centerx) <= DISTANCE and abs(platform.rect.centery - self.rect.centery) <= DISTANCE
+		]
+
 	def execute_move(self, direction: int):
 		"""
-		Exécute le mouvement basé sur la direction fournie par l'agent.
-		:param direction: Direction du mouvement (0: haut, 1: bas, 2: gauche, 3: droite)
+		Executes the movement based on the direction provided by the agent.
+		:param direction: Direction of movement (0: up, 1: down, 2: left, 3: right)
 		"""
-		if direction == 0:  # Haut
+		if direction == 0:  # Top
 			self.jump()
-		elif direction == 1:  # Gauche
+		elif direction == 1:  # Left
 			self.go_left()
-		elif direction == 2:  # Droite
+		elif direction == 2:  # Right
 			self.go_right()

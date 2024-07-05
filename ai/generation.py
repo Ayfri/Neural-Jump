@@ -133,7 +133,7 @@ class Generation:
 		while not all([player.win or player.dead for player in game.players]) and tick / 1000 < time_limit:
 			for agent in self.agents:
 				# Get the surrounding grid
-				grid = agent.player.get_surrounding_grid()
+				grid = agent.player.get_surrounding_tiles()
 
 				# Calculate the move using the agent
 				direction = agent.calculate_move(grid)
