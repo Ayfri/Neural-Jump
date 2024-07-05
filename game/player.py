@@ -149,7 +149,7 @@ class Player(Sprite):
 		"""
 		Collects platforms near the player.
 		"""
-		DISTANCE = 400
+		DISTANCE = 300
 		self._near_platforms = [
 			platform for platform in self.level.platform_list
 			if abs(platform.rect.centerx - self.rect.centerx) <= DISTANCE and abs(platform.rect.centery - self.rect.centery) <= DISTANCE
