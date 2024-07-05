@@ -36,7 +36,6 @@ class Generation:
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
 
-
 	def evolve_generation(self) -> None:
 		"""
 		Evolves agent generation by generating new weights.
@@ -147,12 +146,11 @@ class Generation:
 			game.update()
 			tick += game.clock.get_time()
 
-			best_agent = self.get_best_agent()
-			best_player = game.players[best_agent.current_index]
-			game.level.follow_player(best_player)
-
-			# Display the timer
 			if game.display_window:
+				best_agent = self.get_best_agent()
+				best_player = game.players[best_agent.current_index]
+
+				game.level.follow_player(best_player)
 				elapsed_time = tick / 1000
 				game.draw_text(
 					f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}",
@@ -174,6 +172,4 @@ class Generation:
 
 		# Update the agent's reward based on the game outcome
 		# reward = self.calculate_reward(game)
-		for agent in self.agents:
-			agent.current_reward = agent.calculate_reward()
 		game.quit()
