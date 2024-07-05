@@ -118,7 +118,7 @@ class Generation:
 		"""
 		Play games with all agents in the generation.
 		"""
-		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=False)
+		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=True)
 		game.init()
 
 		for i, agent in enumerate(self.agents):
@@ -150,7 +150,7 @@ class Generation:
 				best_agent = self.get_best_agent()
 				best_player = game.players[best_agent.current_index]
 
-				game.level.follow_player(best_player)
+				# game.level.follow_player(best_player)
 				elapsed_time = tick / 1000
 				game.draw_text(
 					f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}",
