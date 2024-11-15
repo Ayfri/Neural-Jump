@@ -21,14 +21,15 @@ class Generation:
 		elite_count: int = 2,
 		mutation_rate: float = 0.01,
 		mutation_strength: float = 0.1,
-		load_latest_generation_weights: bool = False
+		load_latest_generation_weights: bool = False,
+		show_window: bool = True,
 	) -> None:
 		self.population_size = population_size
 		self.elite_count = elite_count
 		self.mutation_strength = mutation_strength
 		self.mutation_rate = mutation_rate
+		self.show_window = show_window
 		self.tick_rate = 2000
-		self.show_window = True
 		self.running_time = 35  # Time in seconds to run the game
 		self.generation = 1
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]

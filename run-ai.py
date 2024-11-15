@@ -1,3 +1,4 @@
+import argparse
 import os
 from ai.generation import Generation
 
@@ -5,7 +6,22 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 
 def main() -> None:
-	generation = Generation(30,  mutation_rate=0.06, mutation_strength=0.025, load_latest_generation_weights=True)
+	argparser = argparse.ArgumentParser()
+	argparser.add_argument("--population_size", type=int, default=30)
+	argparser.add_argument("--mutation_rate", type=float, default=0.06)
+	argparser.add_argument("--mutation_strength", type=float, default=0.025)
+	argparser.add_argument("--load_latest_generation_weights", action="store_true")
+	argparser.add_argument("--show_window", action="store_true")
+	args = argparser.parse_args()
+
+	generation = Generation(
+		args.population_size,
+		mutation_rate=args.mutation_rate,
+		mutation_strength=args.mutation_strength,
+		load_latest_generation_weights=args.load_latest_generation_weights,
+		show_window=args.show_window
+	)
+
 	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate} - mutation strength: {generation.mutation_strength} ---")
 	while True:
 		generation.play_agents()
