@@ -4,6 +4,7 @@ import torch
 from pygame import Surface
 from torch import nn, optim
 
+from ai.neural_network import NeuralNetwork
 from ai.small_conv_neural_network import SmallConvNeuralNetwork
 from game.game import Game
 from game.player import Player
@@ -23,7 +24,7 @@ class Agent:
 		self.screen: Surface | None = None
 
 		self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		self.model = SmallConvNeuralNetwork()
+		self.model = NeuralNetwork().to(self.device)
 		self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 		self.criterion = nn.MSELoss()
 
@@ -33,18 +34,16 @@ class Agent:
 
 	def calculate_move(self, grid: list[list[Tile]]) -> int:
 		"""
-		Calculate the movement to be made according to the surrounding grid.
-		:param grid: The 7x7 grid around the player, each cell contains the properties of the tile
-		:return: Direction of movement (0: up, 1: down, 2: left, 3: right)
-		"""
-		# Create a NumPy array directly from the grid without intermediate lists
-		input_data = np.zeros((9, 9, 2), dtype=np.float32)
-		for y, row in enumerate(grid):
-			for x, tile in enumerate(row):
-				input_data[y, x, 0] = tile.get('reward', 0)
-				input_data[y, x, 1] = tile.get('is_solid', 0)
-
-		input_tensor = torch.tensor(input_data).unsqueeze(0).permute(0, 3, 1, 2).to(self.device)
+	    Calculate the movement to be made according to the surrounding grid.
+	    :param grid: The 7x7 grid around the player, each cell contains the properties of the tile
+	    :return: Direction of movement (0: up, 1: down, 2: left, 3: right)
+	    """
+		input_data = np.array(
+			[[tile.get('reward', 0), tile.get('is_solid', 0)] for row in grid for tile in row],
+			dtype=np.float32
+		)
+		input_data = input_data.flatten()
+		input_tensor = torch.tensor(input_data).unsqueeze(0).to(self.device)
 
 		with torch.no_grad():
 			output = self.model(input_tensor)

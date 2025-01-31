@@ -23,6 +23,7 @@ class Generation:
 		mutation_strength: float = 0.1,
 		load_latest_generation_weights: bool = False,
 		show_window: bool = True,
+		use_checkpoints: bool = False
 	) -> None:
 		self.population_size = population_size
 		self.elite_count = elite_count
@@ -32,6 +33,7 @@ class Generation:
 		self.tick_rate = 2000
 		self.running_time = 35  # Time in seconds to run the game
 		self.generation = 1
+		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]
 
 		if load_latest_generation_weights:
@@ -124,6 +126,9 @@ class Generation:
 
 		for i, agent in enumerate(self.agents):
 			agent.player = game.players[i]
+			spawn_point = game.level.get_random_spawn_point(self.use_checkpoints)
+			agent.player.rect.x = spawn_point[0]
+			agent.player.rect.y = spawn_point[1]
 
 		# Time limit for the game in seconds
 		time_limit = self.running_time

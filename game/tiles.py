@@ -8,6 +8,7 @@ class Tile(TypedDict, total=False):
 	is_air: bool
 	is_solid: bool
 	is_player: bool
+	is_checkpoint: bool
 	reward: int
 
 
@@ -28,6 +29,10 @@ TILES: dict[str, Tile] = {
 	},
 	'P': {
 		'is_player': True,
+	},
+	'@': {
+		'is_checkpoint': True,
+		'is_air': True,
 	},
 	'F': {
 		'color': AQUA,

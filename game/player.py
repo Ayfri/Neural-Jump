@@ -1,5 +1,6 @@
 import pygame
 from pygame.sprite import Sprite
+from typing import TypedDict
 
 from game.level import Level
 from game.platform import Platform
@@ -13,6 +14,10 @@ from game.settings import (
 	TILE_SIZE,
 )
 from game.tiles import Tile, TILES
+
+
+class EmptyTile(TypedDict, total=False):
+	pass
 
 
 class Player(Sprite):
@@ -71,7 +76,7 @@ class Player(Sprite):
 			if isinstance(block, Platform):
 				if block.tile_data.get('reward', False):
 					self.finished_reward = block.tile_data['reward']
-					self.level.finished = True
+					self.win = True
 					break
 
 				if not block.tile_data.get('is_solid', False):
@@ -124,25 +129,27 @@ class Player(Sprite):
 		self.change_x = 0
 		self.change_y = 0
 
-	def get_surrounding_tiles(self) -> list[list[Tile]]:
+	def get_surrounding_tiles(self) -> list[list[Tile | EmptyTile]]:
 		DISTANCE = 4
-		grid: list[list[Tile]] = []
+		grid: list[list[Tile | EmptyTile]] = []
 		for dy in range(-DISTANCE, DISTANCE + 1):
-			row: list[Tile] = []
+			row: list[Tile | EmptyTile] = []
 			for dx in range(-DISTANCE, DISTANCE + 1):
 				x = (self.rect.centerx // TILE_SIZE) + dx
 				y = (self.rect.centery // TILE_SIZE) + dy
 				if 0 <= x < self.level.width and 0 <= y < self.level.height:
 					# check if not index out of range
 					if y >= len(self.level.tile_map) or x >= len(self.level.tile_map[y]):
-						row += [{}]
+						empty_tile: EmptyTile = {}
+						row += [empty_tile]
 						continue
 
 					tile = self.level.tile_map[round(y)][round(x)]
 					tile_data = TILES[tile]
 					row += [tile_data]
 				else:
-					row += [{}]
+					empty_tile: EmptyTile = {}
+					row += [empty_tile]
 			grid += [row]
 		return grid
 

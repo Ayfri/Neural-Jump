@@ -12,6 +12,7 @@ def main() -> None:
 	argparser.add_argument("--mutation_strength", type=float, default=0.025)
 	argparser.add_argument("--load_latest_generation_weights", action="store_true")
 	argparser.add_argument("--show_window", action="store_true")
+	argparser.add_argument("--checkpoints", action="store_true", help="Use checkpoints as spawn points")
 	args = argparser.parse_args()
 
 	generation = Generation(
@@ -19,7 +20,8 @@ def main() -> None:
 		mutation_rate=args.mutation_rate,
 		mutation_strength=args.mutation_strength,
 		load_latest_generation_weights=args.load_latest_generation_weights,
-		show_window=args.show_window
+		show_window=args.show_window,
+		use_checkpoints=args.checkpoints
 	)
 
 	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate} - mutation strength: {generation.mutation_strength} ---")
