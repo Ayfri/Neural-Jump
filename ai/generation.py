@@ -1,6 +1,7 @@
 import os
 import re
 import traceback
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ class Generation:
 		self.mutation_rate = mutation_rate
 		self.show_window = show_window
 		self.tick_rate = 2000
-		self.running_time = 35  # Time in seconds to run the game
+		self.running_time = 20  # Time in seconds to run the game
 		self.generation = 1
 		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]
@@ -120,62 +121,79 @@ class Generation:
 	def play_agents(self) -> None:
 		"""
 		Play games with all agents in the generation.
+		If use_checkpoints is True, each agent will be tested from each checkpoint and their rewards will be summed.
 		"""
 		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=True)
+		game.use_checkpoints = self.use_checkpoints  # Activer l'utilisation des checkpoints
 		game.init()
 
-		for i, agent in enumerate(self.agents):
-			agent.player = game.players[i]
-			spawn_point = game.level.get_random_spawn_point(self.use_checkpoints)
-			agent.player.rect.x = spawn_point[0]
-			agent.player.rect.y = spawn_point[1]
+		# Get all spawn points (checkpoints + initial spawn)
+		spawn_points = [(game.level.spawn_point[0], game.level.spawn_point[1])]
+		if self.use_checkpoints and game.level.checkpoints:
+			spawn_points.extend(game.level.checkpoints)
 
-		# Time limit for the game in seconds
-		time_limit = self.running_time
+		print(f"Testing agents on {len(spawn_points)} spawn points (1 initial + {len(spawn_points)-1} checkpoints)")
 
-		# Start timer
-		tick = 0
+		# Initialize agents with zero rewards
+		for agent in self.agents:
+			agent.current_reward = 0
 
-		while not all([player.win or player.dead for player in game.players]) and tick / 1000 < time_limit:
+		# For each spawn point, create a copy of each agent and test it
+		for spawn_x, spawn_y in spawn_points:
+			# Reset game state for this spawn point
+			for i, agent in enumerate(self.agents):
+				agent.player = game.players[i]
+				agent.player.rect.x = spawn_x
+				agent.player.rect.y = spawn_y
+				agent.player.dead = False
+				agent.player.win = False
+				agent.player.finished_reward = None
+				agent.player.change_x = 0
+				agent.player.change_y = 0
+
+			# Time limit for the game in seconds
+			time_limit = self.running_time
+			tick = 0
+
+			while not all([player.win or player.dead for player in game.players]) and tick / 1000 < time_limit:
+				for agent in self.agents:
+					if not agent.player.dead and not agent.player.win:
+						# Get the surrounding grid
+						grid = agent.player.get_surrounding_tiles()
+
+						# Calculate the move using the agent
+						direction = agent.calculate_move(grid)
+
+						# Execute the move
+						agent.player.execute_move(direction)
+
+				game.handle_inputs()
+				game.update()
+				tick += game.clock.get_time()
+
+				if game.display_window:
+					best_agent = self.get_best_agent()
+					best_player = game.players[best_agent.current_index]
+
+					elapsed_time = tick / 1000
+					game.draw_text(
+						f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}",
+						10,
+						10,
+						font_size=24,
+						color=BLACK
+					)
+
+					game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
+					game.draw_text(f"Time: {elapsed_time:.2f}/{time_limit}", 10, 100, font_size=24, color=BLACK)
+					game.draw_text(f"Player: X: {best_player.rect.x}, Y: {best_player.rect.y}", 10, 130, font_size=24, color=BLACK)
+					game.draw_text(f"Total Reward: {best_agent.current_reward:.2f}", 10, 160, font_size=24, color=BLACK)
+					game.draw_text(f"Checkpoint: {spawn_points.index((spawn_x, spawn_y)) + 1}/{len(spawn_points)}", 10, 190, font_size=24, color=BLACK)
+
+					game.draw()
+
+			# Calculate and add rewards for this checkpoint run
 			for agent in self.agents:
-				# Get the surrounding grid
-				grid = agent.player.get_surrounding_tiles()
+				agent.current_reward += agent.calculate_reward()
 
-				# Calculate the move using the agent
-				direction = agent.calculate_move(grid)
-
-				# Execute the move
-				agent.player.execute_move(direction)
-				agent.current_reward = agent.calculate_reward()
-
-			game.handle_inputs()
-			game.update()
-			tick += game.clock.get_time()
-
-			if game.display_window:
-				best_agent = self.get_best_agent()
-				best_player = game.players[best_agent.current_index]
-
-				# game.level.follow_player(best_player)
-				elapsed_time = tick / 1000
-				game.draw_text(
-					f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}",
-					10,
-					10,
-					font_size=24,
-					color=BLACK
-				)
-
-				game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
-				game.draw_text(f"Time: {elapsed_time:.2f}/{time_limit}", 10, 100, font_size=24, color=BLACK)
-				game.draw_text(f"Player: X: {best_player.rect.x}, Y: {best_player.rect.y}", 10, 130, font_size=24, color=BLACK)
-				game.draw_text(f"Reward: {best_agent.calculate_reward():.2f}", 10, 160, font_size=24, color=BLACK)
-
-				# self.draw_minimap(game, grid, direction)
-
-				# game.additional_draws += [(self.screen, (game.screen.get_width() - self.screen.get_width(), 0))]
-				game.draw()
-
-		# Update the agent's reward based on the game outcome
-		# reward = self.calculate_reward(game)
 		game.quit()

@@ -2,6 +2,7 @@ import pygame
 from pygame.sprite import Sprite
 from typing import TypedDict
 
+from game.constants import AGENT_NEAR_PLATFORM_DISTANCE, AGENT_VISION_DISTANCE
 from game.level import Level
 from game.platform import Platform
 from game.settings import (
@@ -130,11 +131,10 @@ class Player(Sprite):
 		self.change_y = 0
 
 	def get_surrounding_tiles(self) -> list[list[Tile | EmptyTile]]:
-		DISTANCE = 4
 		grid: list[list[Tile | EmptyTile]] = []
-		for dy in range(-DISTANCE, DISTANCE + 1):
+		for dy in range(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1):
 			row: list[Tile | EmptyTile] = []
-			for dx in range(-DISTANCE, DISTANCE + 1):
+			for dx in range(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1):
 				x = (self.rect.centerx // TILE_SIZE) + dx
 				y = (self.rect.centery // TILE_SIZE) + dy
 				if 0 <= x < self.level.width and 0 <= y < self.level.height:
@@ -157,10 +157,9 @@ class Player(Sprite):
 		"""
 		Collects platforms near the player.
 		"""
-		DISTANCE = 300
 		self._near_platforms = [
 			platform for platform in self.level.platform_list
-			if abs(platform.rect.centerx - self.rect.centerx) <= DISTANCE and abs(platform.rect.centery - self.rect.centery) <= DISTANCE
+			if abs(platform.rect.centerx - self.rect.centerx) <= AGENT_NEAR_PLATFORM_DISTANCE and abs(platform.rect.centery - self.rect.centery) <= AGENT_NEAR_PLATFORM_DISTANCE
 		]
 
 	def execute_move(self, direction: int):
