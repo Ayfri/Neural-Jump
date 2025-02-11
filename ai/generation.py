@@ -150,6 +150,7 @@ class Generation:
 				agent.player.finished_reward = None
 				agent.player.change_x = 0
 				agent.player.change_y = 0
+				agent.player.revive()  # Réinitialise l'état visuel du joueur
 
 			# Time limit for the game in seconds
 			time_limit = self.running_time
