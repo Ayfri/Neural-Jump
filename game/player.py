@@ -105,6 +105,10 @@ class Player(Sprite):
 
 		return False
 
+	def set_dead(self) -> None:
+		self.dead = True
+		self.image.set_alpha(40)
+
 	def jump(self) -> None:
 		if self.check_death():
 			return

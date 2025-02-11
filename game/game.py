@@ -132,19 +132,18 @@ class Game:
 		self.level.update()
 		self.clock.tick(self.tick_rate)
 
-		if self.has_playable_player:
-			alive_players = [player for player in self.players if not player.dead and not player.win]
-			if not len(alive_players):
-				return
+		alive_players = [player for player in self.players if not player.dead and not player.win]
+		if not len(alive_players):
+			return
 
-			alive_players.sort(key=lambda player: player.rect.x, reverse=True)
+		alive_players.sort(key=lambda player: player.rect.x, reverse=True)
 
-			# Update followed player
-			if self.followed_player:
-				self.followed_player.is_followed = False
-			self.followed_player = alive_players[0]
-			self.followed_player.is_followed = True
-			self.level.follow_player(self.followed_player)
+		# Update followed players
+		if self.followed_player:
+			self.followed_player.is_followed = False
+		self.followed_player = alive_players[0]
+		self.followed_player.is_followed = True
+		self.level.follow_player(self.followed_player)
 
 	def draw_sprite(self, sprite: HasImageAndRect):
 		assert self.screen is not None

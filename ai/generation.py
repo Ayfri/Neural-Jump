@@ -39,6 +39,8 @@ class Generation:
 		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]
 		self.should_skip_checkpoint = False
+		self.agent_positions = {}
+		self.last_position_check = 0
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
@@ -69,6 +71,10 @@ class Generation:
 
 		self.agents = new_agents[:self.population_size]
 		self.generation += 1
+
+		# Réinitialiser l'historique des positions pour la nouvelle génération
+		self.agent_positions = {}
+		self.last_position_check = 0
 
 		os.makedirs("weights", exist_ok=True)
 		torch.save(elites[0].model.state_dict(), f"weights/generation_{self.generation}.pth")
@@ -125,13 +131,60 @@ class Generation:
 		"""Skip to the next checkpoint."""
 		self.should_skip_checkpoint = True
 
+	def check_agent_positions(self, tick: int) -> None:
+		"""
+		Check if agents are stuck or in a loop.
+		An agent is considered stuck if it remains at the same X position for 3 seconds.
+		An agent is considered in a loop if its X position is lower than it was 6 seconds ago.
+		"""
+		current_time = tick / 1000
+
+		if current_time - self.last_position_check < 1:
+			return
+
+		self.last_position_check = current_time
+
+		killed_agents = []
+		for agent in self.agents:
+			if agent.player.dead or agent.player.win:
+				continue
+
+			current_x = agent.player.rect.x
+
+			# Utiliser l'index de l'agent comme clé plutôt que l'agent lui-même
+			agent_key = agent.current_index
+			if agent_key not in self.agent_positions:
+				self.agent_positions[agent_key] = []
+
+			self.agent_positions[agent_key].append((current_time, current_x))
+
+			while self.agent_positions[agent_key] and self.agent_positions[agent_key][0][0] < current_time - 6:
+				self.agent_positions[agent_key].pop(0)
+
+			positions = self.agent_positions[agent_key]
+
+			if len(positions) >= 3:
+				last_three_x = [pos[1] for pos in positions[-3:]]
+				if all(x == current_x for x in last_three_x):
+					agent.player.set_dead()
+					killed_agents += [agent]
+
+			if len(positions) >= 6:
+				x_6_seconds_ago = positions[0][1]
+				if current_x < x_6_seconds_ago:
+					agent.player.set_dead()
+					killed_agents += [agent]
+
+		if len(killed_agents) > 0:
+			print(f"Killed {len(killed_agents)} agents")
+
 	def play_agents(self) -> None:
 		"""
 		Play games with all agents in the generation.
 		If use_checkpoints is True, each agent will be tested from each checkpoint and their rewards will be summed.
 		"""
-		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=True)
-		game.use_checkpoints = self.use_checkpoints  # Activer l'utilisation des checkpoints
+		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=False)
+		game.use_checkpoints = self.use_checkpoints
 		game.init()
 
 		# Add skip checkpoint key action
@@ -181,6 +234,9 @@ class Generation:
 				game.handle_inputs()
 				game.update()
 				tick += game.clock.get_time()
+
+				# Vérifier les positions des agents
+				self.check_agent_positions(tick)
 
 				if game.display_window:
 					best_agent = self.get_best_agent()
