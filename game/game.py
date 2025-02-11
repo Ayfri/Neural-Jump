@@ -20,6 +20,7 @@ class HasImageAndRect(Protocol):
 
 class Game:
 	player: Player | None = None
+	followed_player: Player | None = None
 
 	def __init__(self, players_count: int, tick_rate: int = 60, display_window: bool = True, has_playable_player: bool = True) -> None:
 		self.players = list[Player]()
@@ -126,7 +127,13 @@ class Game:
 				return
 
 			alive_players.sort(key=lambda player: player.rect.x, reverse=True)
-			self.level.follow_player(alive_players[0])
+
+			# Update followed player
+			if self.followed_player:
+				self.followed_player.is_followed = False
+			self.followed_player = alive_players[0]
+			self.followed_player.is_followed = True
+			self.level.follow_player(self.followed_player)
 
 	def draw_sprite(self, sprite: HasImageAndRect):
 		assert self.screen is not None

@@ -35,8 +35,9 @@ class Player(Sprite):
 		self.change_x = 0
 		self.change_y = 0
 		self.dead = False
-		self.win = False
 		self.finished_reward: int | None = None
+		self.is_followed = False
+		self.win = False
 
 		self._near_platforms = list[Sprite]()
 
