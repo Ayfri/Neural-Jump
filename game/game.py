@@ -23,6 +23,7 @@ class Game:
 	followed_player: Player | None = None
 
 	def __init__(self, players_count: int, tick_rate: int = 60, display_window: bool = True, has_playable_player: bool = True) -> None:
+		self.key_actions = dict[int, tuple[callable, str]]()
 		self.players = list[Player]()
 		self.level = Level()
 		self.level.load_map('maps/level_1.txt')
@@ -50,14 +51,24 @@ class Game:
 		self.display_window = display_window
 		self.additional_draws = list[tuple[Surface, tuple[int, int]]]()
 
+	def add_key_action(self, key: int, action: callable, description: str = "") -> None:
+		"""Add a custom key action to the game."""
+		self.key_actions[key] = (action, description)
+
 	def handle_inputs(self) -> None:
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				pygame.quit()
 
-			if self.player is None:
-				continue
 			if event.type == pygame.KEYDOWN:
+				# Handle custom key actions first
+				if event.key in self.key_actions:
+					action, _ = self.key_actions[event.key]
+					action()
+
+				if self.player is None:
+					continue
+
 				if event.key == pygame.K_LEFT:
 					self.player.go_left()
 				if event.key == pygame.K_RIGHT:
@@ -160,13 +171,25 @@ class Game:
 			self.draw_sprite(active_sprite)
 
 		# Draw keyboard shortcuts with reduced opacity
-		self.draw_text("R - Restart", 10, SCREEN_HEIGHT - 100, font_size=16, alpha=128)
-		self.draw_text("C - Toggle Checkpoints", 10, SCREEN_HEIGHT - 80, font_size=16, alpha=128)
-		self.draw_text("Arrow Keys - Move", 10, SCREEN_HEIGHT - 60, font_size=16, alpha=128)
+		y_offset = SCREEN_HEIGHT - 100
+		self.draw_text("R - Restart", 10, y_offset, font_size=16, alpha=128)
+		y_offset += 20
+		self.draw_text("C - Toggle Checkpoints", 10, y_offset, font_size=16, alpha=128)
+		y_offset += 20
+		self.draw_text("Arrow Keys - Move", 10, y_offset, font_size=16, alpha=128)
+		y_offset += 20
+
+		# Draw custom key actions
+		for key, (_, description) in self.key_actions.items():
+			if description:
+				key_name = pygame.key.name(key).upper()
+				self.draw_text(f"{key_name} - {description}", 10, y_offset, font_size=16, alpha=128)
+				y_offset += 20
+
 		if self.use_checkpoints:
-			self.draw_text("Checkpoints Mode: ON", 10, SCREEN_HEIGHT - 40, font_size=16, alpha=128)
+			self.draw_text("Checkpoints Mode: ON", 10, y_offset, font_size=16, alpha=128)
 		else:
-			self.draw_text("Checkpoints Mode: OFF", 10, SCREEN_HEIGHT - 40, font_size=16, alpha=128)
+			self.draw_text("Checkpoints Mode: OFF", 10, y_offset, font_size=16, alpha=128)
 
 		for surface, destination in self.additional_draws.copy():
 			self.screen.blit(surface, destination)

@@ -14,6 +14,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from game.game import Game
 from game.settings import BLACK
 
+import pygame
+
 
 class Generation:
 	def __init__(
@@ -36,6 +38,7 @@ class Generation:
 		self.generation = 1
 		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]
+		self.should_skip_checkpoint = False
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
@@ -118,6 +121,10 @@ class Generation:
 		except:
 			print("No weights found, starting with random weights.")
 
+	def skip_checkpoint(self) -> None:
+		"""Skip to the next checkpoint."""
+		self.should_skip_checkpoint = True
+
 	def play_agents(self) -> None:
 		"""
 		Play games with all agents in the generation.
@@ -126,6 +133,9 @@ class Generation:
 		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=True)
 		game.use_checkpoints = self.use_checkpoints  # Activer l'utilisation des checkpoints
 		game.init()
+
+		# Add skip checkpoint key action
+		game.add_key_action(pygame.K_g, self.skip_checkpoint, "Skip Checkpoint")
 
 		# Get all spawn points (checkpoints + initial spawn)
 		spawn_points = [(game.level.spawn_point[0], game.level.spawn_point[1])]
@@ -156,7 +166,7 @@ class Generation:
 			time_limit = self.running_time
 			tick = 0
 
-			while not all([player.win or player.dead for player in game.players]) and tick / 1000 < time_limit:
+			while not all([player.win or player.dead for player in game.players]) and tick / 1000 < time_limit and not self.should_skip_checkpoint:
 				for agent in self.agents:
 					if not agent.player.dead and not agent.player.win:
 						# Get the surrounding grid
@@ -196,5 +206,8 @@ class Generation:
 			# Calculate and add rewards for this checkpoint run
 			for agent in self.agents:
 				agent.current_reward += agent.calculate_reward()
+
+			# Reset skip checkpoint flag after checkpoint is complete
+			self.should_skip_checkpoint = False
 
 		game.quit()

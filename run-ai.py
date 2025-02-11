@@ -7,9 +7,9 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 def main() -> None:
 	argparser = argparse.ArgumentParser()
-	argparser.add_argument("--population_size", type=int, default=30)
-	argparser.add_argument("--mutation_rate", type=float, default=0.06)
-	argparser.add_argument("--mutation_strength", type=float, default=0.025)
+	argparser.add_argument("--population_size", type=int, default=60)
+	argparser.add_argument("--mutation_rate", type=float, default=0.05)
+	argparser.add_argument("--mutation_strength", type=float, default=0.020)
 	argparser.add_argument("--load_latest_generation_weights", action="store_true")
 	argparser.add_argument("--show_window", action="store_true")
 	argparser.add_argument("--checkpoints", action="store_true", help="Use checkpoints as spawn points")
