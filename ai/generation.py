@@ -42,6 +42,7 @@ class Generation:
 		self.should_skip_checkpoint = False
 		self.agent_positions = {}
 		self.last_position_check = 0
+		self.best_fitness_ever = 0
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
@@ -255,12 +256,22 @@ class Generation:
 					game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
 					game.draw_text(f"Time: {elapsed_time:.2f}/{time_limit}", 10, 100, font_size=24, color=BLACK)
 					game.draw_text(f"Player: X: {best_player.rect.x}, Y: {best_player.rect.y}", 10, 130, font_size=24, color=BLACK)
-					game.draw_text(f"Total Reward: {best_agent.current_reward:.2f}", 10, 160, font_size=24, color=BLACK)
-					game.draw_text(f"Checkpoint: {spawn_points.index((spawn_x, spawn_y)) + 1}/{len(spawn_points)}", 10, 190, font_size=24, color=BLACK)
+					game.draw_text(f"Checkpoint: {spawn_points.index((spawn_x, spawn_y)) + 1}/{len(spawn_points)}", 10, 160, font_size=24, color=BLACK)
 
 					# Compter les agents encore en vie
 					living_agents = sum(1 for agent in self.agents if not agent.player.dead and not agent.player.win)
-					game.draw_text(f"Living agents: {living_agents}/{self.population_size}", 10, 220, font_size=24, color=BLACK)
+					game.draw_text(f"Living agents: {living_agents}/{self.population_size}", 10, 190, font_size=24, color=BLACK)
+
+					# Best fitness ever
+					game.draw_text(f"Best Fitness: {self.best_fitness_ever:.2f}", 10, 220, font_size=24, color=BLACK)
+
+					# Current fitness
+					current_fitness = max(
+						(agent.player.finished_reward if agent.player.finished_reward is not None else agent.player.rect.x / 100)
+						for agent in self.agents
+						if not agent.player.dead
+					) if any(not agent.player.dead for agent in self.agents) else 0
+					game.draw_text(f"Current Fitness: {current_fitness:.2f}", 10, 250, font_size=24, color=BLACK)
 
 					game.draw()
 
@@ -270,5 +281,10 @@ class Generation:
 
 			# Reset skip checkpoint flag after checkpoint is complete
 			self.should_skip_checkpoint = False
+
+		# Update best fitness ever
+		if self.agents:
+			current_max_reward = max(agent.current_reward for agent in self.agents)
+			self.best_fitness_ever = max(self.best_fitness_ever, current_max_reward)
 
 		game.quit()
