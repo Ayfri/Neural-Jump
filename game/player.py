@@ -57,44 +57,48 @@ class Player(Sprite):
 		# Check for horizontal collisions
 		block_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		for block in block_hit_list:
-			if isinstance(block, Platform):
-				if block.tile_data.get('reward', False):
-					self.finished_reward = block.tile_data['reward']
-					if block.tile_data['reward'] == 1:  # flag
-						self.win = True
-						if tick is not None:
-							self.win_tick = tick
-					break
+			if not isinstance(block, Platform):
+				continue
+				
+			if block.tile_data.get('reward', False):
+				self.finished_reward = block.tile_data['reward']
+				if block.tile_data['reward'] == 1:  # flag
+					self.win = True
+					if tick is not None:
+						self.win_tick = tick
+				break
 
-				if not block.tile_data.get('is_solid', False):
-					continue
+			if not block.tile_data.get('is_solid', False):
+				continue
 
-				if self.change_x > 0:
-					self.rect.right = block.rect.left
-				elif self.change_x < 0:
-					self.rect.left = block.rect.right
+			if self.change_x > 0:
+				self.rect.right = block.rect.left
+			elif self.change_x < 0:
+				self.rect.left = block.rect.right
 
 		self.rect.y += self.change_y
 
 		# Check for vertical collisions
 		block_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		for block in block_hit_list:
-			if isinstance(block, Platform):
-				if block.tile_data.get('reward', False):
-					self.finished_reward = block.tile_data['reward']
-					if block.tile_data['reward'] == 1:  # flag
-						self.win = True
-						if tick is not None:
-							self.win_tick = tick
-					break
+			if not isinstance(block, Platform):
+				continue
+				
+			if block.tile_data.get('reward', False):
+				self.finished_reward = block.tile_data['reward']
+				if block.tile_data['reward'] == 1:  # flag
+					self.win = True
+					if tick is not None:
+						self.win_tick = tick
+				break
 
-				if not block.tile_data.get('is_solid', False):
-					continue
+			if not block.tile_data.get('is_solid', False):
+				continue
 
-				if self.change_y > 0:
-					self.rect.bottom = block.rect.top
-				elif self.change_y < 0:
-					self.rect.top = block.rect.bottom
+			if self.change_y > 0:
+				self.rect.bottom = block.rect.top
+			elif self.change_y < 0:
+				self.rect.top = block.rect.bottom
 
 			self.change_y = 0
 
@@ -177,9 +181,9 @@ class Player(Sprite):
 	def execute_move(self, direction: int):
 		"""
 		Executes the movement based on the direction provided by the agent.
-		:param direction: Direction of movement (0: up, 1: down, 2: left, 3: right)
+		:param direction: Direction of movement (0: jump, 1: left, 2: right)
 		"""
-		if direction == 0:  # Top
+		if direction == 0:  # Jump
 			self.jump()
 		elif direction == 1:  # Left
 			self.go_left()
