@@ -33,7 +33,7 @@ class Generation:
 		self.mutation_strength = mutation_strength
 		self.mutation_rate = mutation_rate
 		self.show_window = show_window
-		self.tick_rate = 2000
+		self.tick_rate = 90
 		self.generation = 1
 		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, generation=self) for _ in range(population_size)]
