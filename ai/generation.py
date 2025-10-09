@@ -26,7 +26,8 @@ class Generation:
 		mutation_strength: float = 0.1,
 		load_latest_generation_weights: bool = False,
 		show_window: bool = True,
-		use_checkpoints: bool = False
+		use_checkpoints: bool = False,
+		running_time: float = 20.0
 	) -> None:
 		self.population_size = population_size
 		self.elite_count = elite_count
@@ -34,7 +35,7 @@ class Generation:
 		self.mutation_rate = mutation_rate
 		self.show_window = show_window
 		self.tick_rate = 2000
-		self.running_time = 20  # Time in seconds to run the game
+		self.running_time = running_time  # Time in seconds to run the game
 		self.generation = 1
 		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]

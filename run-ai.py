@@ -13,6 +13,7 @@ def main() -> None:
 	argparser.add_argument("--load-latest-generation-weights", action="store_true")
 	argparser.add_argument("--show-window", action="store_true")
 	argparser.add_argument("--checkpoints", action="store_true", help="Use checkpoints as spawn points")
+	argparser.add_argument("--running-time", type=float, default=20.0, help="Time in seconds to run each generation")
 	args = argparser.parse_args()
 
 	generation = Generation(
@@ -21,7 +22,8 @@ def main() -> None:
 		mutation_strength=args.mutation_strength,
 		load_latest_generation_weights=args.load_latest_generation_weights,
 		show_window=args.show_window,
-		use_checkpoints=args.checkpoints
+		use_checkpoints=args.checkpoints,
+		running_time=args.running_time
 	)
 
 	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate} - mutation strength: {generation.mutation_strength} ---")
