@@ -116,7 +116,12 @@ class Agent:
 		:return: The reward value
 		"""
 		if self.player.finished_reward is not None:
-			return self.player.finished_reward
+			if self.player.finished_reward == 1 and self.player.win_tick is not None:
+				time_taken = self.player.win_tick / self.generation.tick_rate
+				speed_bonus = max(0, 100 - time_taken) * 10
+				return speed_bonus
+			else:
+				return self.player.finished_reward
 		else:
 			player_reward = self.player.rect.x / 100  # Reward based on how far the player has moved right
 			if self.player.dead:

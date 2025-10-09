@@ -36,7 +36,7 @@ TILES: dict[str, Tile] = {
 	},
 	'F': {
 		'color': AQUA,
-		'reward': 500,
+		'reward': 1,
 	},
 	'R': {
 		'color': GREEN,

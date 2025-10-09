@@ -65,7 +65,7 @@ class Generation:
 			parent2: Agent
 			parent1, parent2 = random_generator.choice(elites, 2)
 			child_weights = self.crossover(parent1.model.state_dict().copy(), parent2.model.state_dict().copy())
-			new_agent = Agent(self.tick_rate, self.show_window, self.running_time, generation=self)
+			new_agent = Agent(self.tick_rate, self.show_window, generation=self)
 			new_agent.model.load_state_dict(child_weights)
 			self.mutate(new_agent.model)
 			new_agents += [new_agent]
@@ -80,7 +80,10 @@ class Generation:
 		self.any_agent_won = False
 
 		os.makedirs("weights", exist_ok=True)
-		torch.save(elites[0].model.state_dict(), f"weights/generation_{self.generation}.pth")
+		torch.save({
+			'weights': elites[0].model.state_dict(),
+			'best_fitness': self.best_fitness_ever
+		}, f"weights/generation_{self.generation}.pth")
 
 	def crossover(self, parent1_weights: dict, parent2_weights: dict) -> dict:
 		"""
@@ -120,9 +123,16 @@ class Generation:
 			])
 			weights_path = f"weights/generation_{latest_generation}.pth"
 			with open(weights_path, 'rb') as file:
-				weights = torch.load(file)
-				for agent in self.agents:
-					agent.model.load_state_dict(weights)
+				weights_data = torch.load(file)
+				if isinstance(weights_data, dict) and 'weights' in weights_data:
+					# New format
+					for agent in self.agents:
+						agent.model.load_state_dict(weights_data['weights'])
+					self.best_fitness_ever = weights_data.get('best_fitness', 0)
+				else:
+					# Old format, weights_data is the state_dict
+					for agent in self.agents:
+						agent.model.load_state_dict(weights_data)
 
 			self.generation = latest_generation
 			print(f"Loaded weights for generation {latest_generation}.")
@@ -222,7 +232,7 @@ class Generation:
 			# Time limit for the game in seconds
 			tick = 0
 
-			while not all([player.win or player.dead for player in game.players]) and not self.should_skip_checkpoint and not self.manual_stop:
+			while not any([player.win for player in game.players]) and not all([player.dead for player in game.players]) and not self.should_skip_checkpoint and not self.manual_stop:
 				for agent in self.agents:
 					if not agent.player.dead and not agent.player.win:
 						# Get the surrounding grid
@@ -235,7 +245,8 @@ class Generation:
 						agent.player.execute_move(direction)
 
 				game.handle_inputs()
-				game.update()
+				game.update(tick)
+				tick += 1
 
 				# Vérifier les positions des agents
 				self.check_agent_positions(tick)

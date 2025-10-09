@@ -38,10 +38,11 @@ class Player(Sprite):
 		self.finished_reward: int | None = None
 		self.is_followed = False
 		self.win = False
+		self.win_tick = None
 
 		self._near_platforms = list[Sprite]()
 
-	def update(self) -> None:
+	def update(self, tick: int = None) -> None:
 		if self.dead or self.win:
 			return
 
@@ -59,7 +60,10 @@ class Player(Sprite):
 			if isinstance(block, Platform):
 				if block.tile_data.get('reward', False):
 					self.finished_reward = block.tile_data['reward']
-					self.win = True
+					if block.tile_data['reward'] == 1:  # flag
+						self.win = True
+						if tick is not None:
+							self.win_tick = tick
 					break
 
 				if not block.tile_data.get('is_solid', False):
@@ -78,7 +82,10 @@ class Player(Sprite):
 			if isinstance(block, Platform):
 				if block.tile_data.get('reward', False):
 					self.finished_reward = block.tile_data['reward']
-					self.win = True
+					if block.tile_data['reward'] == 1:  # flag
+						self.win = True
+						if tick is not None:
+							self.win_tick = tick
 					break
 
 				if not block.tile_data.get('is_solid', False):

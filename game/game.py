@@ -127,9 +127,10 @@ class Game:
 
 		self.quit()
 
-	def update(self) -> None:
-		self.active_sprite_list.update()
+	def update(self, tick: int = None) -> None:
 		self.level.update()
+		for player in self.players:
+			player.update(tick)
 		self.clock.tick(self.tick_rate)
 
 		alive_players = [player for player in self.players if not player.dead and not player.win]
