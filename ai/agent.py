@@ -32,10 +32,10 @@ class Agent:
 
 	def calculate_move(self, grid: list[list[Tile]]) -> int:
 		"""
-	    Calculate the movement to be made according to the surrounding grid.
-	    :param grid: The 7x7 grid around the player, each cell contains the properties of the tile
-	    :return: Direction of movement (0: up, 1: down, 2: left, 3: right)
-	    """
+		Calculate the movement to be made according to the surrounding grid.
+		:param grid: The 7x7 grid around the player, each cell contains the properties of the tile
+		:return: Direction of movement (0: jump, 1: left, 2: right)
+		"""
 		input_data = np.array(
 			[[tile.get('reward', 0), tile.get('is_solid', 0)] for row in grid for tile in row],
 			dtype=np.float32
@@ -54,13 +54,13 @@ class Agent:
 		Draw the minimap showing the grid and the action taken by the agent.
 		:param game: The game object
 		:param grid: The 7x7 grid around the player
-		:param action: The action chosen by the agent
+		:param action: The action chosen by the agent (0: jump, 1: left, 2: right)
 		"""
 		minimap_size = 200
 		tile_size = minimap_size // 7
 		minimap = pygame.Surface((minimap_size, minimap_size * 2))
 		minimap.fill((255, 255, 255))
-		action_colors = [(255, 0, 0), (0, 0, 255), (255, 255, 0)]  # Colors for actions up, left, right
+		action_colors = [(255, 0, 0), (0, 0, 255), (255, 255, 0)]  # Colors for jump, left, right
 
 		for y in range(7):
 			for x in range(7):
@@ -93,7 +93,7 @@ class Agent:
 			("Player", (0, 0, 0), pygame.draw.circle),
 			("Solid Block", (0, 0, 0), pygame.draw.line),
 			("Reward Block", (0, 255, 255), pygame.draw.rect),
-			("Action: Up", (255, 0, 0), pygame.draw.rect),
+			("Action: Jump", (255, 0, 0), pygame.draw.rect),
 			("Action: Left", (0, 0, 255), pygame.draw.rect),
 			("Action: Right", (255, 255, 0), pygame.draw.rect),
 		]
@@ -113,18 +113,50 @@ class Agent:
 	def calculate_reward(self) -> float:
 		"""
 		Calculate the reward based on the game outcome.
+		The reward system heavily emphasizes speed:
+		- 0.5s = 10000 points (optimal)
+		- 1s = 5000 points
+		- 2s = 2500 points
+		- 5s = 1000 points
+		- 10s+ = very low rewards
+		Exponential decay encourages agents to go as fast as possible.
 		:return: The reward value
 		"""
 		if self.player.finished_reward is not None:
 			if self.player.finished_reward == 1 and self.player.win_tick is not None:
+				# Agent reached the flag - reward based purely on speed
 				time_taken = self.player.win_tick / self.generation.tick_rate
-				speed_bonus = max(0, 100 - time_taken) * 10
-				return speed_bonus
+				
+				# Optimal time: 0.5 seconds
+				optimal_time = 0.5
+				
+				# Exponential decay formula: reward = max_reward * (optimal_time / time_taken)^2
+				# This creates a steep curve where being faster gives exponentially more reward
+				max_reward = 10000
+				
+				if time_taken <= 0.01:  # Avoid division by zero
+					time_taken = 0.01
+				
+				# Calculate reward with exponential decay
+				reward = max_reward * (optimal_time / time_taken) ** 2
+				
+				# Cap minimum reward at 100 for very slow completions
+				reward = max(100, reward)
+				
+				# Cap maximum reward at 20000 for sub-optimal times
+				reward = min(20000, reward)
+				
+				return reward
 			else:
-				return self.player.finished_reward
+				# Other rewards (obstacles, etc.)
+				return self.player.finished_reward * 10
 		else:
-			player_reward = self.player.rect.x / 100  # Reward based on how far the player has moved right
+			# Agent didn't complete - small reward based on progress
+			# Much smaller than completion rewards to prioritize finishing
+			progress_reward = self.player.rect.x / 20
+			
+			# Penalty for dying
 			if self.player.dead:
-				player_reward -= 10
-
-			return player_reward
+				progress_reward -= 20
+			
+			return max(0, progress_reward)
