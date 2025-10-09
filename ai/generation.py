@@ -26,8 +26,7 @@ class Generation:
 		mutation_strength: float = 0.1,
 		load_latest_generation_weights: bool = False,
 		show_window: bool = True,
-		use_checkpoints: bool = False,
-		running_time: float = 20.0
+		use_checkpoints: bool = False
 	) -> None:
 		self.population_size = population_size
 		self.elite_count = elite_count
@@ -35,11 +34,11 @@ class Generation:
 		self.mutation_rate = mutation_rate
 		self.show_window = show_window
 		self.tick_rate = 2000
-		self.running_time = running_time  # Time in seconds to run the game
 		self.generation = 1
 		self.use_checkpoints = use_checkpoints
-		self.agents = [Agent(self.tick_rate, self.show_window, self.running_time, generation=self) for _ in range(population_size)]
+		self.agents = [Agent(self.tick_rate, self.show_window, generation=self) for _ in range(population_size)]
 		self.should_skip_checkpoint = False
+		self.manual_stop = False
 		self.agent_positions = {}
 		self.last_position_check = 0
 		self.best_fitness_ever = 0
@@ -77,6 +76,8 @@ class Generation:
 		# Réinitialiser l'historique des positions pour la nouvelle génération
 		self.agent_positions = {}
 		self.last_position_check = 0
+		self.manual_stop = False
+		self.any_agent_won = False
 
 		os.makedirs("weights", exist_ok=True)
 		torch.save(elites[0].model.state_dict(), f"weights/generation_{self.generation}.pth")
@@ -191,6 +192,7 @@ class Generation:
 
 		# Add skip checkpoint key action
 		game.add_key_action(pygame.K_g, self.skip_checkpoint, "Skip Checkpoint")
+		game.add_key_action(pygame.K_s, lambda: setattr(self, 'manual_stop', True), "Stop Generation")
 
 		# Get all spawn points (checkpoints + initial spawn)
 		spawn_points = [(game.level.spawn_point[0], game.level.spawn_point[1])]
@@ -218,10 +220,9 @@ class Generation:
 				agent.player.revive()  # Réinitialise l'état visuel du joueur
 
 			# Time limit for the game in seconds
-			time_limit = self.running_time
 			tick = 0
 
-			while not all([player.win or player.dead for player in game.players]) and tick / 1000 < time_limit and not self.should_skip_checkpoint:
+			while not all([player.win or player.dead for player in game.players]) and not self.should_skip_checkpoint and not self.manual_stop:
 				for agent in self.agents:
 					if not agent.player.dead and not agent.player.win:
 						# Get the surrounding grid
@@ -235,7 +236,6 @@ class Generation:
 
 				game.handle_inputs()
 				game.update()
-				tick += game.clock.get_time()
 
 				# Vérifier les positions des agents
 				self.check_agent_positions(tick)
@@ -254,7 +254,7 @@ class Generation:
 					)
 
 					game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
-					game.draw_text(f"Time: {elapsed_time:.2f}/{time_limit}", 10, 100, font_size=24, color=BLACK)
+					game.draw_text(f"Time: {elapsed_time:.2f}", 10, 100, font_size=24, color=BLACK)
 					game.draw_text(f"Player: X: {best_player.rect.x}, Y: {best_player.rect.y}", 10, 130, font_size=24, color=BLACK)
 					game.draw_text(f"Checkpoint: {spawn_points.index((spawn_x, spawn_y)) + 1}/{len(spawn_points)}", 10, 160, font_size=24, color=BLACK)
 
@@ -272,6 +272,9 @@ class Generation:
 						if not agent.player.dead
 					) if any(not agent.player.dead for agent in self.agents) else 0
 					game.draw_text(f"Current Fitness: {current_fitness:.2f}", 10, 250, font_size=24, color=BLACK)
+
+					# Manual stop instruction
+					game.draw_text("Press S to skip generation", 10, 280, font_size=24, color=BLACK)
 
 					game.draw()
 

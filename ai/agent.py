@@ -5,17 +5,15 @@ from pygame import Surface
 from torch import nn, optim
 
 from ai.neural_network import NeuralNetwork
-from ai.small_conv_neural_network import SmallConvNeuralNetwork
 from game.game import Game
 from game.player import Player
 from game.tiles import Tile
 
 
 class Agent:
-	def __init__(self, tick_rate: int, show_window: bool, running_time: float, generation: 'Generation') -> None:
+	def __init__(self, tick_rate: int, show_window: bool, generation: 'Generation') -> None:
 		self.tick_rate = tick_rate
 		self.show_window = show_window
-		self.running_time = running_time
 		self.generation = generation
 
 		self.current_reward = 0
