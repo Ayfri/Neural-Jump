@@ -1,25 +1,37 @@
-### PyCharm configuration
-
-.idea
-
-### Python compiled files
-
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
 
-### Python environment
-
+# Environments
 .venv/
 venv/
+env/
+ENV/
 
-### Jupyter Notebook
+# IDE
+.idea/
+.vscode/
 
+# Jupyter
 .ipynb_checkpoints/
 
-### Environment variables
-
-.env
-
-### Weights
-
+# ML/NN
 weights/
+logs/
+tensorboard/
+*.h5
+*.hdf5
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.python-version
