@@ -258,6 +258,10 @@ class Generation:
 					game.draw_text(f"Total Reward: {best_agent.current_reward:.2f}", 10, 160, font_size=24, color=BLACK)
 					game.draw_text(f"Checkpoint: {spawn_points.index((spawn_x, spawn_y)) + 1}/{len(spawn_points)}", 10, 190, font_size=24, color=BLACK)
 
+					# Compter les agents encore en vie
+					living_agents = sum(1 for agent in self.agents if not agent.player.dead and not agent.player.win)
+					game.draw_text(f"Living agents: {living_agents}/{self.population_size}", 10, 220, font_size=24, color=BLACK)
+
 					game.draw()
 
 			# Calculate and add rewards for this checkpoint run
