@@ -49,11 +49,26 @@ class Generation:
 	def evolve_generation(self) -> None:
 		"""
 		Evolves agent generation by generating new weights.
+		Adapts mutation parameters based on progress.
 		"""
 		# Sort agents in descending order of reward and select the best agent
 		self.agents.sort(key=lambda agent: agent.current_reward, reverse=True)
 		elites = self.agents[:self.elite_count]
+		best_reward = elites[0].current_reward
 		print(f"Selected {len(elites)} elites: {[agent.current_reward for agent in elites]}")
+
+		# Adapt mutation parameters based on progress
+		# If agents are consistently reaching the flag (reward > 100), focus on speed optimization
+		if best_reward > 100:
+			# Reduce mutation rate and strength to fine-tune for speed
+			self.mutation_rate = max(0.001, self.mutation_rate * 0.95)
+			self.mutation_strength = max(0.001, self.mutation_strength * 0.95)
+			print(f"Speed optimization mode - Reduced mutation: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
+		elif best_reward < self.best_fitness_ever * 0.8:
+			# Performance dropped significantly, increase exploration
+			self.mutation_rate = min(0.1, self.mutation_rate * 1.05)
+			self.mutation_strength = min(0.05, self.mutation_strength * 1.05)
+			print(f"Exploration mode - Increased mutation: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
 
 		# Ensure we have at least one elite to be preserved without mutation
 		new_agents = elites[:]
@@ -73,16 +88,17 @@ class Generation:
 		self.agents = new_agents[:self.population_size]
 		self.generation += 1
 
-		# Réinitialiser l'historique des positions pour la nouvelle génération
+		# Reset position history for the new generation
 		self.agent_positions = {}
 		self.last_position_check = 0
 		self.manual_stop = False
-		self.any_agent_won = False
 
 		os.makedirs("weights", exist_ok=True)
 		torch.save({
 			'weights': elites[0].model.state_dict(),
-			'best_fitness': self.best_fitness_ever
+			'best_fitness': self.best_fitness_ever,
+			'mutation_rate': self.mutation_rate,
+			'mutation_strength': self.mutation_strength
 		}, f"weights/generation_{self.generation}.pth")
 
 	def crossover(self, parent1_weights: dict, parent2_weights: dict) -> dict:
@@ -125,10 +141,16 @@ class Generation:
 			with open(weights_path, 'rb') as file:
 				weights_data = torch.load(file)
 				if isinstance(weights_data, dict) and 'weights' in weights_data:
-					# New format
+					# New format with additional metadata
 					for agent in self.agents:
 						agent.model.load_state_dict(weights_data['weights'])
 					self.best_fitness_ever = weights_data.get('best_fitness', 0)
+					
+					# Load mutation parameters if available
+					if 'mutation_rate' in weights_data:
+						self.mutation_rate = weights_data['mutation_rate']
+					if 'mutation_strength' in weights_data:
+						self.mutation_strength = weights_data['mutation_strength']
 				else:
 					# Old format, weights_data is the state_dict
 					for agent in self.agents:
@@ -136,6 +158,7 @@ class Generation:
 
 			self.generation = latest_generation
 			print(f"Loaded weights for generation {latest_generation}.")
+			print(f"Mutation parameters: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
 			self.evolve_generation()
 		except:
 			print("No weights found, starting with random weights.")
@@ -146,50 +169,53 @@ class Generation:
 
 	def check_agent_positions(self, tick: int) -> None:
 		"""
-		Check if agents are stuck or in a loop.
-		An agent is considered stuck if it remains at the same X position for 3 seconds.
-		An agent is considered in a loop if its X position is lower than it was 6 seconds ago.
+		Check if agents are stuck or moving backwards.
+		- Stuck: Same X position for 3 seconds
+		- Moving backwards: X position lower than 6 seconds ago
 		"""
 		current_time = tick / 1000
 
+		# Only check every second
 		if current_time - self.last_position_check < 1:
 			return
 
 		self.last_position_check = current_time
 
-		killed_agents = []
 		for agent in self.agents:
+			# Skip dead or winning agents
 			if agent.player.dead or agent.player.win:
 				continue
 
 			current_x = agent.player.rect.x
-
-			# Utiliser l'index de l'agent comme clé plutôt que l'agent lui-même
 			agent_key = agent.current_index
+
+			# Initialize position history
 			if agent_key not in self.agent_positions:
 				self.agent_positions[agent_key] = []
 
+			# Add current position
 			self.agent_positions[agent_key].append((current_time, current_x))
 
-			while self.agent_positions[agent_key] and self.agent_positions[agent_key][0][0] < current_time - 6:
-				self.agent_positions[agent_key].pop(0)
+			# Remove positions older than 6 seconds
+			self.agent_positions[agent_key] = [
+				pos for pos in self.agent_positions[agent_key]
+				if pos[0] >= current_time - 6
+			]
 
 			positions = self.agent_positions[agent_key]
 
+			# Check if stuck (same position for 3 seconds)
 			if len(positions) >= 3:
-				last_three_x = [pos[1] for pos in positions[-3:]]
-				if all(x == current_x for x in last_three_x):
+				recent_positions = [pos[1] for pos in positions[-3:]]
+				if len(set(recent_positions)) == 1:  # All positions are the same
 					agent.player.set_dead()
-					killed_agents += [agent]
+					continue
 
+			# Check if moving backwards (X position decreased over 6 seconds)
 			if len(positions) >= 6:
 				x_6_seconds_ago = positions[0][1]
 				if current_x < x_6_seconds_ago:
 					agent.player.set_dead()
-					killed_agents += [agent]
-
-		if len(killed_agents) > 0:
-			print(f"Killed {len(killed_agents)} agents")
 
 	def play_agents(self) -> None:
 		"""
@@ -215,8 +241,8 @@ class Generation:
 		for agent in self.agents:
 			agent.current_reward = 0
 
-		# For each spawn point, create a copy of each agent and test it
-		for spawn_x, spawn_y in spawn_points:
+		# For each spawn point, test all agents
+		for checkpoint_idx, (spawn_x, spawn_y) in enumerate(spawn_points):
 			# Reset game state for this spawn point
 			for i, agent in enumerate(self.agents):
 				agent.player = game.players[i]
@@ -227,64 +253,53 @@ class Generation:
 				agent.player.finished_reward = None
 				agent.player.change_x = 0
 				agent.player.change_y = 0
-				agent.player.revive()  # Réinitialise l'état visuel du joueur
+				agent.player.revive()
 
-			# Time limit for the game in seconds
 			tick = 0
+			max_ticks = 30 * self.tick_rate  # 30 seconds time limit
 
-			while not any([player.win for player in game.players]) and not all([player.dead for player in game.players]) and not self.should_skip_checkpoint and not self.manual_stop:
+			# Run until all agents die/win, skip checkpoint, manual stop, or timeout
+			while (tick < max_ticks and
+				   not self.should_skip_checkpoint and
+				   not self.manual_stop and
+				   not any(player.win for player in game.players) and
+				   not all(player.dead for player in game.players)):
+				
+				# Update living agents
 				for agent in self.agents:
 					if not agent.player.dead and not agent.player.win:
-						# Get the surrounding grid
 						grid = agent.player.get_surrounding_tiles()
-
-						# Calculate the move using the agent
 						direction = agent.calculate_move(grid)
-
-						# Execute the move
 						agent.player.execute_move(direction)
 
 				game.handle_inputs()
 				game.update(tick)
 				tick += 1
 
-				# Vérifier les positions des agents
+				# Check for stuck agents every second
 				self.check_agent_positions(tick)
 
 				if game.display_window:
 					best_agent = self.get_best_agent()
 					best_player = game.players[best_agent.current_index]
-
-					elapsed_time = tick / 1000
-					game.draw_text(
-						f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}",
-						10,
-						10,
-						font_size=24,
-						color=BLACK
-					)
-
-					game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
-					game.draw_text(f"Time: {elapsed_time:.2f}", 10, 100, font_size=24, color=BLACK)
-					game.draw_text(f"Player: X: {best_player.rect.x}, Y: {best_player.rect.y}", 10, 130, font_size=24, color=BLACK)
-					game.draw_text(f"Checkpoint: {spawn_points.index((spawn_x, spawn_y)) + 1}/{len(spawn_points)}", 10, 160, font_size=24, color=BLACK)
-
-					# Compter les agents encore en vie
+					elapsed_time = tick / self.tick_rate
 					living_agents = sum(1 for agent in self.agents if not agent.player.dead and not agent.player.win)
-					game.draw_text(f"Living agents: {living_agents}/{self.population_size}", 10, 190, font_size=24, color=BLACK)
-
-					# Best fitness ever
-					game.draw_text(f"Best Fitness: {self.best_fitness_ever:.2f}", 10, 220, font_size=24, color=BLACK)
-
-					# Current fitness
+					
+					# Calculate current fitness
 					current_fitness = max(
-						(agent.player.finished_reward if agent.player.finished_reward is not None else agent.player.rect.x / 100)
+						(agent.player.finished_reward if agent.player.finished_reward is not None else agent.player.rect.x / 10)
 						for agent in self.agents
-						if not agent.player.dead
-					) if any(not agent.player.dead for agent in self.agents) else 0
-					game.draw_text(f"Current Fitness: {current_fitness:.2f}", 10, 250, font_size=24, color=BLACK)
+					) if self.agents else 0
 
-					# Manual stop instruction
+					# Draw all info
+					game.draw_text(f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}", 10, 10, font_size=24, color=BLACK)
+					game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
+					game.draw_text(f"Time: {elapsed_time:.2f}s", 10, 100, font_size=24, color=BLACK)
+					game.draw_text(f"Player: X: {best_player.rect.x}, Y: {best_player.rect.y}", 10, 130, font_size=24, color=BLACK)
+					game.draw_text(f"Checkpoint: {checkpoint_idx + 1}/{len(spawn_points)}", 10, 160, font_size=24, color=BLACK)
+					game.draw_text(f"Living agents: {living_agents}/{self.population_size}", 10, 190, font_size=24, color=BLACK)
+					game.draw_text(f"Best Fitness: {self.best_fitness_ever:.2f}", 10, 220, font_size=24, color=BLACK)
+					game.draw_text(f"Current Fitness: {current_fitness:.2f}", 10, 250, font_size=24, color=BLACK)
 					game.draw_text("Press S to skip generation", 10, 280, font_size=24, color=BLACK)
 
 					game.draw()
@@ -293,7 +308,7 @@ class Generation:
 			for agent in self.agents:
 				agent.current_reward += agent.calculate_reward()
 
-			# Reset skip checkpoint flag after checkpoint is complete
+			# Reset skip checkpoint flag
 			self.should_skip_checkpoint = False
 
 		# Update best fitness ever
