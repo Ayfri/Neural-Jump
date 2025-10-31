@@ -39,8 +39,7 @@ class Agent:
 		input_data = np.array(
 			[[tile.get('reward', 0), tile.get('is_solid', 0)] for row in grid for tile in row],
 			dtype=np.float32
-		)
-		input_data = input_data.flatten()
+		)  # Shape: (98,)
 		input_tensor = torch.tensor(input_data).unsqueeze(0).to(self.device)
 
 		with torch.no_grad():
@@ -48,6 +47,28 @@ class Agent:
 
 		best_direction = torch.argmax(output).item()
 		return best_direction
+
+	def calculate_moves_batch(self, grids: list[list[list[Tile]]]) -> list[int]:
+		"""
+		Calculate movements for a batch of grids.
+		:param grids: List of 7x7 grids
+		:return: List of directions
+		"""
+		batch_data = []
+		for grid in grids:
+			input_data = np.array(
+				[[tile.get('reward', 0), tile.get('is_solid', 0)] for row in grid for tile in row],
+				dtype=np.float32
+			)  # Shape: (98,)
+			batch_data.append(input_data)
+		
+		batch_tensor = torch.tensor(np.array(batch_data)).to(self.device)
+
+		with torch.no_grad():
+			outputs = self.model(batch_tensor)
+
+		best_directions = torch.argmax(outputs, dim=1).tolist()
+		return best_directions
 
 	def draw_minimap(self, game: Game, grid: list[list[Tile]], action: int) -> None:
 		"""
@@ -113,46 +134,21 @@ class Agent:
 	def calculate_reward(self) -> float:
 		"""
 		Calculate the reward based on the game outcome.
-		The reward system heavily emphasizes speed:
-		- 0.5s = 10000 points (optimal)
-		- 1s = 5000 points
-		- 2s = 2500 points
-		- 5s = 1000 points
-		- 10s+ = very low rewards
-		Exponential decay encourages agents to go as fast as possible.
+		Simplified reward: distance traveled + bonus for winning.
 		:return: The reward value
 		"""
 		if self.player.finished_reward is not None:
 			if self.player.finished_reward == 1 and self.player.win_tick is not None:
-				# Agent reached the flag - reward based purely on speed
+				# Agent reached the flag - reward based on distance + time bonus
 				time_taken = self.player.win_tick / self.generation.tick_rate
-				
-				# Optimal time: 0.5 seconds
-				optimal_time = 0.5
-				
-				# Exponential decay formula: reward = max_reward * (optimal_time / time_taken)^2
-				# This creates a steep curve where being faster gives exponentially more reward
-				max_reward = 10000
-				
-				if time_taken <= 0.01:  # Avoid division by zero
-					time_taken = 0.01
-				
-				# Calculate reward with exponential decay
-				reward = max_reward * (optimal_time / time_taken) ** 2
-				
-				# Cap minimum reward at 100 for very slow completions
-				reward = max(100, reward)
-				
-				# Cap maximum reward at 20000 for sub-optimal times
-				reward = min(20000, reward)
-				
-				return reward
+				distance_reward = self.player.rect.x / 10
+				time_bonus = max(0, 10 - time_taken) * 100  # Bonus for finishing quickly
+				return distance_reward + time_bonus
 			else:
 				# Other rewards (obstacles, etc.)
 				return self.player.finished_reward * 10
 		else:
-			# Agent didn't complete - small reward based on progress
-			# Much smaller than completion rewards to prioritize finishing
+			# Agent didn't complete - reward based on progress
 			progress_reward = self.player.rect.x / 20
 			
 			# Penalty for dying
