@@ -175,8 +175,8 @@ class Generation:
 		"""
 		current_time = tick / 1000
 
-		# Only check every second
-		if current_time - self.last_position_check < 1:
+		# Only check every 2 seconds
+		if current_time - self.last_position_check < 2:
 			return
 
 		self.last_position_check = current_time
@@ -204,17 +204,17 @@ class Generation:
 
 			positions = self.agent_positions[agent_key]
 
-			# Check if stuck (same position for 3 seconds)
-			if len(positions) >= 3:
-				recent_positions = [pos[1] for pos in positions[-3:]]
+			# Check if stuck (same position for 2 seconds)
+			if len(positions) >= 2:
+				recent_positions = [pos[1] for pos in positions[-2:]]
 				if len(set(recent_positions)) == 1:  # All positions are the same
 					agent.player.set_dead()
 					continue
 
-			# Check if moving backwards (X position decreased over 6 seconds)
-			if len(positions) >= 6:
-				x_6_seconds_ago = positions[0][1]
-				if current_x < x_6_seconds_ago:
+			# Check if moving backwards (X position decreased over 4 seconds)
+			if len(positions) >= 4:
+				x_4_seconds_ago = positions[0][1]
+				if current_x < x_4_seconds_ago:
 					agent.player.set_dead()
 
 	def play_agents(self) -> None:
