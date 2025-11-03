@@ -1,24 +1,34 @@
 import os
+import random
 import re
+from typing import Final
 
-import numpy as np
+import pygame
 import torch
 from torch import nn
+import numpy as np
 
 from ai.agent import Agent
 from game.game import Game
 from game.settings import BLACK
 
-import pygame
+# Generation constants
+DEFAULT_ELITE_COUNT: Final[int] = 4
+DEFAULT_MUTATION_RATE: Final[float] = 0.01
+DEFAULT_MUTATION_STRENGTH: Final[float] = 0.1
+DEFAULT_TICK_RATE: Final[int] = 90
+RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
+POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
+STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
 
 
 class Generation:
 	def __init__(
 		self,
 		population_size: int,
-		elite_count: int = 4,
-		mutation_rate: float = 0.01,
-		mutation_strength: float = 0.1,
+		elite_count: int = DEFAULT_ELITE_COUNT,
+		mutation_rate: float = DEFAULT_MUTATION_RATE,
+		mutation_strength: float = DEFAULT_MUTATION_STRENGTH,
 		load_latest_generation_weights: bool = False,
 		show_window: bool = True,
 		use_checkpoints: bool = False
@@ -28,7 +38,7 @@ class Generation:
 		self.mutation_strength = mutation_strength
 		self.mutation_rate = mutation_rate
 		self.show_window = show_window
-		self.tick_rate = 90
+		self.tick_rate = DEFAULT_TICK_RATE
 		self.generation = 1
 		self.use_checkpoints = use_checkpoints
 		self.agents = [Agent(self.tick_rate, self.show_window, generation=self) for _ in range(population_size)]
@@ -59,9 +69,9 @@ class Generation:
 			new_agents.append(new_agent)
 		
 		# Create offspring from elites
-		random_generator = np.random.default_rng()
-		while len(new_agents) < self.population_size - 5:  # Reserve 5 spots for random agents
-			parent1, parent2 = random_generator.choice(elites, 2, replace=len(elites) < 2)
+		while len(new_agents) < self.population_size - RANDOM_AGENTS_COUNT:
+			parent1 = random.choice(elites)
+			parent2 = random.choice(elites)
 			child_weights = self.crossover(parent1.model.state_dict(), parent2.model.state_dict())
 			new_agent = Agent(self.tick_rate, self.show_window, generation=self)
 			new_agent.model.load_state_dict(child_weights)
@@ -116,12 +126,19 @@ class Generation:
 			weights_data = torch.load(weights_path, weights_only=False)
 			
 			if isinstance(weights_data, dict) and 'weights' in weights_data:
+				weights = weights_data['weights']
+				if not isinstance(weights, dict):
+					raise ValueError("Invalid weights format")
+					
 				for agent in self.agents:
-					agent.model.load_state_dict(weights_data['weights'])
+					agent.model.load_state_dict(weights)
 				self.best_fitness_ever = weights_data.get('best_fitness', 0.0)
 				self.mutation_rate = weights_data.get('mutation_rate', self.mutation_rate)
 				self.mutation_strength = weights_data.get('mutation_strength', self.mutation_strength)
 			else:
+				# Old format - direct state dict
+				if not isinstance(weights_data, dict):
+					raise ValueError("Invalid weights format")
 				for agent in self.agents:
 					agent.model.load_state_dict(weights_data)
 
@@ -129,8 +146,8 @@ class Generation:
 			print(f"Loaded weights for generation {latest_generation}")
 			print(f"Mutation parameters: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
 			self.evolve_generation()
-		except (FileNotFoundError, ValueError):
-			print("No weights found, starting with random weights")
+		except (FileNotFoundError, ValueError) as e:
+			print(f"No weights found, starting with random weights: {e}")
 
 	def skip_checkpoint(self) -> None:
 		"""Skip to next checkpoint"""
@@ -140,7 +157,7 @@ class Generation:
 		"""Check if agents are stuck or moving backwards, kill them if so"""
 		current_time = tick / 1000.0
 
-		if current_time - self.last_position_check < 2:
+		if current_time - self.last_position_check < POSITION_CHECK_INTERVAL:
 			return
 
 		self.last_position_check = current_time
@@ -156,19 +173,19 @@ class Generation:
 				self.agent_positions[agent_key].append((current_time, current_x))
 				self.agent_positions[agent_key] = [
 					pos for pos in self.agent_positions[agent_key]
-					if pos[0] >= current_time - 6
+					if pos[0] >= current_time - STUCK_CHECK_WINDOW
 				]
 
 				positions = self.agent_positions[agent_key]
 
-				# Check if stuck (same position for 2 seconds)
+				# Check if stuck (same position for POSITION_CHECK_INTERVAL seconds)
 				if len(positions) >= 2:
 					recent_x = [pos[1] for pos in positions[-2:]]
 					if len(set(recent_x)) == 1:
 						agent.player.set_dead()
 						continue
 
-				# Check if moving backwards (X decreased over 4 seconds)
+				# Check if moving backwards (X decreased over STUCK_CHECK_WINDOW seconds)
 				if len(positions) >= 4:
 					if current_x < positions[0][1]:
 						agent.player.set_dead()
@@ -257,6 +274,7 @@ class Generation:
 
 		if self.agents:
 			current_max_reward = max(agent.current_reward for agent in self.agents)
-			self.best_fitness_ever = max(self.best_fitness_ever, current_max_reward)
+			if current_max_reward > self.best_fitness_ever:
+				self.best_fitness_ever = current_max_reward
 
 		game.quit()

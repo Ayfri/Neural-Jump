@@ -1,17 +1,35 @@
 import numpy as np
 import pygame
 import torch
+from numpy import ndarray
 from pygame import Surface
 from torch import nn, optim
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from ai.neural_network import NeuralNetwork
+from game.constants import MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
 from game.game import Game
 from game.player import Player
 from game.tiles import Tile
 
 if TYPE_CHECKING:
 	from ai.generation import Generation
+
+# Reward constants
+FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
+NEW_MAX_POSITION_BONUS: Final[float] = 0.1
+BACKWARD_MOVEMENT_PENALTY: Final[float] = -0.1
+STATIONARY_PENALTY: Final[float] = -0.05
+STATIONARY_THRESHOLD: Final[int] = 5  # Ticks before penalty kicks in
+FALLING_PENALTY: Final[float] = -0.02
+FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
+
+DEATH_PENALTY: Final[float] = -20.0
+WIN_TIME_BONUS_MULTIPLIER: Final[float] = 100.0
+WIN_TIME_BONUS_BASE: Final[float] = 10.0
+DISTANCE_REWARD_DIVISOR: Final[float] = 10.0
+PROGRESS_REWARD_DIVISOR: Final[float] = 20.0
+MIN_REWARD: Final[float] = -30.0
 
 
 class Agent:
@@ -39,10 +57,11 @@ class Agent:
 		return self.generation.agents.index(self)
 
 	def calculate_move(self, grid: list[list[Tile]]) -> int:
-		"""Calculate movement based on 7x7 grid (0: jump, 1: left, 2: right)"""
-		input_data = np.array(
-			[tile.get('reward', 0) for row in grid for tile in row] + 
-			[tile.get('is_solid', 0) for row in grid for tile in row],
+		"""Calculate movement based on 7x7 grid (MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT)"""
+		rewards = [tile.get('reward', 0) for row in grid for tile in row]
+		solids = [float(tile.get('is_solid', False)) for row in grid for tile in row]
+		input_data: ndarray[np.float32] = np.array(
+			rewards + solids,
 			dtype=np.float32
 		)
 		input_tensor = torch.tensor(input_data, device=self.device).unsqueeze(0)
@@ -50,7 +69,8 @@ class Agent:
 		with torch.no_grad():
 			output = self.model(input_tensor)
 
-		return int(torch.argmax(output).item())
+		action = int(torch.argmax(output).item())
+		return action
 
 	def draw_minimap(self, game: Game, grid: list[list[Tile]], action: int) -> None:
 		"""Draw minimap showing grid and chosen action"""
@@ -58,7 +78,11 @@ class Agent:
 		tile_size = minimap_size // 7
 		minimap = pygame.Surface((minimap_size, minimap_size * 2))
 		minimap.fill((255, 255, 255))
-		action_colors = [(255, 0, 0), (0, 0, 255), (255, 255, 0)]
+		action_colors = {
+			MOVE_JUMP: (255, 0, 0),    # Red
+			MOVE_LEFT: (0, 0, 255),     # Blue
+			MOVE_RIGHT: (255, 255, 0),  # Yellow
+		}
 
 		for y in range(7):
 			for x in range(7):
@@ -73,7 +97,8 @@ class Agent:
 				if tile.get('reward', 0) != 0:
 					pygame.draw.rect(minimap, (0, 255, 255), (x * tile_size, y * tile_size, tile_size, tile_size), 2)
 
-		pygame.draw.rect(minimap, action_colors[action], (3 * tile_size, 3 * tile_size, tile_size, tile_size), 3)
+		action_color = action_colors.get(action, (128, 128, 128))
+		pygame.draw.rect(minimap, action_color, (3 * tile_size, 3 * tile_size, tile_size, tile_size), 3)
 
 		legend_y = minimap_size + 10
 		legend_items = [
@@ -104,17 +129,17 @@ class Agent:
 		if self.player.finished_reward is not None:
 			if self.player.finished_reward == 1 and self.player.win_tick is not None:
 				time_taken = self.player.win_tick / self.generation.tick_rate
-				distance_reward = self.player.rect.x / 10
-				time_bonus = max(0.0, 10 - time_taken) * 100
+				distance_reward = self.player.rect.x / DISTANCE_REWARD_DIVISOR
+				time_bonus = max(0.0, WIN_TIME_BONUS_BASE - time_taken) * WIN_TIME_BONUS_MULTIPLIER
 				return distance_reward + time_bonus
-			return self.player.finished_reward * 10
+			return self.player.finished_reward * DISTANCE_REWARD_DIVISOR
 		
 		# Use max_x_reached for progress (rewards exploration, not just final position)
-		progress_reward = self.max_x_reached / 20
+		progress_reward = self.max_x_reached / PROGRESS_REWARD_DIVISOR
 		if self.player.dead:
-			progress_reward -= 20
+			progress_reward += DEATH_PENALTY
 		
-		return max(-30.0, progress_reward)  # Allow some negative, but not too harsh
+		return max(MIN_REWARD, progress_reward)  # Floor at minimum reward
 
 	def calculate_continuous_reward(self) -> float:
 		"""Calculate micro-rewards/penalties at each tick"""
@@ -126,24 +151,24 @@ class Agent:
 		x_delta = current_x - self.previous_x
 
 		if x_delta > 0:
-			reward += 0.02  # Increased reward for forward movement
+			reward += FORWARD_MOVEMENT_REWARD
 			if current_x > self.max_x_reached:
-				reward += 0.1  # Increased bonus for new max
+				reward += NEW_MAX_POSITION_BONUS
 				self.max_x_reached = current_x
 		elif x_delta < 0:
-			reward -= 0.1  # Stronger penalty for backward movement
+			reward += BACKWARD_MOVEMENT_PENALTY
 		else:
-			# More aggressive penalty for staying still
+			# Aggressive penalty for staying still
 			self.ticks_stationary += 1
-			if self.ticks_stationary > 5:  # Reduced threshold from 10 to 5
-				reward -= 0.05  # Stronger penalty
+			if self.ticks_stationary > STATIONARY_THRESHOLD:
+				reward += STATIONARY_PENALTY
 
 		if x_delta != 0:
 			self.ticks_stationary = 0
 
 		y_delta = self.player.rect.y - self.previous_y
-		if y_delta > 5:
-			reward -= 0.02  # Stronger falling penalty
+		if y_delta > FALLING_THRESHOLD:
+			reward += FALLING_PENALTY
 
 		self.previous_x = current_x
 		self.previous_y = self.player.rect.y
