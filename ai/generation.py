@@ -48,16 +48,6 @@ class Generation:
 		best_reward = elites[0].current_reward
 		print(f"Selected {len(elites)} elites: {[f'{agent.current_reward:.2f}' for agent in elites]}")
 
-		# Adapt mutation parameters based on progress
-		if best_reward > 100:
-			self.mutation_rate = max(0.05, self.mutation_rate * 0.95)
-			self.mutation_strength = max(0.005, self.mutation_strength * 0.95)
-			print(f"Speed optimization - mutation: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
-		elif best_reward < self.best_fitness_ever * 0.8:
-			self.mutation_rate = min(0.3, self.mutation_rate * 1.05)
-			self.mutation_strength = min(0.1, self.mutation_strength * 1.05)
-			print(f"Exploration mode - mutation: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
-
 		# Preserve elite weights (without mutation)
 		elite_weights = [elite.model.state_dict() for elite in elites]
 		new_agents: list[Agent] = []
