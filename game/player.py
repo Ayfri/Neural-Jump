@@ -1,24 +1,14 @@
 import pygame
 from pygame.sprite import Sprite
-from typing import TypedDict
 
 from game.constants import AGENT_NEAR_PLATFORM_DISTANCE, AGENT_VISION_DISTANCE
 from game.level import Level
 from game.platform import Platform
 from game.settings import (
-	BLACK, PLAYER_SPEED, PLAYER_WIDTH,
-	PLAYER_HEIGHT,
-	PLAYER_COLOR,
-	PLAYER_GRAVITY,
-	PLAYER_JUMP_STRENGTH,
-	SCREEN_HEIGHT,
-	TILE_SIZE,
+	BLACK, PLAYER_SPEED, PLAYER_WIDTH, PLAYER_HEIGHT, PLAYER_COLOR,
+	PLAYER_GRAVITY, PLAYER_JUMP_STRENGTH, SCREEN_HEIGHT, TILE_SIZE,
 )
 from game.tiles import Tile, TILES
-
-
-class EmptyTile(TypedDict, total=False):
-	pass
 
 
 class Player(Sprite):
@@ -36,13 +26,11 @@ class Player(Sprite):
 		self.change_y = 0
 		self.dead = False
 		self.finished_reward: int | None = None
-		self.is_followed = False
 		self.win = False
-		self.win_tick = None
+		self.win_tick: int | None = None
+		self._near_platforms: list[Sprite] = []
 
-		self._near_platforms = list[Sprite]()
-
-	def update(self, tick: int = None) -> None:
+	def update(self, tick: int | None = None) -> None:
 		if self.dead or self.win:
 			return
 
@@ -54,15 +42,14 @@ class Player(Sprite):
 
 		self.calculate_near_platforms()
 
-		# Check for horizontal collisions
-		block_hit_list = self.rect.collideobjectsall(self._near_platforms)
-		for block in block_hit_list:
+		# Check horizontal collisions
+		for block in self.rect.collideobjectsall(self._near_platforms):
 			if not isinstance(block, Platform):
 				continue
 				
 			if block.tile_data.get('reward', False):
 				self.finished_reward = block.tile_data['reward']
-				if block.tile_data['reward'] == 1:  # flag
+				if block.tile_data['reward'] == 1:
 					self.win = True
 					if tick is not None:
 						self.win_tick = tick
@@ -78,15 +65,14 @@ class Player(Sprite):
 
 		self.rect.y += self.change_y
 
-		# Check for vertical collisions
-		block_hit_list = self.rect.collideobjectsall(self._near_platforms)
-		for block in block_hit_list:
+		# Check vertical collisions
+		for block in self.rect.collideobjectsall(self._near_platforms):
 			if not isinstance(block, Platform):
 				continue
 				
 			if block.tile_data.get('reward', False):
 				self.finished_reward = block.tile_data['reward']
-				if block.tile_data['reward'] == 1:  # flag
+				if block.tile_data['reward'] == 1:
 					self.win = True
 					if tick is not None:
 						self.win_tick = tick
@@ -110,10 +96,8 @@ class Player(Sprite):
 
 	def check_death(self) -> bool:
 		if self.rect.top >= (self.level.height - 2) * TILE_SIZE:
-			self.dead = True
-			self.image.set_alpha(40)
+			self.set_dead()
 			return True
-
 		return False
 
 	def set_dead(self) -> None:
@@ -128,7 +112,7 @@ class Player(Sprite):
 		platform_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		self.rect.y -= 2
 
-		if len(platform_hit_list) > 0 or self.rect.bottom >= SCREEN_HEIGHT:
+		if platform_hit_list or self.rect.bottom >= SCREEN_HEIGHT:
 			self.change_y = PLAYER_JUMP_STRENGTH
 
 	def go_left(self) -> None:
@@ -146,46 +130,34 @@ class Player(Sprite):
 		self.change_x = 0
 		self.change_y = 0
 
-	def get_surrounding_tiles(self) -> list[list[Tile | EmptyTile]]:
-		grid: list[list[Tile | EmptyTile]] = []
+	def get_surrounding_tiles(self) -> list[list[Tile]]:
+		grid: list[list[Tile]] = []
 		for dy in range(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1):
-			row: list[Tile | EmptyTile] = []
+			row: list[Tile] = []
 			for dx in range(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1):
 				x = (self.rect.centerx // TILE_SIZE) + dx
 				y = (self.rect.centery // TILE_SIZE) + dy
-				if 0 <= x < self.level.width and 0 <= y < self.level.height:
-					# check if not index out of range
-					if y >= len(self.level.tile_map) or x >= len(self.level.tile_map[y]):
-						empty_tile: EmptyTile = {}
-						row += [empty_tile]
-						continue
-
+				if 0 <= x < self.level.width and 0 <= y < self.level.height and y < len(self.level.tile_map) and x < len(self.level.tile_map[y]):
 					tile = self.level.tile_map[round(y)][round(x)]
-					tile_data = TILES[tile]
-					row += [tile_data]
+					row.append(TILES[tile])
 				else:
-					empty_tile: EmptyTile = {}
-					row += [empty_tile]
-			grid += [row]
+					row.append({})
+			grid.append(row)
 		return grid
 
 	def calculate_near_platforms(self) -> None:
-		"""
-		Collects platforms near the player.
-		"""
+		"""Collect platforms near the player for collision detection"""
 		self._near_platforms = [
 			platform for platform in self.level.platform_list
-			if abs(platform.rect.centerx - self.rect.centerx) <= AGENT_NEAR_PLATFORM_DISTANCE and abs(platform.rect.centery - self.rect.centery) <= AGENT_NEAR_PLATFORM_DISTANCE
+			if abs(platform.rect.centerx - self.rect.centerx) <= AGENT_NEAR_PLATFORM_DISTANCE 
+			and abs(platform.rect.centery - self.rect.centery) <= AGENT_NEAR_PLATFORM_DISTANCE
 		]
 
-	def execute_move(self, direction: int):
-		"""
-		Executes the movement based on the direction provided by the agent.
-		:param direction: Direction of movement (0: jump, 1: left, 2: right)
-		"""
-		if direction == 0:  # Jump
+	def execute_move(self, direction: int) -> None:
+		"""Execute movement (0: jump, 1: left, 2: right)"""
+		if direction == 0:
 			self.jump()
-		elif direction == 1:  # Left
+		elif direction == 1:
 			self.go_left()
-		elif direction == 2:  # Right
+		elif direction == 2:
 			self.go_right()

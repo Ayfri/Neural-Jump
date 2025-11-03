@@ -97,6 +97,8 @@ class Game:
 
 	@cache
 	def _get_font(self, font_size: int) -> Font:
+		if not pygame.font.get_init():
+			pygame.font.init()
 		return pygame.font.SysFont('Arial', font_size)
 
 	def draw_text(self, text: str, x: int, y: int, font_size: int = 20, color: tuple[int, int, int] = (0, 0, 0), alpha: int = 255) -> None:
