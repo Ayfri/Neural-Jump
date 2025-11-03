@@ -1,11 +1,11 @@
+from collections.abc import Callable
 from functools import cache
-from pprint import pprint
 from typing import Protocol
 
 import pygame
 from pygame import Rect, Surface
 from pygame.font import Font
-from pygame.sprite import Group, Sprite
+from pygame.sprite import Group
 from pygame.time import Clock
 
 from game.level import Level
@@ -23,8 +23,8 @@ class Game:
 	followed_player: Player | None = None
 
 	def __init__(self, players_count: int, tick_rate: int = 60, display_window: bool = True, has_playable_player: bool = True) -> None:
-		self.key_actions = dict[int, tuple[callable, str]]()
-		self.players = list[Player]()
+		self.key_actions: dict[int, tuple[Callable[[], None], str]] = {}
+		self.players: list[Player] = []
 		self.level = Level()
 		self.level.load_map('maps/level_1.txt')
 		self.use_checkpoints = False
@@ -33,13 +33,13 @@ class Game:
 			self.player = Player(0, 0)
 			self.player.level = self.level
 			self.player.revive()
-			self.players += [self.player]
+			self.players.append(self.player)
 
 		for _ in range(players_count):
 			player = Player(0, 0)
 			player.level = self.level
 			player.revive()
-			self.players += [player]
+			self.players.append(player)
 
 		self.tick_rate = tick_rate
 		self.active_sprite_list = Group()
@@ -49,9 +49,9 @@ class Game:
 		self.screen: Surface | None = None
 		self.running = False
 		self.display_window = display_window
-		self.additional_draws = list[tuple[Surface, tuple[int, int]]]()
+		self.additional_draws: list[tuple[Surface, tuple[int, int]]] = []
 
-	def add_key_action(self, key: int, action: callable, description: str = "") -> None:
+	def add_key_action(self, key: int, action: Callable[[], None], description: str = "") -> None:
 		"""Add a custom key action to the game."""
 		self.key_actions[key] = (action, description)
 
@@ -83,13 +83,14 @@ class Game:
 					self.player.rect.y = spawn_point[1]
 
 			if event.type == pygame.KEYUP:
-				if event.key == pygame.K_LEFT and self.player.change_x < 0:
-					self.player.stop()
-				if event.key == pygame.K_RIGHT and self.player.change_x > 0:
-					self.player.stop()
+				if self.player is not None:
+					if event.key == pygame.K_LEFT and self.player.change_x < 0:
+						self.player.stop()
+					if event.key == pygame.K_RIGHT and self.player.change_x > 0:
+						self.player.stop()
 
 			# Restart the game when typing R
-			if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+			if event.type == pygame.KEYDOWN and event.key == pygame.K_r and self.player is not None:
 				self.level.restart()
 				spawn_point = self.level.get_random_spawn_point(self.use_checkpoints)
 				self.player.rect.x = spawn_point[0]
@@ -129,23 +130,20 @@ class Game:
 
 		self.quit()
 
-	def update(self, tick: int = None) -> None:
+	def update(self, tick: int | None = None) -> None:
 		self.level.update()
 		for player in self.players:
 			player.update(tick)
 		self.clock.tick(self.tick_rate)
 
 		alive_players = [player for player in self.players if not player.dead and not player.win]
-		if not len(alive_players):
+		if not alive_players:
 			return
 
 		alive_players.sort(key=lambda player: player.rect.x, reverse=True)
 
-		# Update followed players
-		if self.followed_player:
-			self.followed_player.is_followed = False
+		# Update followed players (no need for is_followed attribute)
 		self.followed_player = alive_players[0]
-		self.followed_player.is_followed = True
 		self.level.follow_player(self.followed_player)
 
 	def draw_sprite(self, sprite: HasImageAndRect):
@@ -166,7 +164,7 @@ class Game:
 	def draw(self) -> None:
 		assert self.screen is not None
 		self.screen.fill(WHITE)
-		for platform in self.level.platform_list:
+		for platform in self.level.platforms:
 			self.draw_sprite(platform)
 		self.draw_checkpoints()
 		for active_sprite in self.active_sprite_list:
@@ -193,7 +191,7 @@ class Game:
 		else:
 			self.draw_text("Checkpoints Mode: OFF", 10, y_offset, font_size=16, alpha=128)
 
-		for surface, destination in self.additional_draws.copy():
+		for surface, destination in self.additional_draws:
 			self.screen.blit(surface, destination)
 		self.additional_draws = []
 		pygame.display.flip()

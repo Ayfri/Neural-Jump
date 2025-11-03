@@ -1,7 +1,7 @@
 import pygame
 from pygame.sprite import Sprite
 
-from game.constants import AGENT_NEAR_PLATFORM_DISTANCE, AGENT_VISION_DISTANCE
+from game.constants import AGENT_NEAR_PLATFORM_DISTANCE, AGENT_VISION_DISTANCE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
 from game.level import Level
 from game.platform import Platform
 from game.settings import (
@@ -22,13 +22,13 @@ class Player(Sprite):
 		self.rect = self.image.get_rect()
 		self.rect.x = x
 		self.rect.y = y
-		self.change_x = 0
-		self.change_y = 0
+		self.change_x: float = 0.0
+		self.change_y: float = 0.0
 		self.dead = False
 		self.finished_reward: int | None = None
 		self.win = False
 		self.win_tick: int | None = None
-		self._near_platforms: list[Sprite] = []
+		self._near_platforms: list[Platform] = []
 
 	def update(self, tick: int | None = None) -> None:
 		if self.dead or self.win:
@@ -86,11 +86,11 @@ class Player(Sprite):
 			elif self.change_y < 0:
 				self.rect.top = block.rect.bottom
 
-			self.change_y = 0
+			self.change_y = 0.0
 
 	def calc_grav(self) -> None:
-		if self.change_y == 0:
-			self.change_y = 1
+		if self.change_y == 0.0:
+			self.change_y = 1.0
 		else:
 			self.change_y += PLAYER_GRAVITY
 
@@ -122,13 +122,13 @@ class Player(Sprite):
 		self.change_x = PLAYER_SPEED
 
 	def stop(self) -> None:
-		self.change_x = 0
+		self.change_x = 0.0
 
 	def revive(self) -> None:
 		self.dead = False
 		self.image.set_alpha(255)
-		self.change_x = 0
-		self.change_y = 0
+		self.change_x = 0.0
+		self.change_y = 0.0
 
 	def get_surrounding_tiles(self) -> list[list[Tile]]:
 		grid: list[list[Tile]] = []
@@ -147,17 +147,18 @@ class Player(Sprite):
 
 	def calculate_near_platforms(self) -> None:
 		"""Collect platforms near the player for collision detection"""
+		platforms = [sprite for sprite in self.level.platform_list if isinstance(sprite, Platform)]
 		self._near_platforms = [
-			platform for platform in self.level.platform_list
+			platform for platform in platforms
 			if abs(platform.rect.centerx - self.rect.centerx) <= AGENT_NEAR_PLATFORM_DISTANCE 
 			and abs(platform.rect.centery - self.rect.centery) <= AGENT_NEAR_PLATFORM_DISTANCE
 		]
 
 	def execute_move(self, direction: int) -> None:
-		"""Execute movement (0: jump, 1: left, 2: right)"""
-		if direction == 0:
+		"""Execute movement (MOVE_JUMP: jump, MOVE_LEFT: left, MOVE_RIGHT: right)"""
+		if direction == MOVE_JUMP:
 			self.jump()
-		elif direction == 1:
+		elif direction == MOVE_LEFT:
 			self.go_left()
-		elif direction == 2:
+		elif direction == MOVE_RIGHT:
 			self.go_right()

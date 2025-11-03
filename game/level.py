@@ -1,13 +1,13 @@
 import os
-from typing import Sequence, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import pygame
 from pygame import Surface
 from pygame.sprite import Group
 
 from game.platform import Platform
-from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, SHIFT_THRESHOLD_X, TILE_SIZE, WHITE
-from game.tiles import Tile, TILES
+from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE, WHITE
+from game.tiles import TILES
 
 if TYPE_CHECKING:
 	from game.player import Player
@@ -39,7 +39,9 @@ class Level:
 
 	@property
 	def platforms(self) -> list[Platform]:
-		return self.platform_list.sprites()
+		sprites = self.platform_list.sprites()
+		# Group.sprites() returns List[Sprite] but we know they are all Platforms
+		return sprites  # type: ignore[return-value]
 
 	def update(self) -> None:
 		self.platform_list.update()
@@ -76,7 +78,7 @@ class Level:
 						checkpoint_y = y * TILE_SIZE + offset_y
 						self.checkpoints.append((checkpoint_x, checkpoint_y))
 					elif not tile_data.get('is_air', False):
-						block = Platform(x * TILE_SIZE, y * TILE_SIZE + offset_y, dict(tile_data))
+						block = Platform(x * TILE_SIZE, y * TILE_SIZE + offset_y, tile_data)
 						self.platform_list.add(block)
 
 			self.tile_map += [row]

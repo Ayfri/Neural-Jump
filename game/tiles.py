@@ -1,10 +1,10 @@
 from typing import TypedDict
 
-from game.settings import AQUA, BLACK, GREEN, RED, SEMI_RED, WHITE
+from game.settings import AQUA, BLACK, GREEN, RED
 
 
 class Tile(TypedDict, total=False):
-	color: tuple[int, int, int]
+	color: tuple[int, int, int] | tuple[int, int, int, int]
 	is_air: bool
 	is_solid: bool
 	is_player: bool
@@ -18,7 +18,7 @@ TILES: dict[str, Tile] = {
 		'is_solid': True,
 	},
 	'*': {
-		'color': SEMI_RED,
+		'color': RED,
 	},
 	'_': {
 		'color': BLACK,
