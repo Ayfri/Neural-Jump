@@ -7,12 +7,12 @@ name = "neural-jump"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "matplotlib==3.10.7",
-    "numpy==2.3.4",
-    "pandas==2.3.3",
-    "scikit-learn==1.7.2",
+    "matplotlib==3.10.9",
+    "numpy==2.4.6",
+    "pandas==3.0.3",
+    "scikit-learn==1.8.0",
     "seaborn==0.13.2",
-    "torch==2.9.0",
+    "torch==2.12.0",
     "pygame==2.6.1"
 ]
 
@@ -20,14 +20,14 @@ dependencies = [
 include = ["ai", "game"]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
