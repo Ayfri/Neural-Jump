@@ -1,7 +1,6 @@
 import numpy as np
 import pygame
 import torch
-from numpy import ndarray
 from pygame import Surface
 from torch import optim
 import torch.nn.functional as F
@@ -63,20 +62,37 @@ class Agent:
 
 	def _grid_to_numpy(self, grid: list[list[Tile]]) -> np.ndarray:
 		return np.array(
-			[[tile.get('reward', 0), tile.get('is_solid', 0)] for row in grid for tile in row],
+			[
+				[
+					float(tile.get('is_solid', False)),
+					float(tile.get('reward', 0) == 1),           # flag tile (win condition)
+					float(tile.get('reward', 0) > 0),            # any reward tile
+					float(not tile.get('is_solid', False) and tile.get('reward', 0) == 0),  # empty/passable
+				]
+				for row in grid for tile in row
+			],
 			dtype=np.float32,
-		).flatten()
+		).flatten()  # 49 * 4 = 196
 
-	def _encode_grid(self, grid: list[list[Tile]]) -> torch.Tensor:
-		return torch.from_numpy(self._grid_to_numpy(grid)).unsqueeze(0).to(self.device)
+	def _encode_state(self, grid: list[list[Tile]]) -> torch.Tensor:
+		grid_data = self._grid_to_numpy(grid)
+		if self.player is not None:
+			player_state = np.array([
+				self.player.change_x / 8.0,                    # normalised by max speed
+				self.player.change_y / 20.0,                   # normalised by ~max fall speed
+				float(abs(self.player.change_y) <= 2.0),       # approximately on ground
+			], dtype=np.float32)
+		else:
+			player_state = np.zeros(3, dtype=np.float32)
+		return torch.from_numpy(np.concatenate([grid_data, player_state])).unsqueeze(0).to(self.device)
 
 	def calculate_move(self, grid: list[list[Tile]]) -> int:
 		with torch.no_grad():
-			action, _, _ = self.model.get_action(self._encode_grid(grid), deterministic=False)
+			action, _, _ = self.model.get_action(self._encode_state(grid), deterministic=False)
 		return action
 
 	def calculate_move_with_learning(self, grid: list[list[Tile]]) -> int:
-		action, action_probs, state_value = self.model.get_action(self._encode_grid(grid), deterministic=False)
+		action, action_probs, state_value = self.model.get_action(self._encode_state(grid), deterministic=False)
 		self.actions.append(action)
 		self.values.append(state_value)
 		self.action_probs.append(action_probs)
@@ -107,10 +123,10 @@ class Agent:
 		values = torch.cat(self.values, dim=0).squeeze()
 		action_probs = torch.cat(self.action_probs, dim=0)
 
+		dist = torch.distributions.Categorical(action_probs)
 		advantages = returns_tensor - values.detach()
-		log_probs = torch.log(action_probs.gather(1, actions.unsqueeze(1)).squeeze())
-		actor_loss = -(log_probs * advantages).mean()
-		entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=1).mean()
+		actor_loss = -(dist.log_prob(actions) * advantages).mean()
+		entropy = dist.entropy().mean()
 		critic_loss = F.mse_loss(values, returns_tensor)
 		total_loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy
 
@@ -128,9 +144,10 @@ class Agent:
 		self.action_probs = []
 
 	def calculate_moves_batch(self, grids: list[list[list[Tile]]]) -> list[int]:
-		batch_tensor = torch.from_numpy(np.stack([self._grid_to_numpy(g) for g in grids])).to(self.device)
+		pad = np.zeros(3, dtype=np.float32)
+		batch = np.stack([np.concatenate([self._grid_to_numpy(g), pad]) for g in grids])
 		with torch.no_grad():
-			action_probs, _ = self.model(batch_tensor)
+			action_probs, _ = self.model(torch.from_numpy(batch).to(self.device))
 		return torch.argmax(action_probs, dim=1).tolist()
 
 	def draw_minimap(self, game: Game, grid: list[list[Tile]], action: int) -> None:
