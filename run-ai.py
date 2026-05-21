@@ -13,6 +13,7 @@ def main() -> None:
 	argparser.add_argument("--load-latest-generation-weights", action="store_true")
 	argparser.add_argument("--show-window", action="store_true")
 	argparser.add_argument("--checkpoints", action="store_true", help="Use checkpoints as spawn points")
+	argparser.add_argument("--no-use-a2c", dest="use_a2c", action="store_false", default=True, help="Disable A2C and use only genetic algorithm")
 	args = argparser.parse_args()
 
 	generation = Generation(
@@ -21,9 +22,12 @@ def main() -> None:
 		mutation_strength=args.mutation_strength,
 		load_latest_generation_weights=args.load_latest_generation_weights,
 		show_window=args.show_window,
-		use_checkpoints=args.checkpoints
+		use_checkpoints=args.checkpoints,
+		use_a2c_learning=args.use_a2c
 	)
 
+	learning_method = "A2C + Genetic Algorithm" if args.use_a2c else "Genetic Algorithm only"
+	print(f"--- Training with: {learning_method} ---")
 	print(f"--- Generation {generation.generation}, mutation rate: {generation.mutation_rate:.3f} - mutation strength: {generation.mutation_strength:.3f} ---")
 	while True:
 		generation.play_agents()
