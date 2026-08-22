@@ -26,9 +26,9 @@ if TYPE_CHECKING:
 
 # Evolution
 DEFAULT_POPULATION_SIZE: Final[int] = 300
-DEFAULT_ELITE_COUNT: Final[int] = 4
+DEFAULT_ELITE_COUNT: Final[int] = 6
 DEFAULT_MUTATION_RATE: Final[float] = 0.8
-DEFAULT_MUTATION_STRENGTH: Final[float] = 0.008  # Swept: the level is reached on every seed here, and less often either side
+DEFAULT_MUTATION_STRENGTH: Final[float] = 0.02  # Swept: the level gets furthest here, and a plateau outlives a run either side
 RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
 
 # Simulation

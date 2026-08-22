@@ -30,9 +30,9 @@ The first generation of a run is slower than the rest, because that is where the
 
 - `--population-size N`: agents per generation (default: 300). A tick at 300 agents costs about 1.4x a tick
   at 100 while trying three times as many mutations, and those extra mutations are what break a plateau
-- `--elite-count N`: agents carried over untouched and used as parents (default: 4)
+- `--elite-count N`: agents carried over untouched and used as parents (default: 6)
 - `--mutation-rate R`: probability that a child's weight tensor is mutated at all (default: 0.8)
-- `--mutation-strength S`: scale of the noise added to a mutated tensor (default: 0.008)
+- `--mutation-strength S`: scale of the noise added to a mutated tensor (default: 0.02)
 
 *network* - shape and placement of the policy
 
@@ -205,22 +205,25 @@ is ever read, so their spread is never shaped into a distribution worth sampling
 
 ## Picking the mutation strength
 
-Swept at 300 agents over 40 generations on five seeds each, counting how often the run reaches the flag and
-how far into the run it gets there. `pack` is the population's mean fitness over the last five generations,
-which says how closely the rest follows its elites.
+Swept at 300 agents over 200 generations on five seeds each, on `maps/level_1.txt`, scored by the furthest
+tile the population reaches out of the level's 764.
 
-| `--mutation-strength` | reached the flag | generation it took | pack |
-| --- | --- | --- | --- |
-| 0.002 | 2/5 | 6, 31 | 384 |
-| 0.004 | 3/5 | 14, 14, 18 | 345 |
-| **0.008** | **5/5** | **3, 8, 9, 12, 16** | 224 |
-| 0.015 | 4/5 | 7, 11, 28, 34 | 129 |
-| 0.03 | 2/3 | 23, 36 | 86 |
-| 0.06 | 2/3 | 30, 39 | 67 |
+| `--mutation-strength` | mean tile | per seed |
+| --- | --- | --- |
+| 0.008 | 497 | 504, 514, 199, 501, 767 |
+| 0.015 | 606 | 697, 628, 499, 697, 509 |
+| **0.02** | **709** | **758, 697, 697, 697, 697** |
+| 0.03 | 580 | 494, 504, 509, 697, 697 |
 
-Weights start with a standard deviation near 0.04, so 0.03 is close to a full sigma and leaves most children
-as damaged copies of their parent. That is what makes the elite run away alone on screen. Too small and the
-population never finds the jump it is missing.
+The per-seed column matters more than the mean: below 0.02 a seed can spend its whole run stuck on the tile
+it plateaued at, because the population has converged onto one lineage and the noise is no longer wide enough
+to find the jump it is missing. Weights start with a standard deviation near 0.04, so 0.03 is close to a full
+sigma and leaves most children as damaged copies of their parent, which is what makes the elite run away
+alone on screen.
+
+Population size buys the same thing, and a run that plateaus is short of both: over 300 generations at 0.02,
+100 agents reach tile 511 on average and never see the flag, 300 agents reach 718, and 1000 agents reach the
+flag on two seeds out of five.
 
 ## Performance
 
