@@ -67,10 +67,10 @@ uv run run-ai.py --show-window --speed 4                          # watchable
 
 Every agent's state is in its sprite, so one glance reads the whole population:
 
-- **Fill color**: fitness rank, red (worst) to teal (best). **Grey**: dead. **Violet fill**: reached the flag
-- **Chevron**: heading, a square when standing still. **Blue arrow above the head**: rising, so it jumped
+- **Body color**: fitness rank, red (worst) to teal (best). **Grey with shut eyes**: dead. **Blue body**: reached the flag
+- **Eyes**: heading, pushed left or right, centred while standing still. **Blue arrow above the head**: rising, so it jumped
 - **Gold outline**: an elite carried over untouched. **Violet outline**: a re-randomised agent, kept for diversity
-- **Dark outline**: the agent the camera follows, the best one still alive
+- **White outline**: the agent the camera follows, the best one still alive
 
 The panels cover the run, the followed agent, the hyper-parameters, and the fitness distribution next to the
 best score of every generation so far.
@@ -128,8 +128,8 @@ A policy over a 7x7 tile view plus the player's own state:
 - **Hidden**: 256, 128, 64 (LayerNorm on the first two, leaky ReLU)
 - **Output**: 3 logits (jump, left, right), played as an argmax
 
-Terrain gets a number per tile, rewards and coins do not. The map holds 24 reward tiles and 215 coins out of
-22,800, so a channel per tile for them would spend most of the observation saying "still nothing here", while
+Terrain gets a number per tile, the flag and the coins do not. The map holds 20 flag tiles and 217 coins out of
+22,920, so a channel per tile for them would spend most of the observation saying "still nothing here", while
 one offset to the closest one points at the flag directly rather than leaving the network to read a position
 out of a one-hot grid. The coin block is baked with the terrain, so it still points at a coin the agent has
 already banked.
@@ -147,7 +147,7 @@ of two random elites, and a few slots are re-randomised for diversity.
 - **Backward**: -0.1, **stationary**: -0.05 after 5 ticks, **falling**: -0.02 past 5 pixels
 - **Death**: -20, **progress**: max distance / 20, plus up to 100 for how early the record was set, floored at -30
 - **Win**: distance / 10, +200 for the flag, plus up to 1200 on the square of the episode time left
-- **Coins**: +5 each, added to whatever the run scored, so the 215 coins of the level are worth 1075 to an
+- **Coins**: +5 each, added to whatever the run scored, so the 217 coins of the level are worth 1085 to an
   agent that could sweep them all, and a detour for one is always worth something
 
 Time is part of the fitness on both paths: an agent that touches the flag halfway through the episode scores
@@ -159,17 +159,16 @@ generation ends sooner.
 
 ## The level
 
-`maps/level_1.txt` is 760 tiles wide and 30 tall, read one character per tile:
+`maps/level_1.txt` is 764 tiles wide and 30 tall, read one character per tile:
 
 | Char | Tile |
 | --- | --- |
 | `#` | Solid terrain |
 | `.` | Air |
 | `P` | Spawn point |
-| `@` | Checkpoint, an extra spawn point under `--checkpoints`, drawn as a violet frame |
-| `o` | Coin, worth fitness and nothing else, drawn as a gold disc |
+| `@` | Checkpoint, an extra spawn point under `--checkpoints`, drawn as a violet banner |
+| `o` | Coin, worth fitness and nothing else, drawn as a gold coin |
 | `F` | The flag: touching it wins the episode |
-| `R` | Treasure, worth 8000 to an agent that never reaches the flag |
 | `*` | Decoration, no collision |
 
 Geometry follows the jump: a jump rises 4.5 tiles and its arc covers 8, so steps stay within 3 tiles and gaps
@@ -259,13 +258,26 @@ What is left is the pass itself, bound by reading every agent's weights: 300 age
 parameters is 34 MB, near the memory bandwidth of the card. That is also why the observation is worth
 keeping small, and why `--hidden-sizes` is the last lever on it.
 
+**A frame is a blit and two lists.** The sky, the terrain, the checkpoints and the goal never move, so the
+whole level is painted once into a single opaque surface in the display's own format and a frame draws it with
+one copy of the camera rectangle, whatever the map size. Over it go two batched `blits` calls, one for the
+bodies and one for the markers, filled only with what the camera actually covers: the players are tested
+against the screen as one numpy mask, and the coins are held sorted by x so two binary searches cut the map
+down to the column in view.
+
+**Nothing is painted twice.** Every sprite is a character grid blown up with nearest-neighbour scaling, cached
+under the values that shaped it, and there are few enough of those to cache the lot: sixteen terrain blocks
+per speckle layout, one sprite per fitness bucket, heading and state. A frame never draws a shape, it only
+copies surfaces.
+
 ## Layout
 
 `ai/` holds the learning code: `generation.py` is the training loop, rewards and weight files, `population.py`
 is the batched network. `game/` holds the engine: `world.py` is the batched numpy simulation, `render.py` the
-camera-culled renderer and the panels drawn over it, `play.py` the human-played session on top of both. Both
-entry points fill the same `Hud` and the renderer only lays it out. Levels are text files in `maps/`, weights
-land in `weights/`, physics constants live in `game/settings.py`.
+camera-culled renderer and the panels drawn over it, `art.py` every sprite it draws with, `play.py` the
+human-played session on top of both. Both entry points fill the same `Hud` and the renderer only lays it out.
+Levels are text files in `maps/`, `tiles.py` maps their characters to a `TileKind`, weights land in `weights/`,
+screen and physics constants live in `game/settings.py`.
 
 ## License
 
