@@ -14,11 +14,11 @@ from game.tiles import TILES
 PLAYER_W: Final[int] = int(PLAYER_WIDTH)
 PLAYER_H: Final[int] = int(PLAYER_HEIGHT)
 GRID_SIDE: Final[int] = AGENT_VISION_DISTANCE * 2 + 1
-GRID_TILES: Final[int] = GRID_SIDE * GRID_SIDE
-GRID_CHANNELS: Final[int] = 4  # is_solid, is_flag, has_reward, is_empty per tile
-GRID_FEATURES: Final[int] = GRID_TILES * GRID_CHANNELS
+GRID_TILES: Final[int] = GRID_SIDE * GRID_SIDE  # One solid flag each, which is the whole terrain
+REWARD_FEATURES: Final[int] = 4  # in view, its offset in x and y, is it the flag, for the closest reward tile
+WINDOW_FEATURES: Final[int] = GRID_TILES + REWARD_FEATURES
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
-OBSERVATION_SIZE: Final[int] = GRID_FEATURES + PLAYER_FEATURES
+OBSERVATION_SIZE: Final[int] = WINDOW_FEATURES + PLAYER_FEATURES
 # Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
 # halving the host-to-device copy done every tick.
 OBSERVATION_DTYPE: Final[np.dtype[np.float16]] = np.dtype(np.float16)
@@ -48,6 +48,32 @@ def resolve_map_path(map_path: str) -> str:
 	"""Resolves a map path like 'maps/level_1.txt' to an absolute path."""
 	folder = search_maps_folder(os.path.dirname(map_path))
 	return folder + os.sep + os.path.basename(map_path)
+
+
+def closest_reward(windows: NDArray[np.float32]) -> NDArray[np.float32]:
+	"""
+	Summarises the reward tiles of a window: whether one is in view, where it is, and whether it is the flag.
+
+	A map holds a handful of reward tiles in total, so a channel per tile spends most of the observation
+	saying "still nothing here". Four numbers carry what a player can act on instead, and point at the flag
+	directly rather than leaving the network to read a position out of a one-hot grid.
+	"""
+	rows, columns = np.divmod(np.arange(GRID_TILES), GRID_SIDE)
+	rows = rows - AGENT_VISION_DISTANCE
+	columns = columns - AGENT_VISION_DISTANCE
+	# Tiles walked nearest first, so the first hit of the scan is the closest reward
+	order = np.argsort(rows ** 2 + columns ** 2, kind='stable')
+
+	found = windows[:, order] != 0
+	closest = order[found.argmax(axis=1)]
+	in_view = found.any(axis=1)
+
+	features = np.zeros((len(windows), REWARD_FEATURES), dtype=np.float32)
+	features[:, 0] = in_view
+	features[:, 1] = columns[closest] / AGENT_VISION_DISTANCE * in_view
+	features[:, 2] = rows[closest] / AGENT_VISION_DISTANCE * in_view
+	features[:, 3] = (windows[np.arange(len(windows)), closest] == 1) & in_view
+	return features
 
 
 def tile_of(values: NDArray[np.float64]) -> NDArray[np.int64]:
@@ -114,13 +140,6 @@ class World:
 		# Padded copies: any tile index is clamped into the air border instead of being bounds-checked
 		self.padded_solid = np.pad(self.solid, GRID_PADDING)
 		self.padded_reward = np.pad(self.reward, GRID_PADDING)
-		# Channel-last grid, so the whole 7x7x4 window of every player comes out of one contiguous gather
-		self.padded_grid = np.stack([
-			self.padded_solid,
-			self.padded_reward == 1,
-			self.padded_reward > 0,
-			~self.padded_solid & (self.padded_reward == 0),
-		], axis=-1).astype(OBSERVATION_DTYPE)
 		self._max_row = self.height + 2 * GRID_PADDING - 1
 		self._max_column = self.width + 2 * GRID_PADDING - 1
 		# Collision lookups index these flat views: `take` on one flat array beats a broadcast fancy index
@@ -134,13 +153,17 @@ class World:
 		near_reward[:, :-1] |= near_reward[:, 1:].copy()
 		self._flat_near_reward = near_reward.ravel()
 
-		# Every 7x7x4 window of the map, flattened and baked once: an observation is then a single gather of
-		# contiguous rows instead of a broadcast fancy index rebuilt per tick.
-		windows = sliding_window_view(self.padded_grid, (GRID_SIDE, GRID_SIDE), axis=(0, 1))
-		self._window_stride = windows.shape[1]
-		self._windows = np.ascontiguousarray(windows.transpose(0, 1, 3, 4, 2)).reshape(-1, GRID_FEATURES)
-		self._max_window_row = windows.shape[0] - 1
+		# Every window of the map, baked once: an observation is then a single gather of contiguous rows
+		# instead of a broadcast fancy index rebuilt per tick.
+		solid_windows = sliding_window_view(self.padded_solid, (GRID_SIDE, GRID_SIDE))
+		reward_windows = sliding_window_view(self.padded_reward, (GRID_SIDE, GRID_SIDE))
+		self._max_window_row = solid_windows.shape[0] - 1
+		self._window_stride = solid_windows.shape[1]
 		self._max_window_column = self._window_stride - 1
+
+		self._windows = np.empty((solid_windows.shape[0] * self._window_stride, WINDOW_FEATURES), dtype=OBSERVATION_DTYPE)
+		self._windows[:, :GRID_TILES] = solid_windows.reshape(-1, GRID_TILES)
+		self._windows[:, GRID_TILES:] = closest_reward(reward_windows.reshape(-1, GRID_TILES))
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
@@ -191,8 +214,8 @@ class World:
 
 	def observe(self, out: NDArray[np.float16] | None = None) -> NDArray[np.float16]:
 		"""
-		Fills `out` (or the world's own buffer) with the (count, 199) observation: the 7x7 tile window
-		around each player encoded as four channels per tile (solid, flag, reward, empty), followed by the
+		Fills `out` (or the world's own buffer) with the (count, 56) observation: the solid flag of every
+		tile in the 7x7 window around the player, where the closest reward tile in it sits, and the
 		player's own speed and ground state.
 		"""
 		target = self._observation if out is None else out
@@ -205,10 +228,10 @@ class World:
 		rows *= self._window_stride
 		rows += columns
 
-		np.take(self._windows, rows, axis=0, out=target[:, :GRID_FEATURES])
-		target[:, GRID_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
-		target[:, GRID_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
-		target[:, GRID_FEATURES + 2] = self.on_ground()
+		np.take(self._windows, rows, axis=0, out=target[:, :WINDOW_FEATURES])
+		target[:, WINDOW_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
+		target[:, WINDOW_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
+		target[:, WINDOW_FEATURES + 2] = self.on_ground()
 		return target
 
 	def step(self, actions: NDArray[np.int64], tick: int) -> None:

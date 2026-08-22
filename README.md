@@ -79,10 +79,15 @@ best score of every generation so far.
 
 A policy over a 7x7 tile view plus the player's own state:
 
-- **Input**: 199 features, 4 channels per tile (solid, flag, reward, empty) plus horizontal speed, vertical
-  speed and ground contact
+- **Input**: 56 features. One solid flag per tile, then the closest reward tile in view as `in view, dx, dy,
+  is the flag`, then horizontal speed, vertical speed and ground contact
 - **Hidden**: 256, 128, 64 (LayerNorm on the first two, leaky ReLU)
 - **Output**: 3 logits (jump, left, right), played as an argmax
+
+Terrain gets a number per tile, rewards do not. The map holds 7 reward tiles out of 9,913, so a channel per
+tile for them would spend most of the observation saying "still nothing here", while one offset to the
+closest one points at the flag directly rather than leaving the network to read a position out of a one-hot
+grid.
 
 Every agent shares that shape, so the population lives in one `(agents, in, out)` tensor per layer and a
 forward pass for everyone is a single `baddbmm` per layer. Crossover, mutation and elitism are plain tensor
@@ -149,9 +154,10 @@ collisions read a flat grid through `take` rather than a broadcast fancy index, 
 calls that snaps a blocked player collapses into one select per direction. Reward tiles are rare, so one
 lookup in a baked "any reward in these four tiles" map skips the reward gather on almost every tick.
 
-**Vision is baked.** The 7x7x4 window of every tile is built once at load time, so an observation is a single
-gather. It is written in half precision straight into a page-locked buffer the device copies from, so a tick
-crosses PCIe once each way with no staging copy in between.
+**Vision is baked.** The window of every tile in the map, terrain and reward vector both, is built once at
+load time, so an observation is a single gather of one row. It is written in half precision straight into a
+page-locked buffer the device copies from, so a tick crosses PCIe once each way with no staging copy in
+between.
 
 **The forward pass is one graph replay.** A pass is a few dozen tiny kernels, so it is bound by launch
 latency: both action passes, argmax and sampled, are captured as CUDA graphs, which is about 3x faster than
@@ -163,9 +169,9 @@ started at the end of the tick before the one that plays it, and that tick's phy
 decides. The observation is taken at the same point either way, so a run is identical to a serial one, down
 to the last float.
 
-What is left is the pass itself, bound by reading every agent's weights: 300 agents of 92k half precision
-parameters is 55 MB, near the memory bandwidth of the card. Smaller `--hidden-sizes` are the only lever left
-on it, and the first layer holds more than half of those weights.
+What is left is the pass itself, bound by reading every agent's weights: 300 agents of 57k half precision
+parameters is 34 MB, near the memory bandwidth of the card. That is also why the observation is worth
+keeping small, and why `--hidden-sizes` is the last lever on it.
 
 ## Layout
 
