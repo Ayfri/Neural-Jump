@@ -134,6 +134,7 @@ class Generation:
 		self._previous_x = np.zeros(population_size, dtype=np.float64)
 		self._previous_y = np.zeros(population_size, dtype=np.float64)
 		self._actions = np.zeros(population_size, dtype=np.int64)
+		self._tick_rewards = np.zeros(population_size, dtype=np.float64)  # Scratch the per-tick terms land in
 
 		self.renderer: Renderer | None = None
 		self.ticks_per_frame = 1.0
@@ -312,7 +313,7 @@ class Generation:
 		if (tick + 1) % self.action_repeat == 0:
 			self.decide()
 
-		self.rewards += self.continuous_rewards(alive, self._previous_x, self._previous_y, tick)
+		self.add_continuous_rewards(alive, self._previous_x, self._previous_y, tick)
 
 		self.check_agent_positions(tick)
 		self.total_ticks += 1
@@ -353,29 +354,34 @@ class Generation:
 		self.live_speed = instant if self.live_speed == 0.0 else self.live_speed * 0.6 + instant * 0.4
 		self._speed_time, self._speed_ticks = now, self.total_ticks
 
-	def continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64], tick: int) -> NDArray[np.float64]:
-		"""Per-tick micro rewards, computed for the whole population at once."""
+	def add_continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64], tick: int) -> None:
+		"""Per-tick micro rewards, accumulated into `self.rewards` for the whole population at once."""
 		# Every term is a masked add rather than a mask multiplied by its value, which halves the numpy calls
-		x_delta = self.world.x - previous_x
-		rewards = np.zeros(self.population_size, dtype=np.float64)
+		world = self.world
+		x_delta = world.x - previous_x
+		rewards = self._tick_rewards
+		rewards.fill(0.0)
 
 		forward = x_delta > 0
-		record = forward & alive & (self.world.x > self.max_x_reached)
 		np.add(rewards, FORWARD_MOVEMENT_REWARD, out=rewards, where=forward)
+		# Only a living player ever moves, so a step forward is already proof the agent was alive for it
+		record = forward & (world.x > self.max_x_reached)
 		np.add(rewards, NEW_MAX_POSITION_BONUS, out=rewards, where=record)
 		np.copyto(self.max_x_tick, float(tick), where=record)
-		np.maximum(self.max_x_reached, self.world.x, out=self.max_x_reached, where=forward)
+		np.copyto(self.max_x_reached, world.x, where=record)
 
 		np.add(rewards, BACKWARD_MOVEMENT_PENALTY, out=rewards, where=x_delta < 0)
 
+		# Counting up then zeroing by multiplication: two whole-array calls instead of two masked ones and an invert
 		still = x_delta == 0
-		np.add(self.ticks_stationary, 1, out=self.ticks_stationary, where=still)
-		np.copyto(self.ticks_stationary, 0, where=~still)
-		np.add(rewards, STATIONARY_PENALTY, out=rewards, where=still & (self.ticks_stationary > STATIONARY_THRESHOLD))
+		np.add(self.ticks_stationary, still, out=self.ticks_stationary)
+		np.multiply(self.ticks_stationary, still, out=self.ticks_stationary)
+		# The counter is back to zero for anyone who moved, so being over the threshold already means standing still
+		np.add(rewards, STATIONARY_PENALTY, out=rewards, where=self.ticks_stationary > STATIONARY_THRESHOLD)
 
-		np.add(rewards, FALLING_PENALTY, out=rewards, where=(self.world.y - previous_y) > FALLING_THRESHOLD)
-		rewards *= alive
-		return rewards
+		np.add(rewards, FALLING_PENALTY, out=rewards, where=(world.y - previous_y) > FALLING_THRESHOLD)
+		# The dead score nothing, which is one masked accumulate instead of a multiply and an add
+		np.add(self.rewards, rewards, out=self.rewards, where=alive)
 
 	def speed_ratio(self, ticks: NDArray[np.float64]) -> NDArray[np.float64]:
 		"""How much of the episode was still left after `ticks`, bent by `WIN_SPEED_EXPONENT`, in [0, 1]."""
