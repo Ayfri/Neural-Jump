@@ -5,7 +5,7 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 
-from game.constants import AGENT_VISION_DISTANCE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
+from game.constants import AGENT_VISION_DISTANCE, MOVE_IDLE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
 from game.settings import (
 	PLAYER_GRAVITY, PLAYER_HEIGHT, PLAYER_JUMP_STRENGTH, PLAYER_SPEED, PLAYER_WIDTH, SCREEN_HEIGHT, TILE_SIZE,
 )
@@ -29,7 +29,7 @@ DEATH_ROW_MARGIN: Final[int] = 2  # Rows above the bottom of the map that kill t
 GRID_PADDING: Final[int] = 32  # Air border baked around the grids so lookups never need bounds checks
 GRID_ORIGIN: Final[int] = GRID_PADDING * TILE_SIZE  # Pixels the padding adds to a tile coordinate
 
-MOVE_SPEEDS: Final[NDArray[np.float64]] = np.zeros(3)  # Horizontal speed per action, jumping keeps the current one
+MOVE_SPEEDS: Final[NDArray[np.float64]] = np.zeros(MOVE_IDLE + 1)  # Horizontal speed per action, jumping keeps the current one
 MOVE_SPEEDS[[MOVE_LEFT, MOVE_RIGHT]] = (-PLAYER_SPEED, PLAYER_SPEED)
 
 
@@ -288,14 +288,17 @@ class World:
 		self._collect_rewards(alive, tick, columns)
 		self._collect_coins(alive, columns)
 
-	def _jump(self, mask: NDArray[np.bool_]) -> None:
-		if not mask.any():
-			return
+	def grounded(self) -> NDArray[np.bool_]:
+		"""Players with solid ground right under their feet, which is the only state a jump fires from."""
 		cells = self._cells(self.y + 2.0)
 		row = cells[1] * self._padded_width
 		solid = self._flat_solid
-		grounded = np.take(solid, row + cells[2]) | np.take(solid, row + cells[3])
-		np.copyto(self.change_y, PLAYER_JUMP_STRENGTH, where=mask & grounded)
+		return np.take(solid, row + cells[2]) | np.take(solid, row + cells[3])
+
+	def _jump(self, mask: NDArray[np.bool_]) -> None:
+		if not mask.any():
+			return
+		np.copyto(self.change_y, PLAYER_JUMP_STRENGTH, where=mask & self.grounded())
 
 	def _resolve_horizontal(self, alive: NDArray[np.bool_]) -> None:
 		cells = self._cells(self.y)
