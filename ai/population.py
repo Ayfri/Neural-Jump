@@ -12,7 +12,6 @@ from game.world import OBSERVATION_SIZE
 
 ACTION_COUNT: Final[int] = 3
 DEFAULT_HIDDEN_SIZES: Final[tuple[int, int, int]] = (256, 128, 64)
-CRITIC_HIDDEN_SIZE: Final[int] = 32
 LAYER_NORM_EPS: Final[float] = 1e-5
 
 
@@ -33,14 +32,14 @@ def pick_device(name: str = 'auto') -> torch.device:
 
 class Population:
 	"""
-	The whole population as a single batched actor-critic network.
+	The whole population as a single batched policy network.
 
 	Every layer is one `(agents, in, out)` tensor, so a forward pass for the entire population is one
 	`baddbmm` per layer instead of one module call per agent. Because each agent's weights only touch its
 	own outputs, a single Adam over these tensors trains every agent independently, and the genetic
 	operators (elites, crossover, mutation) are plain tensor ops on the same weights.
 
-	Shapes follow `nn.Linear`'s state dict on export, so a weight file stays readable as fc1/norm1/actor/critic.
+	Shapes follow `nn.Linear`'s state dict on export, so a weight file stays readable as fc1/norm1/actor.
 	"""
 
 	def __init__(self, size: int, hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES, device: torch.device | None = None) -> None:
@@ -54,8 +53,6 @@ class Population:
 			'fc2': (first, second),
 			'fc3': (second, third),
 			'actor': (third, ACTION_COUNT),
-			'critic_hidden': (third, CRITIC_HIDDEN_SIZE),
-			'critic': (CRITIC_HIDDEN_SIZE, 1),
 		}
 		self.norm_shapes: dict[str, int] = {'norm1': first, 'norm2': second}
 
@@ -69,8 +66,6 @@ class Population:
 			self.biases[name] = torch.empty(size, 1, features, device=self.device)
 
 		self.randomize(torch.arange(size, device=self.device))
-		for tensor in self.parameters():
-			tensor.requires_grad_(True)
 
 		self._graph: torch.cuda.CUDAGraph | None = None
 		self._capture_graph()
@@ -99,23 +94,16 @@ class Population:
 		normalized = F.layer_norm(x, (x.shape[-1],), eps=LAYER_NORM_EPS)
 		return normalized * self.weights[name] + self.biases[name]
 
-	def forward(self, observations: Tensor) -> tuple[Tensor, Tensor]:
-		"""
-		Runs the population on `(agents, batch, OBSERVATION_SIZE)` observations.
-
-		Returns action logits `(agents, batch, 3)` and state values `(agents, batch)`.
-		"""
+	def forward(self, observations: Tensor) -> Tensor:
+		"""Runs the population on `(agents, batch, OBSERVATION_SIZE)` observations, returning `(agents, batch, 3)` logits."""
 		x = F.leaky_relu(self._layer_norm(self._linear(observations, 'fc1'), 'norm1'))
 		x = F.leaky_relu(self._layer_norm(self._linear(x, 'fc2'), 'norm2'))
 		x = F.leaky_relu(self._linear(x, 'fc3'))
-		logits = self._linear(x, 'actor')
-		value = self._linear(F.leaky_relu(self._linear(x, 'critic_hidden')), 'critic')
-		return logits, value.squeeze(-1)
+		return self._linear(x, 'actor')
 
 	@torch.no_grad()
 	def _sample(self, observations: Tensor, deterministic: bool = False) -> Tensor:
-		logits, _ = self.forward(observations)
-		logits = logits.squeeze(1)
+		logits = self.forward(observations).squeeze(1)
 		if deterministic:
 			return logits.argmax(dim=-1)
 		# Gumbel-max: argmax(logits + Gumbel noise) samples exactly like softmax + multinomial, in fewer kernels

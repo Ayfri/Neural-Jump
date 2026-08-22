@@ -20,7 +20,7 @@ GRID_FEATURES: Final[int] = GRID_TILES * GRID_CHANNELS
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
 OBSERVATION_SIZE: Final[int] = GRID_FEATURES + PLAYER_FEATURES
 # Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
-# halving both the rollout buffer and the host-to-device copy done every tick.
+# halving the host-to-device copy done every tick.
 OBSERVATION_DTYPE: Final[np.dtype[np.float16]] = np.dtype(np.float16)
 MAX_FALL_SPEED: Final[float] = 20.0  # Normalisation divisor for the vertical speed feature
 ON_GROUND_SPEED: Final[float] = 2.0  # Vertical speed under which the player counts as grounded
@@ -162,7 +162,7 @@ class World:
 		"""
 		Fills `out` (or the world's own buffer) with the (count, 199) observation: the 7x7 tile window
 		around each player encoded as four channels per tile (solid, flag, reward, empty), followed by the
-		player's own speed and ground state. Passing the rollout's slot writes the transitions in place.
+		player's own speed and ground state.
 		"""
 		target = self._observation if out is None else out
 		tile_x = np.floor_divide(self.x + PLAYER_W / 2, TILE_SIZE).astype(np.int64)

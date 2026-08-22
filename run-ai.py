@@ -5,7 +5,6 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
 
 import torch
 
-from ai.a2c_trainer import DEFAULT_EPOCHS, DEFAULT_GAMMA, DEFAULT_LEARNING_RATE
 from ai.generation import (
 	DEFAULT_ACTION_REPEAT, DEFAULT_ELITE_COUNT, DEFAULT_EPISODE_SECONDS, DEFAULT_MUTATION_RATE,
 	DEFAULT_MUTATION_STRENGTH, DEFAULT_TICK_RATE, MAX_SPEED, Generation,
@@ -36,10 +35,7 @@ def main() -> None:
 	argparser.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="Torch CPU threads")
 	argparser.add_argument("--tick-rate", type=int, default=DEFAULT_TICK_RATE, help="Simulation ticks per in-game second (also caps FPS when rendering)")
 	argparser.add_argument("--episode-seconds", type=float, default=DEFAULT_EPISODE_SECONDS)
-	argparser.add_argument("--action-repeat", type=int, default=DEFAULT_ACTION_REPEAT, help="Physics ticks a chosen action is held for, higher shortens the horizon the policy has to reason over")
-	argparser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
-	argparser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, help="Discount factor per decision, not per tick")
-	argparser.add_argument("--ppo-epochs", type=int, default=DEFAULT_EPOCHS, help="Passes over each rollout")
+	argparser.add_argument("--action-repeat", type=int, default=DEFAULT_ACTION_REPEAT, help="Physics ticks a chosen action is held for")
 	argparser.add_argument("--generations", type=int, default=0, help="Stop after N generations, 0 runs forever")
 	argparser.add_argument("--speed", type=speed_value, default=1.0, help="Simulation speed multiplier, or 'max' to run as fast as the target framerate survives (only with --show-window)")
 	argparser.add_argument("--fps", type=int, default=0, help="Target framerate, 0 uses the display refresh rate (only with --show-window)")
@@ -47,9 +43,7 @@ def main() -> None:
 	argparser.add_argument("--load-latest-generation-weights", action="store_true")
 	argparser.add_argument("--show-window", action="store_true")
 	argparser.add_argument("--checkpoints", action="store_true", help="Use checkpoints as spawn points")
-	argparser.add_argument("--no-use-a2c", dest="use_a2c", action="store_false", default=True, help="Disable PPO and use only genetic algorithm")
-	argparser.add_argument("--deterministic", dest="deterministic", action="store_true", default=None, help="Play the policy's argmax, which makes a generation's scores repeatable (default without PPO)")
-	argparser.add_argument("--sampled", dest="deterministic", action="store_false", help="Sample actions from the policy, which PPO needs to learn (default with PPO)")
+	argparser.add_argument("--sampled", dest="deterministic", action="store_false", default=True, help="Sample actions instead of playing the argmax, which makes a generation's scores a lottery")
 	argparser.add_argument("--seed", type=int, default=None, help="Seed python, numpy and torch so a run replays exactly")
 	args = argparser.parse_args()
 
@@ -65,7 +59,6 @@ def main() -> None:
 		load_latest_generation_weights=args.load_latest_generation_weights,
 		show_window=args.show_window,
 		use_checkpoints=args.checkpoints,
-		use_a2c_learning=args.use_a2c,
 		deterministic_actions=args.deterministic,
 		seed=args.seed,
 		hidden_sizes=tuple(args.hidden_sizes),
@@ -73,16 +66,11 @@ def main() -> None:
 		tick_rate=args.tick_rate,
 		episode_seconds=args.episode_seconds,
 		action_repeat=args.action_repeat,
-		learning_rate=args.learning_rate,
-		gamma=args.gamma,
-		epochs=args.ppo_epochs,
 		speed=args.speed,
 		fps=args.fps,
 		map_path=args.map,
 	)
 
-	learning_method = "PPO + Genetic Algorithm" if args.use_a2c else "Genetic Algorithm only"
-	print(f"--- Training with: {learning_method} ---")
 	print(f"--- Generation {generation.generation}, {args.population_size} agents on {generation.population.device}, "
 		  f"mutation rate: {generation.mutation_rate:.3f} - strength: {generation.mutation_strength:.3f} ---")
 

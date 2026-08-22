@@ -7,9 +7,8 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from ai.a2c_trainer import DEFAULT_EPOCHS, DEFAULT_GAMMA, DEFAULT_LEARNING_RATE, A2CTrainer, RolloutBuffer
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
-from game.world import OBSERVATION_SIZE, World
+from game.world import World
 
 # Generation constants
 DEFAULT_ELITE_COUNT: Final[int] = 4
@@ -27,7 +26,6 @@ SPEED_SAMPLE_SECONDS: Final[float] = 0.25
 RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
 POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
 STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
-ROLLOUT_MEMORY_BUDGET: Final[int] = 512 * 1024 * 1024  # Cap on the observations kept for one A2C update
 
 # Reward constants
 FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
@@ -60,17 +58,13 @@ class Generation:
 		load_latest_generation_weights: bool = False,
 		show_window: bool = True,
 		use_checkpoints: bool = False,
-		use_a2c_learning: bool = True,
-		deterministic_actions: bool | None = None,
+		deterministic_actions: bool = True,
 		seed: int | None = None,
 		hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES,
 		device: str = 'auto',
 		tick_rate: int = DEFAULT_TICK_RATE,
 		episode_seconds: float = DEFAULT_EPISODE_SECONDS,
 		action_repeat: int = DEFAULT_ACTION_REPEAT,
-		learning_rate: float = DEFAULT_LEARNING_RATE,
-		gamma: float = DEFAULT_GAMMA,
-		epochs: int = DEFAULT_EPOCHS,
 		speed: float | str = 1.0,
 		fps: int = 0,
 		map_path: str = 'maps/level_1.txt',
@@ -81,10 +75,9 @@ class Generation:
 		self.mutation_strength = mutation_strength
 		self.show_window = show_window
 		self.use_checkpoints = use_checkpoints
-		self.use_a2c_learning = use_a2c_learning
-		# Sampling makes the measured fitness a lottery, which is fatal to selection; only the policy
-		# gradient actually needs it, so without A2C the population plays its argmax
-		self.deterministic_actions = (not use_a2c_learning) if deterministic_actions is None else deterministic_actions
+		# Sampling makes the measured fitness a lottery, which is fatal to selection, so the population
+		# plays its argmax and an elite re-scores exactly what it scored before
+		self.deterministic_actions = deterministic_actions
 		self.seed = seed
 		if seed is not None:
 			seed_everything(seed)
@@ -113,15 +106,6 @@ class Generation:
 		self._previous_x = np.zeros(population_size, dtype=np.float64)
 		self._previous_y = np.zeros(population_size, dtype=np.float64)
 		self._actions = np.zeros(population_size, dtype=np.int64)
-		self._decision_alive = np.ones(population_size, dtype=np.bool_)
-		self._window_rewards = np.zeros(population_size, dtype=np.float64)
-
-		self.a2c_trainer: A2CTrainer | None = None
-		self.rollout: RolloutBuffer | None = None
-		if self.use_a2c_learning:
-			self.a2c_trainer = A2CTrainer(self.population, learning_rate=learning_rate, gamma=gamma, epochs=epochs)
-			self.rollout = RolloutBuffer(self.rollout_capacity(), population_size)
-			print(self.a2c_trainer.get_training_summary())
 
 		self.renderer = None
 		self.ticks_per_frame = 1.0
@@ -141,12 +125,6 @@ class Generation:
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
-
-	def rollout_capacity(self) -> int:
-		"""Number of transitions kept for one A2C update, bounded by the memory budget."""
-		wanted = int(self.episode_seconds * self.tick_rate) // self.action_repeat * len(self.spawn_points())
-		per_step = self.population_size * OBSERVATION_SIZE * 2  # float16 observations dominate the buffer
-		return max(1, min(wanted, ROLLOUT_MEMORY_BUDGET // per_step))
 
 	def skip_checkpoint(self) -> None:
 		self.should_skip_checkpoint = True
@@ -195,10 +173,7 @@ class Generation:
 					if self.episode_over():
 						break
 
-			final = self.final_rewards()
-			self.rewards += final
-			if self.rollout is not None:
-				self.rollout.finish_episode(final)
+			self.rewards += self.final_rewards()
 			self.should_skip_checkpoint = False
 
 		self.best_fitness_ever = max(self.best_fitness_ever, float(self.rewards.max()))
@@ -218,21 +193,13 @@ class Generation:
 		"""
 		alive = self.world.alive()
 		if tick % self.action_repeat == 0:
-			# The world writes straight into the rollout's row, so a recorded tick costs no extra copy
-			observations = self.world.observe(self.rollout.next_slot() if self.rollout is not None else None)
-			self._actions = self.population.act(observations, self.deterministic_actions)
-			self._decision_alive = alive
-			self._window_rewards.fill(0.0)
+			self._actions = self.population.act(self.world.observe(), self.deterministic_actions)
 
 		np.copyto(self._previous_x, self.world.x)
 		np.copyto(self._previous_y, self.world.y)
 		self.world.step(self._actions, tick)
 
-		step_rewards = self.continuous_rewards(alive, self._previous_x, self._previous_y)
-		self.rewards += step_rewards
-		self._window_rewards += step_rewards
-		if self.rollout is not None and tick % self.action_repeat == self.action_repeat - 1:
-			self.rollout.commit(self._actions, self._window_rewards, self._decision_alive)
+		self.rewards += self.continuous_rewards(alive, self._previous_x, self._previous_y)
 
 		self.check_agent_positions(tick)
 		self.total_ticks += 1
@@ -325,15 +292,9 @@ class Generation:
 			('Network', 'x'.join(str(size) for size in self.population.hidden_sizes)),
 			('Device', str(self.population.device)),
 		]
-		if self.a2c_trainer is None:
-			return [*rows, ('Learning', 'Genetic'), ('Actions', 'argmax' if self.deterministic_actions else 'sampled')]
 		return [
 			*rows,
-			('Learning', 'PPO + Genetic'),
 			('Actions', 'argmax' if self.deterministic_actions else 'sampled'),
-			('Learning Rate', f'{self.a2c_trainer.learning_rate:g}'),
-			('Gamma', f'{self.a2c_trainer.gamma:g}'),
-			('Entropy', f'{self.a2c_trainer.entropy_coef:.4f}'),
 			('Act Repeat', f'{self.action_repeat}'),
 		]
 
@@ -359,34 +320,16 @@ class Generation:
 		))
 
 	def evolve_generation(self) -> None:
-		"""Runs the A2C update, selects the elites, breeds the next generation and saves the best weights."""
+		"""Selects the elites, breeds the next generation and saves the best weights."""
 		self.fitness_history.append(float(self.rewards.max()))
-		fitness = self.rewards.astype(np.float32)
-		elite_slots = torch.from_numpy(np.ascontiguousarray(np.argsort(-fitness)[:self.elite_count])).to(self.population.device)
-		# The elites are exactly the weights that scored, so they sit out the update: a fresh Adam step moves
-		# every one of their weights by the full learning rate, which undoes the selection it was given
-		elite_weights = self.population.snapshot(elite_slots) if self.a2c_trainer is not None else None
-
-		if self.a2c_trainer is not None and self.rollout is not None:
-			print('Performing A2C learning step...')
-			stats = self.a2c_trainer.train_step(self.rollout)
-			print(f'A2C Training Stats: {stats}')
-			self.a2c_trainer.decay_entropy(self.generation)
-
 		elites = self.population.evolve(
-			fitness,
+			self.rewards.astype(np.float32),
 			self.elite_count,
 			min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)),
 			self.mutation_rate,
 			self.mutation_strength,
 		)
-		if elite_weights is not None:
-			self.population.restore(elite_weights)
 		print(f'Selected {len(elites)} elites: {[f"{self.rewards[i]:.2f}" for i in elites]}')
-
-		if self.a2c_trainer is not None:
-			# The agents behind each slot just changed, so the Adam moments no longer describe them
-			self.a2c_trainer.reset_optimizer()
 
 		self.generation += 1
 		self.manual_stop = False

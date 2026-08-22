@@ -20,8 +20,8 @@ Neural-Jump is an interactive platformer game featuring AI agents that learn to 
 ## Features
 
 - **Platformer Gameplay**: Classic side-scrolling platformer mechanics with jumping, movement, and collision detection
-- **PPO + Neuroevolution**: Agents learn by clipped policy optimisation within a generation and by genetic selection between generations
-- **Batched PPO**: One Adam trains the entire population at once, gradients clipped per agent, elites left untouched
+- **Neuroevolution**: Agents improve by genetic selection between generations, elites carried over untouched
+- **Deterministic evaluation**: Agents play their argmax, so a generation's scores are repeatable and selection measures skill rather than luck
 - **Batched Simulation**: The whole population is simulated as numpy arrays, so hundreds of agents run in parallel far faster than real time
 - **Batched Networks**: The population is one set of `(agents, in, out)` weight tensors evaluated in a single batched matmul per layer
 - **Reward Shaping**: Sophisticated reward system that encourages forward progress, penalizes backward movement, and rewards level completion
@@ -90,14 +90,9 @@ Training is headless by default and runs as fast as the machine allows. `--show-
 - `--mutation-rate R`: Probability of mutating a given weight tensor (default: 0.8, range: 0.0-1.0)
 - `--mutation-strength S`: Scale of mutations (default: 0.03)
 - `--hidden-sizes N N N`: Sizes of the three shared hidden layers (default: 256 128 64), smaller is faster and dumber
-- `--no-use-a2c`: Disable PPO and evolve with the genetic algorithm only
-- `--deterministic` / `--sampled`: Play the policy's argmax, or sample from it. Argmax is the default without
-  PPO and makes a generation's scores repeatable; sampling is the default with PPO, which needs it to learn
+- `--sampled`: Sample actions from the policy instead of playing its argmax, which makes a generation's scores a lottery
 - `--seed N`: Seed python, numpy and torch so a run replays exactly
 - `--action-repeat N`: Physics ticks a chosen action is held for (default: 2)
-- `--learning-rate R`: Adam learning rate (default: 0.0003)
-- `--gamma G`: Discount factor per decision, not per tick (default: 0.98)
-- `--ppo-epochs N`: Passes over each rollout (default: 4)
 - `--device auto|cpu|cuda`: Where the population runs (default: auto)
 - `--threads N`: Torch CPU threads (default: 4)
 - `--tick-rate N`: Simulation ticks per in-game second (default: 90)
@@ -150,18 +145,16 @@ agents: going from 100 to 1000 agents multiplies the throughput per second, not 
 
 | Setup | Ticks/s | Agent-steps/s |
 | --- | --- | --- |
-| 100 agents, PPO + genetic, CUDA | ~1,150 | ~115,000 |
-| 100 agents, genetic only, CUDA | ~1,400 | ~140,000 |
-| 300 agents, genetic only, CUDA | ~1,330 | ~400,000 |
+| 100 agents, CUDA | ~1,400 | ~140,000 |
+| 300 agents, CUDA | ~1,330 | ~400,000 |
 
 Two things carry that number. The 7x7x4 vision window of every tile is baked once at load time, so an
 observation is a single gather instead of a broadcast fancy index rebuilt per tick. And `--action-repeat`
-holds each decision for two physics ticks, which halves the network calls and the rollout.
+holds each decision for two physics ticks, which halves the network calls.
 
 At 90 ticks per in-game second, 100 agents playing a 30 second episode take about 2.5 seconds of wall clock.
 
-Observations are half precision end to end: the world writes them straight into the rollout buffer's row,
-so recording a tick costs no extra copy and the host-to-device transfer moves half the bytes.
+Observations are half precision, so the host-to-device transfer every tick moves half the bytes.
 
 On CUDA the sampling pass is captured as a CUDA graph: a tick is a few dozen tiny kernels, so it is bound
 by launch latency, and replaying one captured graph is about 3x faster than launching them one by one. The
@@ -181,8 +174,7 @@ uv run run-game.py
 Neural-Jump/
 ├── ai/                    # Learning code
 │   ├── generation.py     # Training loop, rewards and weight files
-│   ├── population.py     # The whole population as one batched actor-critic network
-│   ├── a2c_trainer.py    # Rollout buffer and batched A2C update
+│   ├── population.py     # The whole population as one batched policy network
 │   └── __init__.py
 ├── game/                  # Game engine and mechanics
 │   ├── world.py          # Batched numpy simulation used for training
@@ -211,44 +203,30 @@ Neural-Jump/
 
 ### Neural Network Architecture
 
-The agent's network is an actor-critic over a 7×7 grid view plus the player's own state:
+The agent's network is a policy over a 7×7 grid view plus the player's own state:
 
 - **Input**: 199 features, 4 channels per tile (solid, flag, reward, empty) plus horizontal speed, vertical speed and ground contact
 - **Hidden Layers**: 256, 128 then 64 neurons (LayerNorm on the first two, leaky ReLU), configurable with `--hidden-sizes`
-- **Actor**: 3 action logits (jump, move left, move right), sampled with the Gumbel-max trick
-- **Critic**: a 32 neuron head reducing to one state value
+- **Output**: 3 action logits (jump, move left, move right), played as an argmax
 
 Every agent shares this shape, so the population is stored as one `(agents, in, out)` tensor per layer and a
-forward pass for all agents is a single `baddbmm` per layer. Because an agent's weights only ever touch its
-own outputs, one Adam over those tensors trains every agent independently. Weight files hold one agent in
-plain `nn.Linear` / `nn.LayerNorm` layout (`fc1.weight`, `norm1.bias`, `actor.weight`, ...).
+forward pass for all agents is a single `baddbmm` per layer. The genetic operators are plain tensor ops on
+those same weights. Weight files hold one agent in plain `nn.Linear` / `nn.LayerNorm` layout
+(`fc1.weight`, `norm1.bias`, `actor.weight`, ...).
 
-### How the two learning signals combine
+### How a generation evolves
 
-- **Within a generation**: every decision goes into a rollout buffer, together with the shaping rewards of
-  the ticks it covers. The end of episode reward (death, win, distance) is folded into the last transition
-  of each episode, which is also flagged terminal so returns cannot cross a spawn point reset. The trainer
-  then builds GAE(0.95) advantages over rewards divided by the spread of their own discounted return,
-  normalises the advantages over the whole batch, and runs four clipped PPO epochs in minibatches of 256
-  timesteps, one optimizer step each, with gradients clipped per agent.
-- **Between generations**: agents are ranked by fitness, the elites are copied untouched, most of the
-  population is a mutated crossover of two elites, and a few are re-randomised. The Adam moments are reset
-  afterwards because the agents behind each slot have changed.
+Agents are ranked by fitness, the elites are copied over untouched, most of the population is a mutated
+crossover of two random elites, and a few slots are re-randomised for diversity. A weight tensor of a child
+is mutated with probability `--mutation-rate`, by gaussian noise scaled by `--mutation-strength`.
 
-The elites sit out the PPO update entirely: they are the exact weights that earned their rank, and a fresh
-Adam step moves every one of their weights by the full learning rate, which undoes the selection. That step
-was also the population's main source of exploration, so `--mutation-strength` carries it now and defaults
-to 0.03 rather than 0.015.
-
-`--no-use-a2c` keeps only the second half.
-
-### Why the action selection matters to the genetic algorithm
+### Why the action selection is an argmax
 
 Sampling from the policy makes an agent's measured fitness a lottery: the same weights replayed a hundred
 times score anywhere from 40 to 730, mean 207, standard deviation 130. Selection then picks whichever agent
 drew the luckiest samples, and next generation that agent regresses to its mean, so the best fitness saws up
-and down instead of climbing. Playing the argmax removes the variance entirely, elites re-score exactly, and
-the best fitness becomes a monotonic staircase. That is why `--deterministic` is the default without PPO.
+and down instead of climbing. Playing the argmax removes the variance entirely, elites re-score exactly what
+earned them their rank, and the best fitness becomes a monotonic staircase. `--sampled` restores the lottery.
 
 ### Reward System
 
