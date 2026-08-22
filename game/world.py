@@ -119,7 +119,7 @@ class World:
 		self._box = np.zeros((4, count), dtype=np.float64)  # Scratch the collision passes rebuild every call
 		self._corners = np.zeros((4, count), dtype=np.int64)  # Scratch the coin pass gathers its four corners through
 		self._box_extent = np.array([[PLAYER_H - 1.0], [PLAYER_W - 1.0]])  # Bottom row and right column, off the top row and the left column
-		self._cell_limits = np.array([[self._max_row], [self._max_row], [self._max_column], [self._max_column]])
+		self._cell_limits = np.array([[self.max_row], [self.max_row], [self.max_column], [self.max_column]])
 
 	def _pixels(self, cell: NDArray[np.int64]) -> tuple[int, int]:
 		"""The top-left pixel of a (row, column) map cell, in the same space the players live in."""
@@ -163,31 +163,31 @@ class World:
 		self.padded_solid = np.pad(self.solid, GRID_PADDING)
 		self.padded_goal = np.pad(self.goal, GRID_PADDING)
 		self.padded_coins = np.pad(self.coin_ids, GRID_PADDING, constant_values=-1)
-		self._max_row = self.height + 2 * GRID_PADDING - 1
-		self._max_column = self.width + 2 * GRID_PADDING - 1
+		self.max_row = self.height + 2 * GRID_PADDING - 1
+		self.max_column = self.width + 2 * GRID_PADDING - 1
 		# Collision lookups index these flat views: `take` on one flat array beats a broadcast fancy index
-		self._padded_width = self.width + 2 * GRID_PADDING
-		self._flat_solid = self.padded_solid.ravel()
-		self._flat_goal = self.padded_goal.ravel()
-		self._flat_coins = self.padded_coins.ravel()
+		self.padded_width = self.width + 2 * GRID_PADDING
+		self.flat_solid = self.padded_solid.ravel()
+		self.flat_goal = self.padded_goal.ravel()
+		self.flat_coins = self.padded_coins.ravel()
 		# One lookup on the 2x2 box a player can touch then skips the whole goal or coin pass
-		self._flat_near_goal = near_grid(self.padded_goal != 0).ravel()
-		self._flat_near_coin = near_grid(self.padded_coins >= 0).ravel()
+		self.flat_near_goal = near_grid(self.padded_goal != 0).ravel()
+		self.flat_near_coin = near_grid(self.padded_coins >= 0).ravel()
 
 		# Every window of the map, baked once: an observation is then a single gather of contiguous rows
 		# instead of a broadcast fancy index rebuilt per tick.
 		solid_windows = sliding_window_view(self.padded_solid, (GRID_SIDE, GRID_SIDE))
 		goal_windows = sliding_window_view(self.padded_goal, (GRID_SIDE, GRID_SIDE))
 		coin_windows = sliding_window_view(self.padded_coins >= 0, (GRID_SIDE, GRID_SIDE))
-		self._max_window_row = solid_windows.shape[0] - 1
-		self._window_stride = solid_windows.shape[1]
-		self._max_window_column = self._window_stride - 1
+		self.max_window_row = solid_windows.shape[0] - 1
+		self.window_stride = solid_windows.shape[1]
+		self.max_window_column = self.window_stride - 1
 
-		self._windows = np.empty((solid_windows.shape[0] * self._window_stride, WINDOW_FEATURES), dtype=OBSERVATION_DTYPE)
-		self._windows[:, :GRID_TILES] = solid_windows.reshape(-1, GRID_TILES)
-		self._windows[:, GRID_TILES:GRID_TILES + NEAREST_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES))
+		self.windows = np.empty((solid_windows.shape[0] * self.window_stride, WINDOW_FEATURES), dtype=OBSERVATION_DTYPE)
+		self.windows[:, :GRID_TILES] = solid_windows.reshape(-1, GRID_TILES)
+		self.windows[:, GRID_TILES:GRID_TILES + NEAREST_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES))
 		# Coins are baked like the terrain, so a window still points at one the agent has already taken
-		self._windows[:, GRID_TILES + NEAREST_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES))
+		self.windows[:, GRID_TILES + NEAREST_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES))
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
@@ -231,7 +231,7 @@ class World:
 
 	def _row_offsets(self, cells: NDArray[np.int64]) -> NDArray[np.int64]:
 		"""The two rows of a `_cells` block as offsets into the flat padded grid."""
-		return cells[:2] * self._padded_width
+		return cells[:2] * self.padded_width
 
 	def _touch_block(self, y: NDArray[np.float64]) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
 		"""The flat row offsets and the two tile columns of the box at `y`, which is all a grid lookup reads."""
@@ -253,12 +253,12 @@ class World:
 		tile_y = tile_of(self.y + (PLAYER_H / 2 - self.offset_y))
 
 		# The window table is indexed by its top-left corner, so the centre clamp becomes a corner clamp
-		rows = np.clip(tile_y + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self._max_window_row)
-		columns = np.clip(tile_x + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self._max_window_column)
-		rows *= self._window_stride
+		rows = np.clip(tile_y + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self.max_window_row)
+		columns = np.clip(tile_x + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self.max_window_column)
+		rows *= self.window_stride
 		rows += columns
 
-		self._windows.take(rows, axis=0, out=target[:, :WINDOW_FEATURES])
+		self.windows.take(rows, axis=0, out=target[:, :WINDOW_FEATURES])
 		target[:, WINDOW_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
 		target[:, WINDOW_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
 		target[:, WINDOW_FEATURES + 2] = self.on_ground()
@@ -295,8 +295,8 @@ class World:
 	def grounded(self) -> NDArray[np.bool_]:
 		"""Players with solid ground right under their feet, which is the only state a jump fires from."""
 		cells = self._cells(self.y, 2.0)
-		row = cells[1] * self._padded_width
-		solid = self._flat_solid
+		row = cells[1] * self.padded_width
+		solid = self.flat_solid
 		return solid.take(row + cells[2]) | solid.take(row + cells[3])
 
 	def _jump(self, mask: NDArray[np.bool_]) -> None:
@@ -308,7 +308,7 @@ class World:
 		rows, left, right = self._touch_block(self.y)
 
 		# A player one row tall gathers the same row twice, so the two rows can be OR'd without a guard
-		solid = self._flat_solid
+		solid = self.flat_solid
 		hit_left = solid.take(rows[0] + left) | solid.take(rows[1] + left)
 		hit_right = (solid.take(rows[0] + right) | solid.take(rows[1] + right)) & (right > left)
 
@@ -325,7 +325,7 @@ class World:
 		left, right = cells[2], cells[3]
 
 		# A player one column wide gathers the same column twice, so the two columns can be OR'd without a guard
-		solid = self._flat_solid
+		solid = self.flat_solid
 		hit_top = solid.take(rows[0] + left) | solid.take(rows[0] + right)
 		hit_bottom = (solid.take(rows[1] + left) | solid.take(rows[1] + right)) & (bottom > top)
 
@@ -342,10 +342,10 @@ class World:
 		rows, left, right = block
 
 		# The flag is a handful of tiles on a whole map, so the gather is skipped unless someone stands next to it
-		if not self._flat_near_goal.take(rows[0] + left).any():
+		if not self.flat_near_goal.take(rows[0] + left).any():
 			return
 
-		goal = self._flat_goal
+		goal = self.flat_goal
 		hit = goal.take(rows[0] + left) != 0
 		hit |= goal.take(rows[0] + right) != 0
 		hit |= goal.take(rows[1] + left) != 0
@@ -361,7 +361,7 @@ class World:
 			return
 
 		rows, left, right = block
-		if not self._flat_near_coin.take(rows[0] + left).any():
+		if not self.flat_near_coin.take(rows[0] + left).any():
 			return
 
 		# The four corners of the box are one gather rather than four, and one test rules the whole pass out
@@ -370,7 +370,7 @@ class World:
 		np.add(rows[0], right, out=corners[1])
 		np.add(rows[1], left, out=corners[2])
 		np.add(rows[1], right, out=corners[3])
-		ids = self._flat_coins.take(corners)
+		ids = self.flat_coins.take(corners)
 		standing = ids >= 0
 		standing &= alive
 		if not standing.any():

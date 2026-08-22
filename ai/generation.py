@@ -8,11 +8,18 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from ai.device_runner import DeviceRunner
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
+from ai.rewards import (
+	BACKWARD_MOVEMENT_PENALTY, COIN_REWARD, DEATH_PENALTY, DISTANCE_REWARD_DIVISOR, FALLING_PENALTY,
+	FALLING_THRESHOLD, FORWARD_MOVEMENT_REWARD, MIN_REWARD, NEW_MAX_POSITION_BONUS, PROGRESS_REWARD_DIVISOR,
+	PROGRESS_SPEED_BONUS, STATIONARY_PENALTY, STATIONARY_THRESHOLD, WIN_BASE_BONUS, WIN_SPEED_BONUS,
+	WIN_SPEED_EXPONENT,
+)
 from game.art import COIN_COLOR
 from game.settings import TILE_SIZE
-from game.tiles import TILE_REWARDS, TileKind
 from game.world import World
+from game.world_cuda import CudaWorld
 
 if TYPE_CHECKING:
 	from game.render import Renderer, Row
@@ -42,24 +49,7 @@ SPEED_STEP: Final[float] = 2.0  # Factor the slower and faster keys apply
 MIN_SPEED: Final[float] = 0.1
 MAX_SPEED_MULTIPLIER: Final[float] = 1024.0
 
-# Rewards
-FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
-NEW_MAX_POSITION_BONUS: Final[float] = 0.1
-BACKWARD_MOVEMENT_PENALTY: Final[float] = -0.1
-STATIONARY_PENALTY: Final[float] = -0.05
-STATIONARY_THRESHOLD: Final[int] = 5  # Ticks before penalty kicks in
-FALLING_PENALTY: Final[float] = -0.02
-FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
-
-COIN_REWARD: Final[float] = TILE_REWARDS[TileKind.COIN]  # Every tile's payout lives in one table
-DEATH_PENALTY: Final[float] = -20.0
-WIN_BASE_BONUS: Final[float] = 200.0  # Paid for touching the flag at all, whatever the time taken
-WIN_SPEED_BONUS: Final[float] = 1200.0  # Paid on top, scaled by how much of the episode was still left
-WIN_SPEED_EXPONENT: Final[float] = 2.0  # Bends the scale, so shaving ticks off an already fast run pays the most
-PROGRESS_SPEED_BONUS: Final[float] = 100.0  # Same idea for agents that never reach the flag, on how fast they got as far as they did
-DISTANCE_REWARD_DIVISOR: Final[float] = 10.0
-PROGRESS_REWARD_DIVISOR: Final[float] = 20.0
-MIN_REWARD: Final[float] = -30.0
+ALIVE_CHECK_TICKS: Final[int] = 90  # Ticks between two host reads of the alive mask, on the device path
 
 WEIGHTS_FOLDER: Final[Path] = Path('weights')
 
@@ -125,12 +115,18 @@ class Generation:
 		self.world = World(map_path, population_size)
 		self.population = Population(population_size, hidden_sizes, pick_device(device))
 		self.rewards = np.zeros(population_size, dtype=np.float64)
+		self._rewards_banked = np.zeros(population_size, dtype=np.float64)  # What the checkpoints already played are worth
+
+		# On CUDA the whole tick runs on the device, physics and rewards both, and the host only reads between windows
+		self.cuda_world = CudaWorld(self.world, self.population.device) if self.population.device.type == 'cuda' else None
+		self.runner = DeviceRunner(self.cuda_world, self.population, self.action_repeat) if self.cuda_world else None
+		self._alive_checked_tick = 0
+		self._anyone_alive = True
 
 		self.max_x_reached = np.zeros(population_size, dtype=np.float64)
 		self.max_x_tick = np.zeros(population_size, dtype=np.float64)  # Tick each record was set on, so progress is scored on time too
 		self.ticks_stationary = np.zeros(population_size, dtype=np.int32)
 		self.position_history: list[NDArray[np.float64]] = []
-		self.last_position_check = 0.0
 		self._previous_x = np.zeros(population_size, dtype=np.float64)
 		self._previous_y = np.zeros(population_size, dtype=np.float64)
 		self._actions = np.zeros(population_size, dtype=np.int64)
@@ -173,6 +169,10 @@ class Generation:
 	def max_ticks(self) -> int:
 		return int(self.episode_seconds * self.tick_rate)
 
+	@property
+	def stuck_check_ticks(self) -> int:
+		return max(1, int(POSITION_CHECK_INTERVAL * self.tick_rate))
+
 	def toggle_pause(self) -> None:
 		self.paused = not self.paused
 
@@ -214,6 +214,7 @@ class Generation:
 		self.best_time_ever = 0.0
 		self.fitness_history.clear()
 		self.rewards.fill(0.0)
+		self._rewards_banked.fill(0.0)
 		self.total_ticks = 0
 		self.live_speed = 0.0
 		self.restart_requested = False
@@ -237,6 +238,7 @@ class Generation:
 		"""Runs the whole population through every spawn point and fills `self.rewards`."""
 		points = self.spawn_points()
 		self.rewards.fill(0.0)
+		self._rewards_banked.fill(0.0)
 		max_ticks = self.max_ticks
 		started = time.perf_counter()
 		self._speed_time = started
@@ -244,13 +246,7 @@ class Generation:
 		ticks_done = 0
 
 		for checkpoint_index, (spawn_x, spawn_y) in enumerate(points):
-			self.world.reset(spawn_x, spawn_y)
-			self.decide()
-			self.max_x_reached[:] = self.world.x
-			self.max_x_tick.fill(0.0)
-			self.ticks_stationary.fill(0)
-			self.position_history.clear()
-			self.last_position_check = 0.0
+			self._start_episode(spawn_x, spawn_y)
 			tick = 0
 
 			while tick < max_ticks and not self.episode_over():
@@ -267,14 +263,13 @@ class Generation:
 					self._tick_budget -= steps
 					self._adapt_ticks_per_frame()
 
-				for _ in range(steps):
-					self.simulate_tick(tick)
-					tick += 1
-					ticks_done += 1
-					if self.episode_over():
-						break
+				played = self._simulate(tick, steps)
+				tick += played
+				ticks_done += played
+				if self.renderer is not None:
+					self._tick_budget += steps - played  # Ticks a whole window could not be paid for are owed back
 
-			self.rewards += self.final_rewards()
+			self._end_episode()
 			self.record_best_time()
 			self.should_skip_checkpoint = False
 
@@ -291,7 +286,80 @@ class Generation:
 		self.best_time_ever = best if self.best_time_ever == 0.0 else min(self.best_time_ever, best)
 
 	def episode_over(self) -> bool:
-		return self.should_skip_checkpoint or self.manual_stop or self.restart_requested or not self.world.alive().any()
+		if self.should_skip_checkpoint or self.manual_stop or self.restart_requested:
+			return True
+		# The device path answers from the last sampled alive mask, because reading one costs a full sync
+		return not (self._anyone_alive if self.runner is not None else self.world.alive().any())
+
+	def _start_episode(self, spawn_x: int, spawn_y: int) -> None:
+		"""Puts the population back on a spawn point and clears everything an episode accumulates."""
+		self.world.reset(spawn_x, spawn_y)
+		self.position_history.clear()
+		self._alive_checked_tick = 0
+		self._anyone_alive = True
+
+		if self.runner is not None and self.cuda_world is not None:
+			self.cuda_world.reset(spawn_x, spawn_y)
+			self.runner.start()
+			return
+
+		self.decide()
+		self.max_x_reached[:] = self.world.x
+		self.max_x_tick.fill(0.0)
+		self.ticks_stationary.fill(0)
+
+	def _end_episode(self) -> None:
+		"""Banks what the checkpoint paid: the per-tick rewards it accumulated plus its end of episode payout."""
+		if self.runner is not None:
+			self._sync_from_device()
+		self.rewards += self.final_rewards()
+		self._rewards_banked[:] = self.rewards
+
+	def _sync_from_device(self) -> None:
+		"""Reads the device state back into the numpy world and the trackers the fitness and the HUD use."""
+		assert self.cuda_world is not None and self.runner is not None
+		self.cuda_world.sync()
+		self.rewards[:] = self._rewards_banked + self.runner.rewards.cpu().numpy()
+		np.copyto(self.max_x_reached, self.runner.max_x_reached.cpu().numpy())
+		np.copyto(self.max_x_tick, self.runner.max_x_tick.cpu().numpy())
+
+	def _simulate(self, tick: int, steps: int) -> int:
+		"""Advances the simulation by up to `steps` ticks, returning how many were actually played."""
+		if self.runner is not None:
+			return self._simulate_windows(tick, steps)
+
+		played = 0
+		for _ in range(steps):
+			self.simulate_tick(tick + played)
+			played += 1
+			if self.episode_over():
+				break
+		return played
+
+	def _simulate_windows(self, tick: int, steps: int) -> int:
+		"""
+		The device path: whole action windows, one graph replay each, with nothing read back between them.
+
+		Both periodic checks land on a window boundary rather than on the exact tick the numpy loop would
+		have used, so a stuck agent can outlive its sentence by a tick and an episode where everyone is
+		already dead runs to the end of the current second.
+		"""
+		assert self.runner is not None
+		played = 0
+		while played + self.action_repeat <= steps:
+			self.runner.play_window()
+			played += self.action_repeat
+			self.total_ticks += self.action_repeat
+
+			done = tick + played
+			if done % self.stuck_check_ticks == 0:
+				self.runner.check_positions()
+			if done - self._alive_checked_tick >= ALIVE_CHECK_TICKS:
+				self._alive_checked_tick = done
+				self._anyone_alive = self.runner.anyone_alive()
+				if self.episode_over():
+					break
+		return played
 
 	def simulate_tick(self, tick: int) -> None:
 		"""
@@ -408,12 +476,15 @@ class Generation:
 		return np.where(world.win, win_reward, progress) + COIN_REWARD * world.coins
 
 	def check_agent_positions(self, tick: int) -> None:
-		"""Kills agents that are stuck in place or crawling backwards."""
-		current_time = tick / self.tick_rate
-		if current_time - self.last_position_check < POSITION_CHECK_INTERVAL:
+		"""
+		Kills agents that are stuck in place or crawling backwards, once every `POSITION_CHECK_INTERVAL`.
+
+		The schedule counts ticks rather than in-game seconds so that it lands on the same tick whether the
+		episode is played one tick at a time or one action window at a time.
+		"""
+		if (tick + 1) % self.stuck_check_ticks:
 			return
 
-		self.last_position_check = current_time
 		self.position_history.append(self.world.x.copy())
 		window = int(STUCK_CHECK_WINDOW / POSITION_CHECK_INTERVAL) + 1
 		del self.position_history[:-window]
@@ -448,6 +519,8 @@ class Generation:
 
 		self.renderer.poll_events()
 		self._sample_live_speed()
+		if self.runner is not None:
+			self._sync_from_device()  # A frame is the one place the whole device state is worth reading back
 		world = self.world
 		best = int(np.argmax(np.where(world.alive(), self.rewards, -np.inf)))
 		alive = int(world.alive().sum())

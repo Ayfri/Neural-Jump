@@ -149,6 +149,10 @@ class Population:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
 			self._graph = None
 
+	def decide(self, observations: Tensor) -> Tensor:
+		"""Picks one action per agent from observations already on the device, for a caller that never leaves it."""
+		return self._greedy(observations)
+
 	def act(self) -> NDArray[np.int64]:
 		"""Picks one action per agent from the observations staged in `self.observations`."""
 		self.submit()
