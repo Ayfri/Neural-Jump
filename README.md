@@ -18,8 +18,11 @@ uv run run-game.py                            # play the level yourself
 uv run run-game.py --spawn 3                  # start on the third checkpoint
 ```
 
-Python 3.13+, pygame-ce for the window, and `uv sync` pulls torch with CUDA 13 on Windows and Linux. CPU
-works too, it is just slower.
+Python 3.13+, pygame-ce for the window, and `uv sync` pulls torch with CUDA 13 on Windows and Linux, plus
+the triton wheel torch does not ship on Windows, which is what compiles the simulation. CPU works too, it is
+just slower: the whole tick then runs in numpy on the host instead.
+
+The first generation of a run is slower than the rest, because that is where the simulation is compiled.
 
 ## Options
 
@@ -221,19 +224,36 @@ population never finds the jump it is missing.
 
 ## Performance
 
-A tick grows far slower than the population it simulates: ten times the agents cost about two and a half
-times the tick. Measured on a 4060 Ti.
+On CUDA the whole tick runs on the device and a population of 300 plays about four million agent-steps a
+second. The same tick in numpy, which is what a CPU run falls back to, is an order of magnitude slower at
+that size. Measured on a 4060 Ti.
 
-| Setup | Ticks/s | Agent-steps/s |
-| --- | --- | --- |
-| 100 agents, CUDA | ~2,550 | ~255,000 |
-| 300 agents, CUDA | ~2,150 | ~645,000 |
-| 600 agents, CUDA | ~1,350 | ~810,000 |
-| 1000 agents, CUDA | ~1,050 | ~1,050,000 |
+| Setup | Ticks/s | Agent-steps/s | Same tick in numpy |
+| --- | --- | --- | --- |
+| 100 agents | ~21,000 | ~2,100,000 | ~1,200 |
+| 300 agents | ~13,600 | ~4,100,000 | ~1,160 |
+| 600 agents | ~5,500 | ~3,300,000 | ~810 |
+| 1000 agents | ~3,300 | ~3,300,000 | ~620 |
+| 3000 agents | ~1,200 | ~3,600,000 | ~370 |
 
-At 90 ticks per in-game second, 100 agents playing a 60 second episode take about 2.1 seconds of wall clock.
+At 90 ticks per in-game second, 300 agents playing a 60 second episode take about 0.4 seconds of wall clock.
+Agent-steps flatten out around four million because past a few hundred agents a tick is no longer physics at
+all, it is the action pass reading every agent's weights.
 
-**Physics is bound by numpy call overhead, not by data.** A 300-element `np.add` costs 0.69 us against 0.61 us
+**A tick never leaves the device.** Physics, the per-tick rewards and the next decision are one compiled,
+captured graph replayed once per action window, so a window is a single launch and nothing crosses back to
+the host inside it. Positions are truncated to whole pixels every tick, which keeps the device simulation
+exactly equal to the numpy one rather than merely close: same collisions, same deaths, same coins, agent for
+agent. What the host still reads, it reads between windows. The alive mask is sampled once an in-game second,
+and the whole state is copied back only when a frame is drawn or a checkpoint ends.
+
+**Fusing is what makes it fast, not the device.** Written as plain tensor calls a tick is 245 tiny kernels,
+each paying a fixed cost whatever the population size, and it measures no faster than numpy at 300 agents.
+Inductor fuses those into 14, which is the order of magnitude, and the graph capture removes what is left of
+the launch cost. Compiling the action pass on top is worth about 3%, because that one moves real bytes, so
+only the simulation is compiled.
+
+**Physics in numpy is bound by call overhead, not by data.** A 300-element `np.add` costs 0.69 us against 0.61 us
 for a one-element one, so nine tenths of a call is dispatch and the vector unit is idle waiting on Python.
 Widening the arrays is free and narrowing them buys nothing: float32 measures the same as float64 at this size.
 The only lever is making fewer calls, so the collision passes are written around that. The four tiles a player
@@ -294,10 +314,11 @@ copies surfaces.
 
 ## Layout
 
-`ai/` holds the learning code: `generation.py` is the training loop, rewards and weight files, `population.py`
-is the batched network. `game/` holds the engine: `world.py` is the batched numpy simulation, `render.py` the
-camera-culled renderer and the panels drawn over it, `art.py` every sprite it draws with, `play.py` the
-human-played session on top of both. Both entry points fill the same `Hud` and the renderer only lays it out.
+`ai/` holds the learning code: `generation.py` is the training loop and weight files, `population.py` is the
+batched network, `device_runner.py` plays whole action windows on the device, `rewards.py` is what a run pays
+out. `game/` holds the engine: `world.py` is the batched numpy simulation and `world_cuda.py` the same
+physics as tensors, `render.py` the camera-culled renderer and the panels drawn over it, `art.py` every
+sprite it draws with, `play.py` the human-played session on top of both. Both entry points fill the same `Hud` and the renderer only lays it out.
 Levels are text files in `maps/`, `tiles.py` maps their characters to a `TileKind`, weights land in `weights/`,
 screen and physics constants live in `game/settings.py`.
 
