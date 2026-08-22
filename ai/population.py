@@ -47,13 +47,28 @@ class Population:
 
 	Shapes follow `nn.Linear`'s state dict on export, and are widened back to float32 there, so a weight file
 	stays readable as fc1/norm1/actor whatever the population runs in.
+
+	`size` is how many independent networks the tensors hold and `batch` how many observations each one is
+	asked about per pass. Evolution runs `size` networks on one observation each; PPO runs a single network
+	on one observation per environment, which is the same `baddbmm` with the two dimensions swapped and
+	reads a thousandth of the weight bytes per decision.
 	"""
 
-	def __init__(self, size: int, hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES, device: torch.device | None = None) -> None:
+	def __init__(
+		self,
+		size: int,
+		hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES,
+		device: torch.device | None = None,
+		batch: int = 1,
+		critic: bool = False,
+	) -> None:
 		self.size = size
+		self.batch = batch
+		self.critic = critic
 		self.device = device if device is not None else pick_device()
-		# Only the argmax of the logits is ever read, so the mantissa half precision drops costs nothing here
-		self.dtype = pick_dtype(self.device)
+		# Evolution only ever reads the argmax of the logits, so half precision drops nothing it uses; a
+		# gradient does care, so a critic pins the whole policy to float32 rather than to a loss scaler
+		self.dtype = torch.float32 if critic else pick_dtype(self.device)
 		self.hidden_sizes = hidden_sizes
 		first, second, third = hidden_sizes
 
@@ -63,6 +78,8 @@ class Population:
 			'fc3': (second, third),
 			'actor': (third, ACTION_COUNT),
 		}
+		if critic:
+			self.linear_shapes['critic'] = (third, 1)
 		self.norm_shapes: dict[str, int] = {'norm1': first, 'norm2': second}
 
 		self.weights: dict[str, Tensor] = {}
@@ -75,13 +92,17 @@ class Population:
 			self.biases[name] = torch.empty(size, 1, features, device=self.device, dtype=self.dtype)
 
 		self.randomize(torch.arange(size, device=self.device))
+		if critic:
+			# Evolution rewrites these tensors by hand; a policy gradient needs autograd to reach them instead
+			for tensor in self.parameters():
+				tensor.requires_grad_(True)
 
 		# Page-locked staging buffers: the world writes its observations straight into `observations`, and the
 		# actions come back into `actions`, so a tick copies twice over PCIe instead of through pageable memory
 		pinned = self.device.type == 'cuda'
-		self._host_observations = torch.empty(size, 1, OBSERVATION_SIZE, dtype=HOST_DTYPE, pin_memory=pinned)
-		self.observations: NDArray[np.float16] = self._host_observations.numpy().reshape(size, OBSERVATION_SIZE)
-		self._host_actions = torch.empty(size, dtype=torch.int64, pin_memory=pinned)
+		self._host_observations = torch.empty(size, batch, OBSERVATION_SIZE, dtype=HOST_DTYPE, pin_memory=pinned)
+		self.observations: NDArray[np.float16] = self._host_observations.numpy().reshape(size * batch, OBSERVATION_SIZE)
+		self._host_actions = torch.empty(size * batch, dtype=torch.int64, pin_memory=pinned)
 		self.actions: NDArray[np.int64] = self._host_actions.numpy()
 
 		self._pending: Tensor | None = None  # Result of a pass run eagerly, where no graph could be captured
@@ -112,12 +133,42 @@ class Population:
 		normalized = F.layer_norm(x, (x.shape[-1],), eps=LAYER_NORM_EPS)
 		return normalized * self.weights[name] + self.biases[name]
 
-	def forward(self, observations: Tensor) -> Tensor:
-		"""Runs the population on `(agents, batch, OBSERVATION_SIZE)` observations, returning `(agents, batch, 3)` logits."""
+	def _trunk(self, observations: Tensor) -> Tensor:
 		x = F.leaky_relu(self._layer_norm(self._linear(observations, 'fc1'), 'norm1'))
 		x = F.leaky_relu(self._layer_norm(self._linear(x, 'fc2'), 'norm2'))
-		x = F.leaky_relu(self._linear(x, 'fc3'))
-		return self._linear(x, 'actor')
+		return F.leaky_relu(self._linear(x, 'fc3'))
+
+	def forward(self, observations: Tensor) -> Tensor:
+		"""Runs the population on `(agents, batch, OBSERVATION_SIZE)` observations, returning `(agents, batch, 3)` logits."""
+		return self._linear(self._trunk(observations), 'actor')
+
+	def forward_actor_critic(self, observations: Tensor) -> tuple[Tensor, Tensor]:
+		"""Logits and state values off one trunk pass, `(agents, batch, 3)` and `(agents, batch)`."""
+		features = self._trunk(observations)
+		return self._linear(features, 'actor'), self._linear(features, 'critic').squeeze(-1)
+
+	@torch.no_grad()
+	def sample(self, observations: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+		"""
+		Samples one action per environment and returns it with its log probability and the state value.
+
+		Sampling is what PPO's ratio is defined against, so the rollout plays the distribution rather than
+		its argmax. Gumbel-max draws from the softmax in one elementwise pass, with no host read and no
+		kernel that a graph capture would refuse.
+		"""
+		logits, values = self.forward_actor_critic(observations)
+		log_probs = F.log_softmax(logits.float(), dim=-1)
+		uniform = torch.rand_like(log_probs).clamp_(1e-20, 1.0)
+		actions = (log_probs - (-uniform.log()).log()).argmax(dim=-1)
+		return actions, log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1), values.float()
+
+	def evaluate(self, observations: Tensor, actions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+		"""Log probability of `actions`, the policy's entropy and its values, with the graph the update needs."""
+		logits, values = self.forward_actor_critic(observations)
+		log_probs = F.log_softmax(logits.float(), dim=-1)
+		taken = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+		entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+		return taken, entropy, values.float()
 
 	@torch.no_grad()
 	def _greedy(self, observations: Tensor) -> Tensor:
@@ -131,10 +182,10 @@ class Population:
 		Replaying a captured graph collapses those launches into one, and the shapes never change here.
 		The weights are updated in place by evolution, so the graph keeps reading the current values.
 		"""
-		if self.device.type != 'cuda':
+		if self.device.type != 'cuda' or self.critic:
 			return
 		try:
-			self._graph_input = torch.zeros(self.size, 1, OBSERVATION_SIZE, device=self.device, dtype=self.dtype)
+			self._graph_input = torch.zeros(self.size, self.batch, OBSERVATION_SIZE, device=self.device, dtype=self.dtype)
 			warmup = torch.cuda.Stream()
 			warmup.wait_stream(torch.cuda.current_stream())
 			with torch.cuda.stream(warmup):
@@ -241,6 +292,8 @@ class Population:
 		"""Loads a single agent's state dict into every agent of the population."""
 		with torch.no_grad():
 			for name in self.linear_shapes:
+				if f'{name}.weight' not in state:
+					continue  # A file saved by the other trainer carries no critic, which keeps its random init
 				weight = state[f'{name}.weight'].to(self.device, self.dtype).t()
 				if weight.shape != self.weights[name].shape[1:]:
 					raise ValueError(f'{name} expects {tuple(self.weights[name].shape[1:])}, got {tuple(weight.shape)}')

@@ -48,7 +48,8 @@ class CudaWorld:
 		self.win_tick = torch.full((self.count,), -1, device=device, dtype=torch.int64)
 		self.coins = zeros(torch.int32)
 		self.collected = torch.zeros(self.count, max(1, world.coin_count), device=device, dtype=torch.bool)
-		self.tick = torch.zeros((), device=device, dtype=torch.int64)
+		# One tick counter per player rather than one for the batch, so an episode can end and restart per agent
+		self.tick = torch.zeros(self.count, device=device, dtype=torch.int64)
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state, tick counter included."""
@@ -62,6 +63,26 @@ class CudaWorld:
 		self.coins.zero_()
 		self.collected.zero_()
 		self.tick.zero_()
+
+	def reset_where(self, mask: Tensor, spawn_x: Tensor, spawn_y: Tensor) -> None:
+		"""
+		Restarts only the players `mask` selects, each on its own spawn point, leaving the others untouched.
+
+		Every write is a whole-population `where`, so a reset costs the same whoever it hits and stays inside
+		a captured graph: this is what lets an agent that died carry on collecting experience from a fresh
+		episode while the rest of the batch keeps playing theirs.
+		"""
+		keep = ~mask
+		torch.where(mask, spawn_x, self.x, out=self.x)
+		torch.where(mask, spawn_y, self.y, out=self.y)
+		self.change_x *= keep
+		self.change_y *= keep
+		self.dead &= keep
+		self.win &= keep
+		torch.where(mask, torch.full_like(self.win_tick, -1), self.win_tick, out=self.win_tick)
+		self.coins *= keep
+		self.collected &= keep.unsqueeze(1)
+		self.tick *= keep
 
 	def sync(self) -> World:
 		"""Writes the device state back into the numpy world the renderer and the fitness pass read."""
@@ -172,7 +193,7 @@ class CudaWorld:
 		hit |= (goal[bottom_row + left] != 0) | (goal[bottom_row + right] != 0)
 
 		won = alive & hit
-		torch.where(won, self.tick.expand_as(self.win_tick), self.win_tick, out=self.win_tick)
+		torch.where(won, self.tick, self.win_tick, out=self.win_tick)
 		self.win |= won
 
 	def _collect_coins(self, alive: Tensor, block: tuple[Tensor, Tensor, Tensor, Tensor]) -> None:

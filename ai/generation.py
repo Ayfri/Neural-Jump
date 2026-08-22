@@ -10,6 +10,12 @@ from numpy.typing import NDArray
 
 from ai.device_runner import DeviceRunner
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
+from ai.ppo import (
+	DEFAULT_CLIP_RANGE, DEFAULT_ENTROPY_COEF, DEFAULT_EPOCHS, DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA,
+	DEFAULT_LEARNING_RATE, DEFAULT_MINIBATCHES, DEFAULT_ROLLOUT_STEPS, DEFAULT_TARGET_KL, PPOTrainer,
+	RolloutBuffer,
+)
+from ai.ppo_runner import PPORunner, SpawnCurriculum
 from ai.rewards import (
 	BACKWARD_MOVEMENT_PENALTY, COIN_REWARD, DEATH_PENALTY, DISTANCE_REWARD_DIVISOR, FALLING_PENALTY,
 	FALLING_THRESHOLD, FORWARD_MOVEMENT_REWARD, MIN_REWARD, NEW_MAX_POSITION_BONUS, PROGRESS_REWARD_DIVISOR,
@@ -49,6 +55,13 @@ SPEED_STEP: Final[float] = 2.0  # Factor the slower and faster keys apply
 MIN_SPEED: Final[float] = 0.1
 MAX_SPEED_MULTIPLIER: Final[float] = 1024.0
 
+TRAINERS: Final[tuple[str, ...]] = ('ppo', 'ga')
+DEFAULT_TRAINER: Final[str] = 'ppo'
+DEFAULT_ENV_COUNT: Final[int] = 1024  # Environments PPO runs by default: one policy, so the action pass barely notices
+SPAWN_MODES: Final[tuple[str, ...]] = ('curriculum', 'uniform', 'start')
+DEFAULT_SPAWN_MODE: Final[str] = 'curriculum'
+DEFAULT_SPAWN_SPACING: Final[int] = 20  # Tiles between two rungs of the curriculum's ladder
+
 ALIVE_CHECK_TICKS: Final[int] = 90  # Ticks between two host reads of the alive mask, on the device path
 
 WEIGHTS_FOLDER: Final[Path] = Path('weights')
@@ -60,6 +73,7 @@ class Generation:
 	def __init__(
 		self,
 		population_size: int = DEFAULT_POPULATION_SIZE,
+		trainer: str = DEFAULT_TRAINER,
 		# Evolution
 		elite_count: int = DEFAULT_ELITE_COUNT,
 		mutation_rate: float = DEFAULT_MUTATION_RATE,
@@ -73,6 +87,18 @@ class Generation:
 		tick_rate: int = DEFAULT_TICK_RATE,
 		action_repeat: int = DEFAULT_ACTION_REPEAT,
 		use_checkpoints: bool = False,
+		# PPO
+		spawn_mode: str = DEFAULT_SPAWN_MODE,
+		spawn_spacing: int = DEFAULT_SPAWN_SPACING,
+		rollout_steps: int = DEFAULT_ROLLOUT_STEPS,
+		learning_rate: float = DEFAULT_LEARNING_RATE,
+		gamma: float = DEFAULT_GAMMA,
+		gae_lambda: float = DEFAULT_GAE_LAMBDA,
+		clip_range: float = DEFAULT_CLIP_RANGE,
+		epochs: int = DEFAULT_EPOCHS,
+		minibatches: int = DEFAULT_MINIBATCHES,
+		entropy_coef: float = DEFAULT_ENTROPY_COEF,
+		target_kl: float = DEFAULT_TARGET_KL,
 		# Run
 		seed: int | None = None,
 		load_latest_generation_weights: bool = False,
@@ -82,6 +108,7 @@ class Generation:
 		fps: int = 0,
 	) -> None:
 		self.population_size = population_size
+		self.trainer = trainer
 		self.elite_count = min(elite_count, population_size)
 		self.mutation_rate = mutation_rate
 		self.mutation_strength = mutation_strength
@@ -101,7 +128,8 @@ class Generation:
 		self.speed = 1.0 if self.auto_speed else float(speed)
 
 		self.generation = 1
-		self.best_fitness_ever = 0.0
+		# A policy gradient's episodes can be worth less than nothing, so the record starts below every score
+		self.best_fitness_ever = -float('inf') if trainer == 'ppo' else 0.0
 		self.best_time_ever = 0.0  # Fastest run to the flag in seconds, 0 while nobody has reached it
 		self.should_skip_checkpoint = False
 		self.manual_stop = False
@@ -113,15 +141,41 @@ class Generation:
 		self.fitness_history: list[float] = []
 
 		self.world = World(map_path, population_size)
-		self.population = Population(population_size, hidden_sizes, pick_device(device))
+		resolved = pick_device(device)
+		# PPO trains one network on every environment at once, so the batched tensors hold a single agent
+		# asked about `population_size` observations rather than `population_size` agents asked about one
+		self.population = (
+			Population(1, hidden_sizes, resolved, batch=population_size, critic=True) if trainer == 'ppo'
+			else Population(population_size, hidden_sizes, resolved)
+		)
 		self.rewards = np.zeros(population_size, dtype=np.float64)
 		self._rewards_banked = np.zeros(population_size, dtype=np.float64)  # What the checkpoints already played are worth
 
-		# On CUDA the whole tick runs on the device, physics and rewards both, and the host only reads between windows
-		self.cuda_world = CudaWorld(self.world, self.population.device) if self.population.device.type == 'cuda' else None
-		self.runner = DeviceRunner(self.cuda_world, self.population, self.action_repeat) if self.cuda_world else None
+		# On CUDA the whole tick runs on the device, physics and rewards both, and the host only reads between
+		# windows. PPO needs that path whatever the device, since an episode restarts one environment at a time.
+		self.cuda_world = CudaWorld(self.world, resolved) if resolved.type == 'cuda' or trainer == 'ppo' else None
+		self.runner = DeviceRunner(self.cuda_world, self.population, self.action_repeat) if self.cuda_world and trainer == 'ga' else None
 		self._alive_checked_tick = 0
 		self._anyone_alive = True
+		self._stuck_owed = 0
+		self._collected = 0  # Steps of the last rollout that were actually played, which a manual stop cuts short
+		self._updating = False  # True while the policy is being updated, which the HUD says and the window survives
+		self._drawn = False  # Whether this update's one frame has gone out, since nothing moves for the rest of it
+
+		spawns = self.world.ground_spawns(spawn_spacing)
+		self.curriculum = SpawnCurriculum(spawns, spawn_mode if len(spawns) > 1 else 'start')
+		self.ppo: PPOTrainer | None = None
+		self.ppo_runner: PPORunner | None = None
+		self.buffer: RolloutBuffer | None = None
+		self.last_stats: dict[str, float] = {}
+		if trainer == 'ppo':
+			assert self.cuda_world is not None
+			self.buffer = RolloutBuffer(rollout_steps, population_size, resolved)
+			self.ppo_runner = PPORunner(self.cuda_world, self.population, self.buffer, self.action_repeat, self.max_ticks, self.curriculum)
+			self.ppo = PPOTrainer(
+				self.population, population_size, learning_rate=learning_rate, gamma=gamma, gae_lambda=gae_lambda,
+				clip_range=clip_range, epochs=epochs, minibatches=minibatches, entropy_coef=entropy_coef, target_kl=target_kl,
+			)
 
 		self.max_x_reached = np.zeros(population_size, dtype=np.float64)
 		self.max_x_tick = np.zeros(population_size, dtype=np.float64)  # Tick each record was set on, so progress is scored on time too
@@ -151,8 +205,8 @@ class Generation:
 				(pygame.K_m, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
 				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), 'Slower'),
 				(pygame.K_EQUALS, lambda: self.scale_speed(SPEED_STEP), 'Faster'),
-				(pygame.K_g, self.skip_checkpoint, 'Skip ckpt'),
-				(pygame.K_s, self.stop_generation, 'Stop gen'),
+				(pygame.K_g, self.skip_checkpoint, 'Next rung' if trainer == 'ppo' else 'Skip ckpt'),
+				(pygame.K_s, self.stop_generation, 'End rollout' if trainer == 'ppo' else 'Stop gen'),
 				(pygame.K_r, self.restart_run, 'Restart'),
 				# Same two on the numpad, described nowhere so the legend keeps one line per action
 				(pygame.K_KP_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), ''),
@@ -208,9 +262,9 @@ class Generation:
 
 	def _restart(self) -> None:
 		"""Throws the run away: random weights again, generation back to 1, every record cleared."""
-		self.population.randomize(torch.arange(self.population_size, device=self.population.device))
+		self.population.randomize(torch.arange(self.population.size, device=self.population.device))
 		self.generation = 1
-		self.best_fitness_ever = 0.0
+		self.best_fitness_ever = -float('inf') if self.ppo is not None else 0.0
 		self.best_time_ever = 0.0
 		self.fitness_history.clear()
 		self.rewards.fill(0.0)
@@ -220,9 +274,24 @@ class Generation:
 		self.restart_requested = False
 		self.manual_stop = False
 		self.should_skip_checkpoint = False
+		if self.ppo is not None and self.ppo_runner is not None:
+			self.ppo = PPOTrainer(
+				self.population, self.population_size, learning_rate=self.ppo.optimizer.param_groups[0]['lr'],
+				gamma=self.ppo.gamma, gae_lambda=self.ppo.gae_lambda, clip_range=self.ppo.clip_range,
+				epochs=self.ppo.epochs, minibatches=self.ppo.minibatches, entropy_coef=self.ppo.entropy_start,
+				target_kl=self.ppo.target_kl,
+			)
+			self.ppo_runner.reset_all()
 		print('Restarted from scratch, generation 1')
 
 	def skip_checkpoint(self) -> None:
+		"""Ends the current checkpoint's episode, or under PPO moves the curriculum on a rung by hand."""
+		if self.ppo_runner is not None and self.ppo is not None:
+			self.curriculum.promote()
+			self.ppo_runner.apply_curriculum()
+			self.ppo.restart_exploration()
+			print(f'Curriculum: episodes now start from rung {self.curriculum.front} of {len(self.curriculum.spawns) - 1}')
+			return
 		self.should_skip_checkpoint = True
 
 	def stop_generation(self) -> None:
@@ -235,6 +304,59 @@ class Generation:
 		return points
 
 	def play_agents(self) -> None:
+		"""Plays what the trainer scores on: a rollout of transitions for PPO, a full episode for evolution."""
+		if self.ppo_runner is not None:
+			self.collect_rollout()
+			return
+		self._play_episodes()
+
+	def collect_rollout(self) -> None:
+		"""
+		Fills one rollout buffer, paced and rendered exactly like an episode is.
+
+		Nothing here waits for an episode to finish: environments start and end their own, so the loop counts
+		decisions and hands the buffer over the moment it is full, whatever each environment is in the middle of.
+		"""
+		assert self.ppo_runner is not None and self.buffer is not None
+		started = time.perf_counter()
+		self._speed_time = started
+		self._speed_ticks = self.total_ticks
+		self.ppo_runner.begin_rollout()
+
+		wanted = self.buffer.steps
+		played = 0
+		while played < wanted and not (self.manual_stop or self.restart_requested):
+			steps = wanted - played
+			if self.renderer is not None:
+				self.render(0, 1, played * self.action_repeat)
+				if self.paused:
+					self._tick_budget = 0.0
+					continue
+				self._tick_budget += self.ticks_per_frame
+				steps = min(int(self._tick_budget) // self.action_repeat, steps)
+				self._tick_budget -= steps * self.action_repeat
+				self._adapt_ticks_per_frame()
+
+			for _ in range(steps):
+				self.ppo_runner.collect_step()
+				self.total_ticks += self.action_repeat
+				self._stuck_owed += self.action_repeat
+				if self._stuck_owed >= self.stuck_check_ticks:
+					self._stuck_owed = 0
+					self.ppo_runner.check_positions(self.stuck_check_ticks)
+			played += steps
+
+		self._collected = played
+		self._sync_from_device()
+		best_return, best_tick = self.ppo_runner.records()
+		self.best_fitness_ever = max(self.best_fitness_ever, best_return)
+		if best_tick >= 0:
+			self.best_time_ever = best_tick / self.tick_rate
+		elapsed = time.perf_counter() - started
+		self.last_speed = played * self.action_repeat / elapsed if elapsed else 0.0
+		self.manual_stop = False
+
+	def _play_episodes(self) -> None:
 		"""Runs the whole population through every spawn point and fills `self.rewards`."""
 		points = self.spawn_points()
 		self.rewards.fill(0.0)
@@ -317,8 +439,15 @@ class Generation:
 
 	def _sync_from_device(self) -> None:
 		"""Reads the device state back into the numpy world and the trackers the fitness and the HUD use."""
-		assert self.cuda_world is not None and self.runner is not None
+		assert self.cuda_world is not None
 		self.cuda_world.sync()
+		if self.ppo_runner is not None:
+			# What the HUD ranks agents on under PPO is the return of the episode each one is still playing
+			np.copyto(self.rewards, self.ppo_runner.episode_return.cpu().numpy())
+			np.copyto(self.max_x_reached, self.ppo_runner.max_x_reached.cpu().numpy())
+			return
+
+		assert self.runner is not None
 		self.rewards[:] = self._rewards_banked + self.runner.rewards.cpu().numpy()
 		np.copyto(self.max_x_reached, self.runner.max_x_reached.cpu().numpy())
 		np.copyto(self.max_x_tick, self.runner.max_x_tick.cpu().numpy())
@@ -497,14 +626,28 @@ class Generation:
 
 	def training_rows(self) -> 'list[Row]':
 		"""The knobs that shape the run, laid out for the HUD's training panel."""
-		rows: 'list[Row]' = [
-			('Population', f'{self.population_size}'),
-			('Mutation Rate', f'{self.mutation_rate:.3f}'),
-			('Mutation Str', f'{self.mutation_strength:.4f}'),
-			('Elites', f'{self.elite_count}'),
-			('Network', 'x'.join(str(size) for size in self.population.hidden_sizes)),
-			('Device', str(self.population.device)),
-		]
+		if self.ppo is not None:
+			assert self.buffer is not None
+			rows: 'list[Row]' = [
+				('Envs', f'{self.population_size}'),
+				('Rollout', f'{self.buffer.steps} x {self.population_size}'),
+				('Entropy', f'{self.ppo.entropy_coef:.4f}'),
+				('KL', f'{self.last_stats.get("approx_kl", 0.0):.4f}'),
+				('Value Loss', f'{self.last_stats.get("value_loss", 0.0):.3f}'),
+				('Spawn', f'{self.curriculum.mode} {self.curriculum.front}/{len(self.curriculum.spawns) - 1}'),
+				('Update', f'{self.generation}'),
+				('Network', 'x'.join(str(size) for size in self.population.hidden_sizes)),
+				('Device', str(self.population.device)),
+			]
+		else:
+			rows = [
+				('Population', f'{self.population_size}'),
+				('Mutation Rate', f'{self.mutation_rate:.3f}'),
+				('Mutation Str', f'{self.mutation_strength:.4f}'),
+				('Elites', f'{self.elite_count}'),
+				('Network', 'x'.join(str(size) for size in self.population.hidden_sizes)),
+				('Device', str(self.population.device)),
+			]
 		return [
 			*rows,
 			('Coin', f'+{COIN_REWARD:g} x{self.world.coin_count}'),
@@ -519,24 +662,25 @@ class Generation:
 
 		self.renderer.poll_events()
 		self._sample_live_speed()
-		if self.runner is not None:
+		if self.cuda_world is not None and not self._updating:
 			self._sync_from_device()  # A frame is the one place the whole device state is worth reading back
 		world = self.world
 		best = int(np.argmax(np.where(world.alive(), self.rewards, -np.inf)))
 		alive = int(world.alive().sum())
 		fps = self.renderer.measured_fps()
 		best_coins = int(world.coins.max())
-		elite_count = self.elite_count if self.generation > 1 else 0
-		random_count = min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0
+		elite_count = self.elite_count if self.generation > 1 and self.ppo is None else 0
+		random_count = min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if elite_count else 0
+		progress = (f'  {tick // max(1, self.action_repeat)}/{self.buffer.steps}' + ('  LEARNING' if self._updating else '')
+			if self.buffer is not None
+			else f'  ckpt {checkpoint_index + 1}/{checkpoint_count}' if checkpoint_count > 1 else '')
 
 		run = Panel('Run', [
-			('Generation', f'{self.generation}'),
-			('Time', f'{tick / max(1, self.tick_rate):.1f}s'
-				+ (f'  ckpt {checkpoint_index + 1}/{checkpoint_count}' if checkpoint_count > 1 else '')
-				+ ('  PAUSED' if self.paused else '')),
+			('Generation' if self.ppo is None else 'Rollout', f'{self.generation}'),
+			('Time', f'{tick / max(1, self.tick_rate):.1f}s' + progress + ('  PAUSED' if self.paused else '')),
 			Gauge('Alive', f'{alive}/{world.count}', alive / max(1, world.count)),
 			('Best', f'{float(self.rewards.max()):.1f}'),
-			('Record', f'{self.best_fitness_ever:.1f}' + (f'  {self.best_time_ever:.2f}s' if self.best_time_ever > 0 else '')),
+			('Record', (f'{self.best_fitness_ever:.1f}' if self.best_fitness_ever > -float('inf') else '-') + (f'  {self.best_time_ever:.2f}s' if self.best_time_ever > 0 else '')),
 			Gauge('Coins', f'{best_coins}/{world.coin_count}', best_coins / max(1, world.coin_count), COIN_COLOR),
 			('Ticks/s', f'{self.live_speed:,.0f}  x{self.live_speed / self.tick_rate:.0f}'),
 			Gauge('FPS', f'{fps:.0f}/{self.renderer.target_fps}', fps / max(1, self.renderer.target_fps)),
@@ -558,9 +702,12 @@ class Generation:
 		))
 
 	def evolve_generation(self) -> None:
-		"""Selects the elites, breeds the next generation and saves the best weights."""
+		"""Improves the policy on what was just played: a PPO update, or selection and breeding."""
 		if self.restart_requested:
 			self._restart()
+			return
+		if self.ppo is not None:
+			self._update_policy()
 			return
 
 		self.fitness_history.append(float(self.rewards.max()))
@@ -575,7 +722,52 @@ class Generation:
 
 		self.generation += 1
 		self.manual_stop = False
+		self._save_weights()
 
+	def _update_policy(self) -> None:
+		"""One PPO update over the rollout just collected, then the same weight file every generation writes."""
+		assert self.ppo is not None and self.ppo_runner is not None and self.buffer is not None
+		if self._collected == 0:
+			return
+		statistics = self.ppo_runner.statistics()
+		self._updating, self._drawn = True, False
+		try:
+			result = self.ppo.update(self.buffer, self.ppo_runner.last_value(), self._collected, self._draw_frame)
+		finally:
+			self._updating = False
+		self.last_stats = {**statistics, **result}
+		self.fitness_history.append(statistics['mean_return'])
+
+		if self.curriculum.observe(int(statistics['front_episodes']), int(statistics['front_cleared'])):
+			self.ppo_runner.apply_curriculum()
+			self.ppo.restart_exploration()
+			print(f'Curriculum: episodes now start from rung {self.curriculum.front} of {len(self.curriculum.spawns) - 1}, tile {self.curriculum.spawns[self.curriculum.front][0] // TILE_SIZE}')
+		elif self.curriculum.stalled():
+			self.ppo.restart_exploration(stalled=True)
+			print(f'Stuck on rung {self.curriculum.front}, entropy bonus back up to {self.ppo.entropy_coef:.4f}')
+
+		self.generation += 1
+		self.manual_stop = False
+		self._save_weights()
+
+	def _draw_frame(self) -> None:
+		"""
+		Keeps the window alive through an update, which the simulation spends standing still.
+
+		The world does not move during an update, so there is exactly one frame worth drawing and the rest of
+		the minibatches only pump the event queue. Drawing every one of them would be far worse than wasted:
+		a frame reads the device state back, and every one of those reads blocks on the gradient kernels
+		already queued in front of it, which serialises the whole update behind the window.
+		"""
+		if self.renderer is None:
+			return
+		if self._drawn:
+			self.renderer.poll_events()
+			return
+		self._drawn = True
+		self.render(0, 1, self._collected * self.action_repeat)
+
+	def _save_weights(self) -> None:
 		WEIGHTS_FOLDER.mkdir(exist_ok=True)
 		torch.save({
 			'weights': self.population.state_dict(0),
@@ -608,6 +800,9 @@ class Generation:
 
 			self.generation = latest
 			print(f'Loaded weights for generation {latest}')
+			if self.ppo is not None:
+				self.generation += 1
+				return
 			print(f'Mutation parameters: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}')
 			self.evolve_generation()
 		except (FileNotFoundError, ValueError, KeyError) as error:

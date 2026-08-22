@@ -27,6 +27,7 @@ ON_GROUND_SPEED: Final[float] = 2.0  # Vertical speed under which the player cou
 DEATH_ROW_MARGIN: Final[int] = 2  # Rows above the bottom of the map that kill the player
 GRID_PADDING: Final[int] = 32  # Air border baked around the grids so lookups never need bounds checks
 GRID_ORIGIN: Final[int] = GRID_PADDING * TILE_SIZE  # Pixels the padding adds to a tile coordinate
+MIN_SPAWN_SPACING: Final[int] = 3  # Tiles under which two rungs of the spawn ladder are the same place
 
 MOVE_SPEEDS: Final[NDArray[np.float64]] = np.zeros(MOVE_IDLE + 1)  # Horizontal speed per action, jumping keeps the current one
 MOVE_SPEEDS[[MOVE_LEFT, MOVE_RIGHT]] = (-PLAYER_SPEED, PLAYER_SPEED)
@@ -155,6 +156,9 @@ class World:
 		self.coin_count = len(coins)
 		self.coin_positions: list[tuple[int, int]] = [self._pixels(cell) for cell in coins]
 
+		# The near edge of the flag, which is how far along the level a run has to get to have finished it
+		flags = np.argwhere(self.kinds == TileKind.FLAG)
+		self.goal_x = int(flags[:, 1].min()) * TILE_SIZE if len(flags) else self.width * TILE_SIZE
 		spawns = np.argwhere(self.kinds == TileKind.SPAWN)
 		self.spawn_point = self._pixels(spawns[0]) if len(spawns) else (0, 0)
 		self.checkpoints: list[tuple[int, int]] = [self._pixels(cell) for cell in np.argwhere(self.kinds == TileKind.CHECKPOINT)]
@@ -188,6 +192,29 @@ class World:
 		self.windows[:, GRID_TILES:GRID_TILES + NEAREST_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES))
 		# Coins are baked like the terrain, so a window still points at one the agent has already taken
 		self.windows[:, GRID_TILES + NEAREST_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES))
+
+	def ground_spawns(self, spacing: int) -> list[tuple[int, int]]:
+		"""
+		Somewhere to restart an episode roughly every `spacing` tiles, in map order, starting with the spawn point.
+
+		A level carries a handful of hand-placed checkpoints, which is far too coarse a ladder to climb down:
+		the last one here is still 169 tiles from the flag. The geometry gives a finer one for free. A column's
+		landing is the lowest solid tile with two clear rows over it, which is the main floor where there is
+		one and the platform bridging a pit where there is not, and a column with no landing at all is skipped.
+		"""
+		clear = ~self.solid[:-2] & ~self.solid[1:-1] & self.solid[2:]  # Rows r-2 and r-1 empty over a solid row r
+		landing = np.where(clear.any(axis=0), self.height - 1 - clear[::-1].argmax(axis=0), -1)
+		# The near edge of every surface, so a rung lands on the platforms a pit is crossed by rather than
+		# straddling the whole crossing: those are the jumps the ladder exists to break up
+		edge = np.r_[True, landing[:-1] < 0]
+
+		points = [self.spawn_point]
+		last = self.spawn_point[0] // TILE_SIZE
+		for column in np.flatnonzero(landing >= 0):
+			if column - last >= spacing or (edge[column] and column - last >= MIN_SPAWN_SPACING):
+				points.append((int(column) * TILE_SIZE, int(landing[column] - 1) * TILE_SIZE + self.offset_y))
+				last = int(column)
+		return points
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
