@@ -399,7 +399,8 @@ class Background:
 	Four layers, each scrolled at its own fraction of the camera: the gradient barely moves, the stars drift,
 	and the two ridges slide fast enough to read as distance. Every layer is one viewport-sized surface baked
 	once, the scrolling ones tile horizontally and the key-coloured ones skip their empty rows, so a frame
-	costs six blits whatever the map size.
+	costs at most nine blits whatever the map size. Each layer is also clipped to the rows the one in front of
+	it leaves uncovered, which on a low camera cuts the gradient and the stars out of the frame entirely.
 	"""
 
 	def __init__(self, level: tuple[int, int], view: tuple[int, int]) -> None:
@@ -419,17 +420,22 @@ class Background:
 
 	def draw(self, screen: Surface, left: int, top: int) -> None:
 		"""`left` is the camera's x in the level and `top` its y on the level surface, so both are already positive."""
-		window = Rect(0, int(top * SKY_PARALLAX), self._width, self._height)
-		screen.blit(self._sky, (0, 0), window)
-
-		# A layer is drawn twice, one copy left of the other, so whatever the offset the viewport is covered
-		window.top = int(top * STAR_PARALLAX)
-		offset = -int(left * STAR_PARALLAX) % self._width
-		screen.blit(self._stars, (offset - self._width, 0), window)
-		screen.blit(self._stars, (offset, 0), window)
-
 		# The ridges sit at the bottom of their layer, so they slide down the screen as the camera climbs
 		tops = [int((self._scroll_y - top) * factor) for _, _, factor in self._ridges]
+		# The back range is opaque under its own floor, so the two layers behind it are cut off there: with the
+		# camera low in the level that is most of the viewport, and the gradient is the one full-screen copy a frame makes
+		sky_height = min(self._height, max(0, tops[0] + self._ridges[0][1]))
+
+		if sky_height:
+			window = Rect(0, int(top * SKY_PARALLAX), self._width, sky_height)
+			screen.blit(self._sky, (0, 0), window)
+
+			# A layer is drawn twice, one copy left of the other, so whatever the offset the viewport is covered
+			window.top = int(top * STAR_PARALLAX)
+			offset = -int(left * STAR_PARALLAX) % self._width
+			screen.blit(self._stars, (offset - self._width, 0), window)
+			screen.blit(self._stars, (offset, 0), window)
+
 		for index, (ridge, floor, factor) in enumerate(self._ridges):
 			y = tops[index]
 			if y >= self._height:
@@ -477,5 +483,5 @@ def bake_level(kinds: NDArray[np.uint8], size: tuple[int, int], top: int) -> Sur
 			sprite = flag_sprite(row == 0 or kinds[row - 1, column] != TileKind.FLAG)
 		blits.append((sprite, (column * TILE_SIZE, top + row * TILE_SIZE)))
 
-	surface.blits(blits, doreturn=False)
+	surface.fblits(blits)
 	return _punched(surface)
