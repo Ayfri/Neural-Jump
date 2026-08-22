@@ -9,7 +9,9 @@ import torch
 from numpy.typing import NDArray
 
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
-from game.settings import COIN_COLOR, TILE_SIZE
+from game.art import COIN_COLOR
+from game.settings import TILE_SIZE
+from game.tiles import TILE_REWARDS, TileKind
 from game.world import World
 
 if TYPE_CHECKING:
@@ -49,7 +51,7 @@ STATIONARY_THRESHOLD: Final[int] = 5  # Ticks before penalty kicks in
 FALLING_PENALTY: Final[float] = -0.02
 FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
 
-COIN_REWARD: Final[float] = 5.0  # Paid per coin, so a full sweep is worth less than reaching the flag
+COIN_REWARD: Final[float] = TILE_REWARDS[TileKind.COIN]  # Every tile's payout lives in one table
 DEATH_PENALTY: Final[float] = -20.0
 WIN_BASE_BONUS: Final[float] = 200.0  # Paid for touching the flag at all, whatever the time taken
 WIN_SPEED_BONUS: Final[float] = 1200.0  # Paid on top, scaled by how much of the episode was still left
@@ -396,9 +398,8 @@ class Generation:
 			+ world.dead * DEATH_PENALTY,
 		)
 
-		rewards = np.where(world.finished_reward != 0, world.finished_reward * DISTANCE_REWARD_DIVISOR, progress)
 		# Coins are paid whatever the run ended as, so a detour that banks one is always worth something
-		return np.where(world.win, win_reward, rewards) + COIN_REWARD * world.coins
+		return np.where(world.win, win_reward, progress) + COIN_REWARD * world.coins
 
 	def check_agent_positions(self, tick: int) -> None:
 		"""Kills agents that are stuck in place or crawling backwards."""

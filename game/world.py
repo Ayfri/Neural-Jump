@@ -9,15 +9,15 @@ from game.constants import AGENT_VISION_DISTANCE, MOVE_IDLE, MOVE_JUMP, MOVE_LEF
 from game.settings import (
 	PLAYER_GRAVITY, PLAYER_HEIGHT, PLAYER_JUMP_STRENGTH, PLAYER_SPEED, PLAYER_WIDTH, SCREEN_HEIGHT, TILE_SIZE,
 )
-from game.tiles import TILES
+from game.tiles import TILE_CHARS, TILE_REWARDS, TileKind
 
 PLAYER_W: Final[int] = int(PLAYER_WIDTH)
 PLAYER_H: Final[int] = int(PLAYER_HEIGHT)
 GRID_SIDE: Final[int] = AGENT_VISION_DISTANCE * 2 + 1
 GRID_TILES: Final[int] = GRID_SIDE * GRID_SIDE  # One solid flag each, which is the whole terrain
-REWARD_FEATURES: Final[int] = 4  # in view, its offset in x and y, is it the flag, for the closest reward tile
+GOAL_FEATURES: Final[int] = 4  # in view, its offset in x and y, is it the flag, for the closest goal tile
 COIN_FEATURES: Final[int] = 3  # in view, its offset in x and y, for the closest uncollected coin
-WINDOW_FEATURES: Final[int] = GRID_TILES + REWARD_FEATURES + COIN_FEATURES
+WINDOW_FEATURES: Final[int] = GRID_TILES + GOAL_FEATURES + COIN_FEATURES
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
 OBSERVATION_SIZE: Final[int] = WINDOW_FEATURES + PLAYER_FEATURES
 # Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
@@ -57,7 +57,7 @@ def closest_tile(windows: NDArray[np.float32], flag_feature: bool) -> NDArray[np
 	Summarises the non-zero tiles of a window: whether one is in view, where it is, and optionally whether
 	it is the flag.
 
-	A map holds a handful of reward tiles in total, so a channel per tile spends most of the observation
+	A map holds a handful of goal tiles in total, so a channel per tile spends most of the observation
 	saying "still nothing here". A few numbers carry what a player can act on instead, and point at the flag
 	directly rather than leaving the network to read a position out of a one-hot grid.
 	"""
@@ -113,7 +113,6 @@ class World:
 		self.change_y = np.zeros(count, dtype=np.float64)
 		self.dead = np.zeros(count, dtype=np.bool_)
 		self.win = np.zeros(count, dtype=np.bool_)
-		self.finished_reward = np.zeros(count, dtype=np.float32)
 		self.win_tick = np.full(count, -1, dtype=np.int32)
 		self.coins = np.zeros(count, dtype=np.int32)
 		self.collected = np.zeros((count, max(1, self.coin_count)), dtype=np.bool_)
@@ -124,6 +123,10 @@ class World:
 		self._box = np.zeros((4, count), dtype=np.float64)  # Scratch the collision passes rebuild every call
 		self._cell_limits = np.array([[self._max_row], [self._max_row], [self._max_column], [self._max_column]])
 
+	def _pixels(self, cell: NDArray[np.int64]) -> tuple[int, int]:
+		"""The top-left pixel of a (row, column) map cell, in the same space the players live in."""
+		return int(cell[1]) * TILE_SIZE, int(cell[0]) * TILE_SIZE + self.offset_y
+
 	def _load_map(self, map_path: str) -> None:
 		with resolve_map_path(map_path).open() as file:
 			lines = [line.strip() for line in file.readlines() if line.strip()]
@@ -133,52 +136,50 @@ class World:
 		self.offset_y = SCREEN_HEIGHT - self.height * TILE_SIZE
 		self.death_y = (self.height - DEATH_ROW_MARGIN) * TILE_SIZE + self.offset_y
 
-		self.chars = np.full((self.height, self.width), '.', dtype='<U1')
-		self.solid = np.zeros((self.height, self.width), dtype=np.bool_)
-		self.reward = np.zeros((self.height, self.width), dtype=np.float32)
-		# Coins are numbered as they are read, so an agent's collected set is one bool per coin
-		self.coin_ids = np.full((self.height, self.width), -1, dtype=np.int64)
-		self.coin_positions: list[tuple[int, int]] = []
-		self.spawn_point = (0, 0)
-		self.checkpoints: list[tuple[int, int]] = []
-
+		# One character-code lookup per row turns the whole map into its tile kinds, without a dict hit per cell
+		lookup = np.zeros(256, dtype=np.uint8)
+		for char, kind in TILE_CHARS.items():
+			lookup[ord(char)] = kind
+		self.kinds = np.zeros((self.height, self.width), dtype=np.uint8)
 		for y, line in enumerate(lines):
-			for x, char in enumerate(line):
-				tile = TILES.get(char)
-				if tile is None:
-					continue
-				self.chars[y, x] = char
-				self.solid[y, x] = tile.get('is_solid', False)
-				self.reward[y, x] = tile.get('reward', 0)
-				if tile.get('is_coin', False):
-					self.coin_ids[y, x] = len(self.coin_positions)
-					self.coin_positions.append((x * TILE_SIZE, y * TILE_SIZE + self.offset_y))
-				elif tile.get('is_player', False):
-					self.spawn_point = (x * TILE_SIZE, y * TILE_SIZE + self.offset_y)
-				elif tile.get('is_checkpoint', False):
-					self.checkpoints.append((x * TILE_SIZE, y * TILE_SIZE + self.offset_y))
+			codes = np.frombuffer(line.encode('ascii', 'replace'), dtype=np.uint8)
+			self.kinds[y, :codes.size] = lookup[codes]
 
-		self.coin_count = len(self.coin_positions)
+		self.solid = self.kinds == TileKind.SOLID
+		# The flag is the one tile a player wins on, kept as a float grid because the vision windows read it
+		self.goal = np.zeros((self.height, self.width), dtype=np.float32)
+		self.goal[self.kinds == TileKind.FLAG] = TILE_REWARDS[TileKind.FLAG]
+
+		# Coins are numbered in reading order, so an agent's collected set is one bool per coin
+		coins = np.argwhere(self.kinds == TileKind.COIN)
+		self.coin_ids = np.full((self.height, self.width), -1, dtype=np.int64)
+		self.coin_ids[coins[:, 0], coins[:, 1]] = np.arange(len(coins))
+		self.coin_count = len(coins)
+		self.coin_positions: list[tuple[int, int]] = [self._pixels(cell) for cell in coins]
+
+		spawns = np.argwhere(self.kinds == TileKind.SPAWN)
+		self.spawn_point = self._pixels(spawns[0]) if len(spawns) else (0, 0)
+		self.checkpoints: list[tuple[int, int]] = [self._pixels(cell) for cell in np.argwhere(self.kinds == TileKind.CHECKPOINT)]
 
 		# Padded copies: any tile index is clamped into the air border instead of being bounds-checked
 		self.padded_solid = np.pad(self.solid, GRID_PADDING)
-		self.padded_reward = np.pad(self.reward, GRID_PADDING)
+		self.padded_goal = np.pad(self.goal, GRID_PADDING)
 		self.padded_coins = np.pad(self.coin_ids, GRID_PADDING, constant_values=-1)
 		self._max_row = self.height + 2 * GRID_PADDING - 1
 		self._max_column = self.width + 2 * GRID_PADDING - 1
 		# Collision lookups index these flat views: `take` on one flat array beats a broadcast fancy index
 		self._padded_width = self.width + 2 * GRID_PADDING
 		self._flat_solid = self.padded_solid.ravel()
-		self._flat_reward = self.padded_reward.ravel()
+		self._flat_goal = self.padded_goal.ravel()
 		self._flat_coins = self.padded_coins.ravel()
-		# One lookup on the 2x2 box a player can touch then skips the whole reward or coin pass
-		self._flat_near_reward = near_grid(self.padded_reward != 0).ravel()
+		# One lookup on the 2x2 box a player can touch then skips the whole goal or coin pass
+		self._flat_near_goal = near_grid(self.padded_goal != 0).ravel()
 		self._flat_near_coin = near_grid(self.padded_coins >= 0).ravel()
 
 		# Every window of the map, baked once: an observation is then a single gather of contiguous rows
 		# instead of a broadcast fancy index rebuilt per tick.
 		solid_windows = sliding_window_view(self.padded_solid, (GRID_SIDE, GRID_SIDE))
-		reward_windows = sliding_window_view(self.padded_reward, (GRID_SIDE, GRID_SIDE))
+		goal_windows = sliding_window_view(self.padded_goal, (GRID_SIDE, GRID_SIDE))
 		coin_windows = sliding_window_view(self.padded_coins >= 0, (GRID_SIDE, GRID_SIDE))
 		self._max_window_row = solid_windows.shape[0] - 1
 		self._window_stride = solid_windows.shape[1]
@@ -187,8 +188,8 @@ class World:
 		self._windows = np.empty((solid_windows.shape[0] * self._window_stride, WINDOW_FEATURES), dtype=OBSERVATION_DTYPE)
 		self._windows[:, :GRID_TILES] = solid_windows.reshape(-1, GRID_TILES)
 		# Coins are baked like the terrain, so a window still points at one the agent has already taken
-		self._windows[:, GRID_TILES:GRID_TILES + REWARD_FEATURES] = closest_tile(reward_windows.reshape(-1, GRID_TILES), flag_feature=True)
-		self._windows[:, GRID_TILES + REWARD_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES), flag_feature=False)
+		self._windows[:, GRID_TILES:GRID_TILES + GOAL_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES), flag_feature=True)
+		self._windows[:, GRID_TILES + GOAL_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES), flag_feature=False)
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
@@ -198,7 +199,6 @@ class World:
 		self.change_y.fill(0.0)
 		self.dead.fill(False)
 		self.win.fill(False)
-		self.finished_reward.fill(0.0)
 		self.win_tick.fill(-1)
 		self.coins.fill(0)
 		self.collected.fill(False)
@@ -242,7 +242,7 @@ class World:
 	def observe(self, out: NDArray[np.float16] | None = None) -> NDArray[np.float16]:
 		"""
 		Fills `out` (or the world's own buffer) with the (count, 56) observation: the solid flag of every
-		tile in the 7x7 window around the player, where the closest reward tile in it sits, and the
+		tile in the 7x7 window around the player, where the closest goal tile in it sits, and the
 		player's own speed and ground state.
 		"""
 		target = self._observation if out is None else out
@@ -285,7 +285,7 @@ class World:
 		np.trunc(self.y, out=self.y, where=alive)
 		# x is final once the horizontal pass is done, so the last two passes share its tile columns
 		columns = self._resolve_vertical(alive)
-		self._collect_rewards(alive, tick, columns)
+		self._touch_goal(alive, tick, columns)
 		self._collect_coins(alive, columns)
 
 	def grounded(self) -> NDArray[np.bool_]:
@@ -317,7 +317,7 @@ class World:
 		np.copyto(self.x, snapped, where=alive & (hit_left | hit_right) & (self.change_x != 0))
 
 	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-		"""Resolves the vertical move and hands back the tile columns, which the reward pass reuses as is."""
+		"""Resolves the vertical move and hands back the tile columns, which the goal pass reuses as is."""
 		cells = self._cells(self.y)
 		rows = self._row_offsets(cells)
 		top, bottom = cells[0], cells[1]
@@ -337,23 +337,22 @@ class World:
 		np.copyto(self.change_y, 0.0, where=blocked)
 		return left, right
 
-	def _collect_rewards(self, alive: NDArray[np.bool_], tick: int, columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
+	def _touch_goal(self, alive: NDArray[np.bool_], tick: int, columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
+		"""Wins the episode for every player whose box overlaps the flag, on the tick it got there."""
 		left, right = columns
 		rows = self._row_offsets(self._cells(self.y))
 
-		# Reward tiles are rare, so the whole gather is skipped unless someone actually stands next to one
-		if not np.take(self._flat_near_reward, rows[0] + left).any():
+		# The flag is a handful of tiles on a whole map, so the gather is skipped unless someone stands next to it
+		if not np.take(self._flat_near_goal, rows[0] + left).any():
 			return
 
-		values = self._flat_reward
-		best = np.maximum(
-			np.maximum(np.take(values, rows[0] + left), np.take(values, rows[0] + right)),
-			np.maximum(np.take(values, rows[1] + left), np.take(values, rows[1] + right)),
-		)
+		goal = self._flat_goal
+		hit = np.take(goal, rows[0] + left) != 0
+		hit |= np.take(goal, rows[0] + right) != 0
+		hit |= np.take(goal, rows[1] + left) != 0
+		hit |= np.take(goal, rows[1] + right) != 0
 
-		touched = alive & (best != 0)
-		np.copyto(self.finished_reward, best, where=touched)
-		won = touched & (best == 1)
+		won = alive & hit
 		np.copyto(self.win_tick, tick, where=won)
 		self.win |= won
 
