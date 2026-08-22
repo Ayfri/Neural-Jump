@@ -226,19 +226,29 @@ times the tick. Measured on a 4060 Ti.
 
 | Setup | Ticks/s | Agent-steps/s |
 | --- | --- | --- |
-| 100 agents, CUDA | ~2,450 | ~245,000 |
-| 300 agents, CUDA | ~1,800 | ~540,000 |
-| 600 agents, CUDA | ~1,330 | ~800,000 |
-| 1000 agents, CUDA | ~1,000 | ~1,000,000 |
+| 100 agents, CUDA | ~2,550 | ~255,000 |
+| 300 agents, CUDA | ~2,150 | ~645,000 |
+| 600 agents, CUDA | ~1,350 | ~810,000 |
+| 1000 agents, CUDA | ~1,050 | ~1,050,000 |
 
-At 90 ticks per in-game second, 100 agents playing a 60 second episode take about 2.2 seconds of wall clock.
+At 90 ticks per in-game second, 100 agents playing a 60 second episode take about 2.1 seconds of wall clock.
 
-**Physics is bound by numpy call overhead, not by data.** On 300-element arrays a numpy call costs far more
-than the arithmetic inside it, so the four collision passes are written to make as few calls as possible. The
-four tiles a player box touches come out of one `(4, count)` block instead of four separate divisions,
-collisions read a flat grid through `take` rather than a broadcast fancy index, and the chain of `where`
-calls that snaps a blocked player collapses into one select per direction. Reward tiles are rare, so one
-lookup in a baked "any reward in these four tiles" map skips the reward gather on almost every tick.
+**Physics is bound by numpy call overhead, not by data.** A 300-element `np.add` costs 0.69 us against 0.61 us
+for a one-element one, so nine tenths of a call is dispatch and the vector unit is idle waiting on Python.
+Widening the arrays is free and narrowing them buys nothing: float32 measures the same as float64 at this size.
+The only lever is making fewer calls, so the collision passes are written around that. The four tiles a player
+box touches come out of one `(4, count)` block instead of four separate divisions, and the far side of that box
+is one strided add off the near side. Both passes that run after the vertical snap read the same tiles, so the
+box is resolved once and handed to them rather than rebuilt inside each. Grids are gathered with the `take`
+method rather than `np.take`, which is the same gather without two frames of dispatch in front of it, and the
+chain of `where` calls that snaps a blocked player collapses into one select per direction. The coin pass takes
+its four corners in a single gather and drops out before its dedupe loop unless somebody is standing on a coin;
+reward tiles are rare, so one lookup in a baked "any reward in these four tiles" map skips the reward gather on
+almost every tick.
+
+Per-tick rewards are written the same way: the stationary counter is stepped and cleared by a whole-array add
+and multiply instead of two masked writes and an invert, and the terms accumulate into the running fitness
+through one masked add rather than a mask multiply and a separate `+=`.
 
 **Vision is baked.** The window of every tile in the map, terrain and reward vector both, is built once at
 load time, so an observation is a single gather of one row. It is written in half precision straight into a
@@ -263,13 +273,16 @@ keeping small, and why `--hidden-sizes` is the last lever on it.
 star field and three mountain ranges, each one a viewport-sized surface baked at startup and scrolled at its own
 fraction of the camera, from 0.05 for the stars to 0.36 for the nearest range. The scrolling layers tile
 horizontally, so each is drawn twice side by side whatever the offset, and a range is clipped to the rows the one
-in front of it does not already cover.
+in front of it does not already cover. The gradient is the one full-screen copy a frame makes, so it is clipped
+the same way: below the back range's floor that range is opaque in every column, and the sky and the stars stop
+there. With the camera low in the level that is most of the viewport.
 
 The terrain and the goal never move, so the whole level is painted once into a single surface in the display's
 own format, with the air left as a run-length encoded key colour. That makes the level blit skip the empty sky
 instead of blending it, which is worth about a hundred times the cost of the same copy with a real alpha channel.
-Over it go two batched `blits` calls, one for the bodies and one for the markers, filled only with what the camera
-actually covers: the players are tested against the screen as one numpy mask, and the coins are held sorted by x
+Over it go two batched `fblits` calls, one for the bodies and one for the markers. `fblits` gives up the source
+rect and the per-blit flags that `blits` carries, which none of these need, and draws the same 300 bodies about
+1.7x faster. Both lists are filled only with what the camera actually covers: the players are tested against the screen as one numpy mask, and the coins are held sorted by x
 so two binary searches cut the map down to the column in view. Coins and checkpoints are the two things drawn per
 frame rather than baked, the coins because which are left depends on the agent being followed, the checkpoints
 because their haze is translucent and a key colour cannot carry that.
