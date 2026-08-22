@@ -1,19 +1,23 @@
 # Neural-Jump
 
-A platformer where a whole population of neural networks plays the level at once. No gradients, no reward
-backprop: 300 agents run the level in parallel, the best few breed, their children get mutated, repeat until
-someone touches the flag.
+A platformer where a thousand neural networks play the level at once, and two ways of getting better at it:
+
+- **PPO** (default) trains one policy on every environment in parallel, with a reverse curriculum that starts
+  episodes near the flag and walks them back to the level's own spawn point as the policy learns.
+- **Evolution** (`--trainer ga`) runs a population of separate networks, scores them, breeds the best few and
+  mutates their children. No gradients anywhere. It plateaus part way through the level.
 
 The interesting part is that everything is batched. The world is numpy arrays with one slot per agent, the
-population is one set of `(agents, in, out)` weight tensors, and a tick steps all of them together. On a
-4060 Ti that is a million agent-steps per second.
+networks are one set of `(agents, in, out)` weight tensors, and a tick steps all of them together. On a
+4060 Ti that is seven million agent-steps per second.
 
 ## Quick start
 
 ```bash
 uv sync
-uv run run-ai.py                              # headless training, as fast as the machine allows
+uv run run-ai.py                              # headless PPO, as fast as the machine allows
 uv run run-ai.py --show-window --speed max    # watch it, as fast as the framerate survives
+uv run run-ai.py --trainer ga                 # the genetic algorithm instead
 uv run run-game.py                            # play the level yourself
 uv run run-game.py --spawn 3                  # start on the third checkpoint
 ```
@@ -26,10 +30,27 @@ The first generation of a run is slower than the rest, because that is where the
 
 ## Options
 
-*evolution* - how a generation is selected and bred
+- `--trainer ppo|ga`: `ppo` trains one policy on every environment at once, `ga` selects and breeds a
+  population of separate networks (default: ppo)
+- `--population-size N`: parallel environments under PPO, agents per generation under evolution. Defaults to
+  1024 and 300, because one shared policy makes the action pass cost almost nothing per environment
 
-- `--population-size N`: agents per generation (default: 300). A tick at 300 agents costs about 1.4x a tick
-  at 100 while trying three times as many mutations, and those extra mutations are what break a plateau
+*ppo* - the policy gradient, ignored under `--trainer ga`
+
+- `--rollout-steps N`: decisions per environment between two updates (default: 256), so the default update
+  sees 262,144 transitions
+- `--learning-rate R` (default: 3e-4), `--gamma G` (default: 0.999, per decision, not per tick)
+- `--gae-lambda L`: bias against variance in the advantage estimate (default: 0.95)
+- `--clip-range C`: how far one update may move the policy (default: 0.2)
+- `--epochs N`: passes over each rollout (default: 4), `--minibatches N`: what each pass is split into (default: 8)
+- `--target-kl K`: divergence from the rollout that stops the extra passes early (default: 0.02)
+- `--entropy-coef E`: exploration bonus (default: 0.01), annealed to 0.001 over the first 400 updates
+- `--spawn curriculum|uniform|start`: where an episode restarts (default: curriculum)
+- `--spawn-spacing T`: tiles between two rungs of the curriculum ladder (default: 20), which is built from
+  the level floor rather than from the hand-placed checkpoints
+
+*evolution* - how a generation is selected and bred, ignored under `--trainer ppo`
+
 - `--elite-count N`: agents carried over untouched and used as parents (default: 6)
 - `--mutation-rate R`: probability that a child's weight tensor is mutated at all (default: 0.8)
 - `--mutation-strength S`: scale of the noise added to a mutated tensor (default: 0.02)
@@ -61,7 +82,9 @@ The first generation of a run is slower than the rest, because that is where the
 - `--fps N`: target framerate (default: 0, uses the display refresh rate)
 
 ```bash
-uv run run-ai.py --population-size 1000 --hidden-sizes 64 32 16   # a big dumb crowd
+uv run run-ai.py --spawn start                                    # PPO on the whole level, no curriculum
+uv run run-ai.py --population-size 4096 --rollout-steps 128       # wider rollout, same transitions per update
+uv run run-ai.py --trainer ga --population-size 1000 --hidden-sizes 64 32 16   # a big dumb crowd
 uv run run-ai.py --seed 1                                         # replays exactly
 uv run run-ai.py --show-window --speed 4                          # watchable
 ```
@@ -74,11 +97,23 @@ Every agent's state is in its sprite, so one glance reads the whole population:
 - **Faded grey ghost with shut eyes**: dead, dimmed out of the way of the agents still running, and carrying no outline
 - **Heading**: the face slides forward, both pupils sit against the front of their whites and the light moves to the
   leading edge; standing still, the face is centred and symmetric. **Blue arrow above the head**: rising, so it jumped
-- **Gold outline**: an elite carried over untouched. **Violet outline**: a re-randomised agent, kept for diversity
+- **Gold outline**: an elite carried over untouched. **Violet outline**: a re-randomised agent, kept for
+  diversity. Neither appears under PPO, where every environment plays the same policy
 - **White outline**: the agent the camera follows, the best one still alive
 
 The panels cover the run, the followed agent, the hyper-parameters, and the fitness distribution next to the
 best score of every generation so far.
+
+Under PPO the Run panel counts rollouts rather than generations, and its time row is how full the current one
+is. There is no reset between two of them: an environment carries its episode across the update, and the ones
+that restart do so on their own, whenever they die or reach the flag. The Training panel shows which rung the
+curriculum is on, which is near the flag at the start of a run and not at the level's own spawn point. To
+watch a run from the beginning of the level instead, use `--spawn start`.
+
+Between two rollouts the row reads **LEARNING** and the level stops moving, because it is: an update over a
+quarter of a million transitions takes about two seconds, and the simulation is not being stepped through any
+of it. The window stays live, it just has nothing new to draw. What that costs to watch depends on `--speed`,
+since it is a fixed two seconds against however long the rollout in front of it took.
 
 ## Keys
 
@@ -89,8 +124,8 @@ best score of every generation so far.
 | `1` | Back to speed x1 |
 | `M` | Speed `max`, which tunes itself to the framerate |
 | `-` / `=` | Halve or double the speed, also on the numpad. From `max` it starts at the multiplier it had reached |
-| `G` | Skip to the next spawn point |
-| `S` | End the generation now and breed from what it scored |
+| `G` | Skip to the next spawn point, or under PPO move the curriculum on a rung by hand |
+| `S` | End the generation now and breed from what it scored, or under PPO update on the rollout so far |
 | `R` | Start the whole run over: random weights, generation 1, records cleared |
 
 They are listed in the legend at the bottom left, and the speed shows in the Training panel.
@@ -142,8 +177,82 @@ Every agent shares that shape, so the population lives in one `(agents, in, out)
 forward pass for everyone is a single `baddbmm` per layer. Crossover, mutation and elitism are plain tensor
 ops on those same weights. Weight files hold one agent in ordinary `nn.Linear` / `nn.LayerNorm` layout.
 
-Agents are ranked by fitness, elites are copied over untouched, most of the population is a mutated crossover
-of two random elites, and a few slots are re-randomised for diversity.
+Under evolution every agent owns a copy of that shape, so the population lives in one `(agents, in, out)`
+tensor per layer. Agents are ranked by fitness, elites are copied over untouched, most of the population is a
+mutated crossover of two random elites, and a few slots are re-randomised for diversity.
+
+Under PPO the same tensors hold a single network with a value head bolted onto the trunk, asked about one
+observation per environment instead of `agents` networks asked about one each. It is the same `baddbmm` with
+the two dimensions swapped, and it reads 1024 times fewer weight bytes per decision.
+
+## PPO
+
+A rollout is `--rollout-steps` decisions on every environment, each one an action window of `--action-repeat`
+ticks. Environments run their own episodes: one that dies or reaches the flag restarts on the next step while
+the rest carry on with theirs, so nothing waits for anybody and a rollout is always exactly as long as it says.
+Then GAE(lambda) over the buffer, and `--epochs` passes of clipped minibatch ascent, stopped early when the
+policy has moved `--target-kl` away from the data that produced it.
+
+The whole rollout is one graph replay per step, buffer writes included: the write cursor is a device tensor,
+episode ends and resets are whole-population `where` calls, and the spawn point of a restart is drawn on the
+device from a cumulative table. The host reads nothing between the start of a rollout and its end.
+
+**The curriculum is what gets through the level.** The fast route is 44 seconds long, and a policy dropped at
+the start ends every one of its first thousand episodes in the same opening seconds, so nothing past them is
+ever seen. So episodes start near the flag instead and work backwards, one rung at a time.
+
+The ladder is built from the level's geometry, not from its four hand-placed checkpoints. A column's landing
+is its lowest solid tile with two clear rows over it, which is the main floor where there is one and the
+platform bridging a pit where there is not. A rung is taken every `--spawn-spacing` tiles, and also on the
+near edge of every surface, which is what puts one on each stepping stone of a crossing. That is 58 rungs on
+`maps/level_1.txt` against 4 checkpoints whose last one is still 169 tiles from the flag.
+
+How the ladder is built is the whole thing working or not, and both refinements were paid for by a stall:
+
+- On the **checkpoints**, `--seed 1` spent 150 updates on the first rung without a single win, its entropy
+  collapsing the whole way, while other seeds got through in 9. On a built ladder the same seed wins in its
+  first rollout.
+- On the **main floor alone**, the ladder has 76-tile holes where the level runs over pits, and the front
+  stalls on the first one.
+- Every `--spawn-spacing` tiles and nothing else, the front descended 30 rungs and then sat for 280 updates
+  on tile 147, which is the near lip of a 13-tile pit crossed by two stepping platforms. The rung straddled
+  the entire crossing. **Taking the edges too** puts a rung on each platform, so the ladder breaks that jump
+  into the three it is made of.
+
+The entropy bonus anneals against updates spent on the current rung rather than updates in the run, for the
+same reason: a curriculum can sit on one stretch for hundreds of updates, and a bonus annealed against the
+run is at its floor by the time the hard rungs come up. A rung that clears nothing at all for 25 rollouts is
+called stuck, and doubles what the bonus restarts on, up to a ceiling of 0.08.
+
+That is aimed at one failure in particular. The hardest jump on `maps/level_1.txt` is a 6-tile gap taken two
+rows uphill off a 4-tile platform, at tile 639: one random agent in 16,384 lands it, against about 50 in
+16,384 for the rungs either side. A policy that has already settled explores a good deal less than a random
+one, so the way past a rung like that is to put the noise back rather than to wait. Over a run that clears
+all 57 rungs it fires exactly once, on that one.
+
+The front moves one rung back each time 60% of the episodes started there reach the rung in front of it.
+Reaching the *next rung* rather than the flag is what keeps every promotion asking for the same thing, one
+stretch of level; asking for a full run instead makes each promotion harder than the last and stalls the
+ladder somewhere in the middle of the map. Rungs already behind the front keep 40% of the episodes, which is
+what stops the earlier ones being forgotten.
+
+`--spawn uniform` draws any rung with equal probability and `--spawn start` always uses the level's own spawn
+point, which is the honest baseline the curriculum is measured against.
+
+**What it comes to.** `--seed 1` at the defaults, 1024 environments and 262,144 transitions an update: the
+front leaves the last rung on update 3, reaches the level's own spawn point on update 429, and by update 457
+finishes the level in 156 of 160 episodes, its fastest full run 48.49 seconds against a 44 second route and a
+60 second budget. That is about two hours on a 4060 Ti. The genetic path on the same level plateaus around
+tile 700 of 764 and reaches the flag on two seeds out of five at a thousand agents.
+
+**Rewards are paid where the decision is.** Evolution only needs one number per agent to rank on, so it pays
+distance, coins and the win bonus at the end of the episode. A policy gradient needs to know which decision
+earned what, so under PPO the coins are paid on the tick they are taken and the end of episode reward is the
+flag bonus or the death penalty and nothing else. Distance is already paid tick by tick as it is covered;
+paying it again at the end would put most of the return in one terminal spike.
+
+What is left of the scale problem is handled by dividing every reward by the running spread of its own
+discounted return, which is what keeps a 1400 point flag and a 0.02 point step in the same critic.
 
 ## Rewards
 
@@ -154,12 +263,17 @@ of two random elites, and a few slots are re-randomised for diversity.
 - **Coins**: +5 each, added to whatever the run scored, so the 217 coins of the level are worth 1085 to an
   agent that could sweep them all, and a detour for one is always worth something
 
-Time is part of the fitness on both paths: an agent that touches the flag halfway through the episode scores
-300 of the 1200, one that touches it in the first tenth scores 970. An episode runs until every agent is dead
-or has finished, so the winners of a generation are ranked against each other by the tick they arrived on.
+Time is part of the score: an agent that touches the flag halfway through the episode scores 300 of the 1200,
+one that touches it in the first tenth scores 970.
 
-Agents that stand still for 2 seconds, or end up behind where they were 6 seconds earlier, are killed so the
-generation ends sooner.
+Under evolution an episode runs until every agent is dead or has finished, so the winners of a generation are
+ranked against each other by the tick they arrived on. Under PPO the progress and coin lines move: coins are
+paid the tick they are taken, and the end of an episode pays the flag bonus or the death penalty alone, since
+distance has already been paid as it was covered.
+
+Agents that stand still for 2 seconds, or end up behind where they were 6 seconds earlier, are killed. Under
+PPO an environment whose episode is younger than the window is exempt, since it is behind where it was only
+because it restarted.
 
 ## The level
 
@@ -191,21 +305,25 @@ are built around that height:
   gallery's staircase climbs to the left before it climbs to the right, which is the move an agent that only
   ever holds right and jump never makes, so which of the two an agent takes is visible at a glance.
 
-## Why the argmax
+## Why evolution plays the argmax
 
-The policy always plays the argmax of its logits. Sampling from it instead makes fitness a lottery: the same
+Under evolution the policy always plays the argmax of its logits. Sampling from it instead makes fitness a lottery: the same
 weights replayed a hundred times score anywhere from 40 to 730, mean 207, standard deviation 130. Selection
 then picks whoever drew the luckiest samples, that agent regresses to its mean next generation, and the best
 fitness saws up and down instead of climbing. The argmax has no variance: elites re-score exactly what earned
 them their rank, and the best fitness becomes a monotonic staircase.
 
-Nothing is lost by dropping the noise. Exploration here comes from mutating weights, not from mutating
+Nothing is lost by dropping the noise. Exploration there comes from mutating weights, not from mutating
 actions, and there is no policy gradient to feed a sampled action back into. Only the ordering of the logits
 is ever read, so their spread is never shaped into a distribution worth sampling from.
 
+PPO is the other case exactly: the ratio it clips is defined against the probability of the action that was
+played, so the rollout has to sample, and the entropy bonus is there to keep that distribution wide early on.
+Fitness being noisy costs nothing, because nothing is selected on it.
+
 ## Picking the mutation strength
 
-Swept at 300 agents over 200 generations on five seeds each, on `maps/level_1.txt`, scored by the furthest
+Evolution only. Swept at 300 agents over 200 generations on five seeds each, on `maps/level_1.txt`, scored by the furthest
 tile the population reaches out of the level's 764.
 
 | `--mutation-strength` | mean tile | per seed |
@@ -227,9 +345,38 @@ flag on two seeds out of five.
 
 ## Performance
 
-On CUDA the whole tick runs on the device and a population of 300 plays about four million agent-steps a
-second. The same tick in numpy, which is what a CPU run falls back to, is an order of magnitude slower at
-that size. Measured on a 4060 Ti.
+On CUDA the whole tick runs on the device. Measured on a 4060 Ti, on `maps/level_1.txt`.
+
+| Trainer | Setup | Ticks/s collecting | Agent-steps/s | Ticks/s counting the update |
+| --- | --- | --- | --- | --- |
+| PPO | 1000 environments | ~7,000 | ~7,000,000 | ~1,700 |
+| Evolution | 300 agents | ~13,600 | ~4,100,000 | ~13,600 |
+
+PPO steps fewer ticks a second than evolution at three times the environments and still moves more
+agent-steps, because its action pass reads one network instead of a thousand. What it spends the difference on
+is the rest of a rollout step: the value head, sampling, the buffer writes and the resets.
+
+**The update is three quarters of the wall clock**, and that is what PPO is. A rollout of 256 decisions on
+1000 environments takes 85 ms to collect and 250 ms to learn from, because learning walks the same 256,000
+transitions four more times, forwards and backwards. Evolution has no such phase: it never learns from what it
+played, it only ranks it. The `Speed:` line reports both rates so the gap is visible rather than surprising.
+
+Getting that 250 ms down was mostly not about the gradient. GAE and the reward scaler are sequential scans
+over the rollout, and written a step at a time they were 127 ms of pure kernel launches for arithmetic on
+1000 floats: everything in them that does not depend on the step before it is now lifted out into one
+whole-rollout call each, which is 40 ms. Compiling the policy's evaluation is worth another third of a
+minibatch, since the trunk is bound by passes over its activations rather than by its matmuls. Half precision
+buys nothing here and neither does TF32; both are the wrong lever on something already at bandwidth.
+
+**Watching costs almost nothing.** The window draws exactly one frame per update, not one per minibatch, and
+that frame does not read the device state back. Every one of those reads would otherwise block on the
+gradient kernels already queued in front of it, which serialises the entire update behind the window. At
+`--speed max` the update still dominates, which is the honest picture: there is nothing to watch at that
+speed anyway. Watch at `--speed 2` or `--speed 4`, where a rollout takes seconds and the update is a fifth of
+the cycle, or trade sample efficiency for smoothness with `--epochs 2`.
+
+The table below is the genetic path alone, where the action pass is the whole cost. The same tick in numpy,
+which is what a CPU run falls back to, is an order of magnitude slower at that size.
 
 | Setup | Ticks/s | Agent-steps/s | Same tick in numpy |
 | --- | --- | --- | --- |
