@@ -1,29 +1,49 @@
 import os
-import random
 import re
+import time
 from typing import Final
 
-import pygame
-import torch
-from torch import nn
 import numpy as np
+import torch
+from numpy.typing import NDArray
 
-from ai.agent import Agent
-from ai.a2c_trainer import A2CTrainer
+from ai.a2c_trainer import A2CTrainer, RolloutBuffer
+from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device
+from game.world import OBSERVATION_SIZE, World
 
-from game.game import Game
-from game.settings import BLACK
-
+# Generation constants
 DEFAULT_ELITE_COUNT: Final[int] = 4
-DEFAULT_MUTATION_RATE: Final[float] = 0.01
-DEFAULT_MUTATION_STRENGTH: Final[float] = 0.1
+DEFAULT_MUTATION_RATE: Final[float] = 0.8
+DEFAULT_MUTATION_STRENGTH: Final[float] = 0.015
 DEFAULT_TICK_RATE: Final[int] = 90
-RANDOM_AGENTS_COUNT: Final[int] = 5
-POSITION_CHECK_INTERVAL: Final[float] = 2.0
-STUCK_CHECK_WINDOW: Final[float] = 6.0
+DEFAULT_EPISODE_SECONDS: Final[float] = 20.0
+RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
+POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
+STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
+ROLLOUT_MEMORY_BUDGET: Final[int] = 512 * 1024 * 1024  # Cap on the observations kept for one A2C update
+
+# Reward constants
+FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
+NEW_MAX_POSITION_BONUS: Final[float] = 0.1
+BACKWARD_MOVEMENT_PENALTY: Final[float] = -0.1
+STATIONARY_PENALTY: Final[float] = -0.05
+STATIONARY_THRESHOLD: Final[int] = 5  # Ticks before penalty kicks in
+FALLING_PENALTY: Final[float] = -0.02
+FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
+
+DEATH_PENALTY: Final[float] = -20.0
+WIN_TIME_BONUS_MULTIPLIER: Final[float] = 100.0
+WIN_TIME_BONUS_BASE: Final[float] = 10.0
+DISTANCE_REWARD_DIVISOR: Final[float] = 10.0
+PROGRESS_REWARD_DIVISOR: Final[float] = 20.0
+MIN_REWARD: Final[float] = -30.0
+
+WEIGHTS_FOLDER: Final[str] = 'weights'
 
 
 class Generation:
+	"""Training loop: one batched World and one batched Population, stepped together and bred every generation."""
+
 	def __init__(
 		self,
 		population_size: int,
@@ -33,276 +53,244 @@ class Generation:
 		load_latest_generation_weights: bool = False,
 		show_window: bool = True,
 		use_checkpoints: bool = False,
-		use_a2c_learning: bool = True
+		use_a2c_learning: bool = True,
+		hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES,
+		device: str = 'auto',
+		tick_rate: int = DEFAULT_TICK_RATE,
+		episode_seconds: float = DEFAULT_EPISODE_SECONDS,
+		render_every: int = 1,
+		map_path: str = 'maps/level_1.txt',
 	) -> None:
 		self.population_size = population_size
-		self.elite_count = elite_count
-		self.mutation_strength = mutation_strength
+		self.elite_count = min(elite_count, population_size)
 		self.mutation_rate = mutation_rate
+		self.mutation_strength = mutation_strength
 		self.show_window = show_window
-		self.tick_rate = DEFAULT_TICK_RATE
-		self.generation = 1
 		self.use_checkpoints = use_checkpoints
 		self.use_a2c_learning = use_a2c_learning
-		self.agents = [Agent(self.tick_rate, self.show_window, generation=self) for _ in range(population_size)]
+		self.tick_rate = tick_rate
+		self.episode_seconds = episode_seconds
+		self.render_every = max(1, render_every)
+		self.generation = 1
+		self.best_fitness_ever = 0.0
 		self.should_skip_checkpoint = False
 		self.manual_stop = False
-		self.agent_positions: dict[int, list[tuple[float, int]]] = {}
-		self.last_position_check = 0.0
-		self.best_fitness_ever = 0.0
+		self.last_speed = 0.0
 
-		self.a2c_trainer = None
+		self.world = World(map_path, population_size)
+		self.population = Population(population_size, hidden_sizes, pick_device(device))
+		self.rewards = np.zeros(population_size, dtype=np.float64)
+
+		self.max_x_reached = np.zeros(population_size, dtype=np.float64)
+		self.ticks_stationary = np.zeros(population_size, dtype=np.int32)
+		self.position_history: list[NDArray[np.float64]] = []
+		self.last_position_check = 0.0
+
+		self.a2c_trainer: A2CTrainer | None = None
+		self.rollout: RolloutBuffer | None = None
 		if self.use_a2c_learning:
-			self.a2c_trainer = A2CTrainer(
-				agents=self.agents,
-				learning_rate=0.003,
-				gamma=0.95,
-				value_loss_coef=0.3,
-				entropy_coef=0.005,
-			)
+			self.a2c_trainer = A2CTrainer(self.population)
+			self.rollout = RolloutBuffer(self.rollout_capacity(), population_size)
 			print(self.a2c_trainer.get_training_summary())
+
+		self.renderer = None
+		if show_window:
+			import pygame
+
+			from game.render import Renderer
+
+			self.renderer = Renderer(self.world)
+			self.renderer.add_key_action(pygame.K_g, self.skip_checkpoint, 'Skip Checkpoint')
+			self.renderer.add_key_action(pygame.K_s, self.stop_generation, 'Stop Generation')
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
 
-	def evolve_generation(self) -> None:
-		"""Evolve generation by selecting elites and creating new offspring"""
-		self.agents.sort(key=lambda agent: agent.current_reward, reverse=True)
-		elites = self.agents[:self.elite_count]
-		best_reward = elites[0].current_reward
-		print(f"Selected {len(elites)} elites: {[f'{agent.current_reward:.2f}' for agent in elites]}")
-
-		if best_reward > self.best_fitness_ever:
-			self.best_fitness_ever = best_reward
-
-		if self.use_a2c_learning and self.a2c_trainer:
-			print("Performing A2C learning step...")
-			training_stats = self.a2c_trainer.train_step()
-			print(f"A2C Training Stats: {training_stats}")
-			if self.generation > 20:
-				new_entropy = max(0.001, 0.005 * (0.95 ** (self.generation - 20)))
-				self.a2c_trainer.adjust_entropy_coefficient(new_entropy)
-
-		elite_weights = [elite.model.state_dict() for elite in elites]
-		new_agents: list[Agent] = []
-
-		for elite_weight in elite_weights:
-			new_agent = Agent(self.tick_rate, self.show_window, generation=self)
-			new_agent.model.load_state_dict(elite_weight)
-			new_agents.append(new_agent)
-
-		while len(new_agents) < self.population_size - RANDOM_AGENTS_COUNT:
-			parent1 = random.choice(elites)
-			parent2 = random.choice(elites)
-			child_weights = self.crossover(parent1.model.state_dict(), parent2.model.state_dict())
-			new_agent = Agent(self.tick_rate, self.show_window, generation=self)
-			new_agent.model.load_state_dict(child_weights)
-			self.mutate(new_agent.model)
-			new_agents.append(new_agent)
-
-		while len(new_agents) < self.population_size:
-			new_agents.append(Agent(self.tick_rate, self.show_window, generation=self))
-
-		self.agents = new_agents[:self.population_size]
-
-		if self.use_a2c_learning:
-			self.a2c_trainer.update_agents(self.agents)
-
-		self.generation += 1
-		self.agent_positions.clear()
-		self.last_position_check = 0.0
-		self.manual_stop = False
-
-		os.makedirs("weights", exist_ok=True)
-		torch.save({
-			'weights': elites[0].model.state_dict(),
-			'best_fitness': self.best_fitness_ever,
-			'mutation_rate': self.mutation_rate,
-			'mutation_strength': self.mutation_strength
-		}, f"weights/generation_{self.generation}.pth")
-
-	def crossover(self, parent1_weights: dict[str, torch.Tensor], parent2_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-		"""Cross over weights of two parents to create a child"""
-		return {
-			key: (parent1_weights[key] + parent2_weights.get(key, parent1_weights[key])) / 2
-			for key in parent1_weights
-		}
-
-	def mutate(self, model: nn.Module) -> None:
-		"""Mutate model weights"""
-		for param in model.parameters():
-			if param.requires_grad and np.random.rand() < self.mutation_rate:
-				param.data += torch.randn_like(param) * self.mutation_strength
-
-	def get_best_agent(self) -> Agent:
-		"""Return agent with highest reward"""
-		return max(self.agents, key=lambda agent: agent.current_reward)
-
-	def load_latest_generation_weights(self) -> None:
-		"""Load weights from latest generation file"""
-		try:
-			latest_generation = max(
-				int(filename.split('_')[1].split('.')[0])
-				for filename in os.listdir("weights")
-				if re.match(r"generation_\d+\.pth", filename)
-			)
-			weights_path = f"weights/generation_{latest_generation}.pth"
-			weights_data = torch.load(weights_path, weights_only=False)
-
-			if isinstance(weights_data, dict) and 'weights' in weights_data:
-				weights = weights_data['weights']
-				if not isinstance(weights, dict):
-					raise ValueError("Invalid weights format")
-				for agent in self.agents:
-					agent.model.load_state_dict(weights)
-				self.best_fitness_ever = weights_data.get('best_fitness', 0.0)
-				self.mutation_rate = weights_data.get('mutation_rate', self.mutation_rate)
-				self.mutation_strength = weights_data.get('mutation_strength', self.mutation_strength)
-			else:
-				if not isinstance(weights_data, dict):
-					raise ValueError("Invalid weights format")
-				for agent in self.agents:
-					agent.model.load_state_dict(weights_data)
-
-			self.generation = latest_generation
-			print(f"Loaded weights for generation {latest_generation}")
-			print(f"Mutation parameters: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}")
-			self.evolve_generation()
-		except (FileNotFoundError, ValueError) as e:
-			print(f"No weights found, starting with random weights: {e}")
+	def rollout_capacity(self) -> int:
+		"""Number of transitions kept for one A2C update, bounded by the memory budget."""
+		wanted = int(self.episode_seconds * self.tick_rate) * len(self.spawn_points())
+		per_step = self.population_size * OBSERVATION_SIZE * 2  # float16 observations dominate the buffer
+		return max(1, min(wanted, ROLLOUT_MEMORY_BUDGET // per_step))
 
 	def skip_checkpoint(self) -> None:
-		"""Skip to next checkpoint"""
 		self.should_skip_checkpoint = True
 
-	def check_agent_positions(self, tick: int) -> None:
-		"""Check if agents are stuck or moving backwards, kill them if so"""
-		current_time = tick / 1000.0
+	def stop_generation(self) -> None:
+		self.manual_stop = True
 
+	def spawn_points(self) -> list[tuple[int, int]]:
+		points = [self.world.spawn_point]
+		if self.use_checkpoints:
+			points.extend(self.world.checkpoints)
+		return points
+
+	def play_agents(self) -> None:
+		"""Runs the whole population through every spawn point and fills `self.rewards`."""
+		points = self.spawn_points()
+		self.rewards.fill(0.0)
+		max_ticks = int(self.episode_seconds * self.tick_rate)
+		started = time.perf_counter()
+		ticks_done = 0
+
+		for checkpoint_index, (spawn_x, spawn_y) in enumerate(points):
+			self.world.reset(spawn_x, spawn_y)
+			self.max_x_reached[:] = self.world.x
+			self.ticks_stationary.fill(0)
+			self.position_history.clear()
+			self.last_position_check = 0.0
+
+			for tick in range(max_ticks):
+				if self.should_skip_checkpoint or self.manual_stop or self.world.win.any() or not self.world.alive().any():
+					break
+
+				alive = self.world.alive()
+				observations = self.world.observe()
+				actions = self.population.act(observations)
+				previous_x = self.world.x.copy()
+				previous_y = self.world.y.copy()
+				self.world.step(actions, tick)
+
+				step_rewards = self.continuous_rewards(alive, previous_x, previous_y)
+				self.rewards += step_rewards
+				if self.rollout is not None:
+					self.rollout.add(observations, actions, step_rewards, alive)
+
+				self.check_agent_positions(tick)
+				ticks_done += 1
+
+				if self.renderer is not None and tick % self.render_every == 0:
+					self.render(checkpoint_index, len(points), tick)
+
+			self.rewards += self.final_rewards()
+			self.should_skip_checkpoint = False
+
+		self.best_fitness_ever = max(self.best_fitness_ever, float(self.rewards.max()))
+		elapsed = time.perf_counter() - started
+		self.last_speed = ticks_done / elapsed if elapsed else 0.0
+
+	def continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64]) -> NDArray[np.float64]:
+		"""Per-tick micro rewards, computed for the whole population at once."""
+		x_delta = self.world.x - previous_x
+		rewards = np.zeros(self.population_size, dtype=np.float64)
+
+		forward = x_delta > 0
+		rewards += forward * FORWARD_MOVEMENT_REWARD
+		new_max = forward & (self.world.x > self.max_x_reached)
+		rewards += new_max * NEW_MAX_POSITION_BONUS
+		np.maximum(self.max_x_reached, self.world.x, out=self.max_x_reached, where=forward)
+
+		rewards += (x_delta < 0) * BACKWARD_MOVEMENT_PENALTY
+
+		still = x_delta == 0
+		self.ticks_stationary = np.where(still, self.ticks_stationary + 1, 0)
+		rewards += (still & (self.ticks_stationary > STATIONARY_THRESHOLD)) * STATIONARY_PENALTY
+
+		rewards += ((self.world.y - previous_y) > FALLING_THRESHOLD) * FALLING_PENALTY
+		return rewards * alive
+
+	def final_rewards(self) -> NDArray[np.float64]:
+		"""End of episode reward: win bonus, reward tile value, or distance travelled minus the death penalty."""
+		world = self.world
+		time_taken = np.where(world.win_tick >= 0, world.win_tick / self.tick_rate, WIN_TIME_BONUS_BASE)
+		win_reward = world.x / DISTANCE_REWARD_DIVISOR + np.maximum(0.0, WIN_TIME_BONUS_BASE - time_taken) * WIN_TIME_BONUS_MULTIPLIER
+		progress = np.maximum(MIN_REWARD, self.max_x_reached / PROGRESS_REWARD_DIVISOR + world.dead * DEATH_PENALTY)
+
+		rewards = np.where(world.finished_reward != 0, world.finished_reward * DISTANCE_REWARD_DIVISOR, progress)
+		return np.where(world.win, win_reward, rewards)
+
+	def check_agent_positions(self, tick: int) -> None:
+		"""Kills agents that are stuck in place or crawling backwards."""
+		current_time = tick / self.tick_rate
 		if current_time - self.last_position_check < POSITION_CHECK_INTERVAL:
 			return
 
 		self.last_position_check = current_time
+		self.position_history.append(self.world.x.copy())
+		window = int(STUCK_CHECK_WINDOW / POSITION_CHECK_INTERVAL) + 1
+		del self.position_history[:-window]
 
-		for agent in self.agents:
-			if agent.player and not agent.player.dead and not agent.player.win:
-				current_x = agent.player.rect.x
-				agent_key = agent.current_index
+		alive = self.world.alive()
+		if len(self.position_history) >= 2:
+			self.world.kill(alive & (self.position_history[-1] == self.position_history[-2]))
+		if len(self.position_history) >= 4:
+			self.world.kill(alive & (self.world.x < self.position_history[0]))
 
-				if agent_key not in self.agent_positions:
-					self.agent_positions[agent_key] = []
+	def render(self, checkpoint_index: int, checkpoint_count: int, tick: int) -> None:
+		assert self.renderer is not None
+		self.renderer.poll_events()
+		best = int(np.argmax(np.where(self.world.alive(), self.rewards, -np.inf)))
+		living = int(self.world.alive().sum())
+		self.renderer.draw(
+			best,
+			[
+				f'Generation: {self.generation} | Agent {best + 1}/{self.population_size}',
+				f'Time: {tick / self.tick_rate:.2f}s | Checkpoint {checkpoint_index + 1}/{checkpoint_count}',
+				f'Living agents: {living}/{self.population_size}',
+				f'Best fitness ever: {self.best_fitness_ever:.2f} | Current: {self.rewards.max():.2f}',
+				f'X: {int(self.world.x[best])} Y: {int(self.world.y[best])}',
+			],
+			self.tick_rate,
+		)
 
-				self.agent_positions[agent_key].append((current_time, current_x))
-				self.agent_positions[agent_key] = [
-					pos for pos in self.agent_positions[agent_key]
-					if pos[0] >= current_time - STUCK_CHECK_WINDOW
-				]
+	def evolve_generation(self) -> None:
+		"""Runs the A2C update, selects the elites, breeds the next generation and saves the best weights."""
+		if self.a2c_trainer is not None and self.rollout is not None:
+			print('Performing A2C learning step...')
+			stats = self.a2c_trainer.train_step(self.rollout)
+			print(f'A2C Training Stats: {stats}')
+			self.a2c_trainer.decay_entropy(self.generation)
 
-				positions = self.agent_positions[agent_key]
+		elites = self.population.evolve(
+			self.rewards.astype(np.float32),
+			self.elite_count,
+			min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)),
+			self.mutation_rate,
+			self.mutation_strength,
+		)
+		print(f'Selected {len(elites)} elites: {[f"{self.rewards[i]:.2f}" for i in elites]}')
 
-				if len(positions) >= 2:
-					recent_x = [pos[1] for pos in positions[-2:]]
-					if len(set(recent_x)) == 1:
-						agent.player.set_dead()
-						continue
+		if self.a2c_trainer is not None:
+			# The agents behind each slot just changed, so the Adam moments no longer describe them
+			self.a2c_trainer.reset_optimizer()
 
-				if len(positions) >= 4:
-					if current_x < positions[0][1]:
-						agent.player.set_dead()
+		self.generation += 1
+		self.manual_stop = False
 
-	def play_agents(self) -> None:
-		"""Play games with all agents in the generation"""
-		game = Game(self.population_size, self.tick_rate, self.show_window, has_playable_player=False)
-		game.use_checkpoints = self.use_checkpoints
-		game.init()
+		os.makedirs(WEIGHTS_FOLDER, exist_ok=True)
+		torch.save({
+			'weights': self.population.state_dict(0),
+			'hidden_sizes': self.population.hidden_sizes,
+			'best_fitness': self.best_fitness_ever,
+			'mutation_rate': self.mutation_rate,
+			'mutation_strength': self.mutation_strength,
+		}, f'{WEIGHTS_FOLDER}/generation_{self.generation}.pth')
 
-		game.add_key_action(pygame.K_g, self.skip_checkpoint, "Skip Checkpoint")
-		game.add_key_action(pygame.K_s, lambda: setattr(self, 'manual_stop', True), "Stop Generation")
+	def load_latest_generation_weights(self) -> None:
+		"""Loads the most recent weight file into every agent, then immediately breeds from it."""
+		try:
+			latest = max(
+				int(filename.split('_')[1].split('.')[0])
+				for filename in os.listdir(WEIGHTS_FOLDER)
+				if re.match(r'generation_\d+\.pth', filename)
+			)
+			data = torch.load(f'{WEIGHTS_FOLDER}/generation_{latest}.pth', weights_only=True, map_location='cpu')
+			weights = data['weights'] if isinstance(data, dict) and 'weights' in data else data
+			if not isinstance(weights, dict):
+				raise ValueError('invalid weights format')
 
-		spawn_points = [(game.level.spawn_point[0], game.level.spawn_point[1])]
-		if self.use_checkpoints and game.level.checkpoints:
-			spawn_points.extend(game.level.checkpoints)
+			self.population.load_state_dict(weights)
+			if isinstance(data, dict):
+				self.best_fitness_ever = float(data.get('best_fitness', 0.0))
+				self.mutation_rate = float(data.get('mutation_rate', self.mutation_rate))
+				self.mutation_strength = float(data.get('mutation_strength', self.mutation_strength))
 
-		print(f"Testing agents on {len(spawn_points)} spawn points (1 initial + {len(spawn_points)-1} checkpoints)")
+			self.generation = latest
+			print(f'Loaded weights for generation {latest}')
+			print(f'Mutation parameters: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}')
+			self.evolve_generation()
+		except (FileNotFoundError, ValueError, KeyError) as error:
+			print(f'No usable weights found, starting with random weights: {error}')
 
-		for agent in self.agents:
-			agent.current_reward = 0.0
-
-		for checkpoint_idx, (spawn_x, spawn_y) in enumerate(spawn_points):
-			for i, agent in enumerate(self.agents):
-				player = game.players[i]
-				agent.player = player
-				player.rect.x = spawn_x
-				player.rect.y = spawn_y
-				player.dead = False
-				player.win = False
-				player.finished_reward = None
-				player.change_x = 0
-				player.change_y = 0
-				player.revive()
-				agent.reset_continuous_reward_tracking()
-
-			tick = 0
-			max_ticks = 20 * self.tick_rate
-
-			while (tick < max_ticks and
-				   not self.should_skip_checkpoint and
-				   not self.manual_stop and
-				   not any(p.win for p in game.players) and
-				   not all(p.dead for p in game.players)):
-
-				if self.use_a2c_learning:
-					for agent in self.agents:
-						if agent.player and not agent.player.dead and not agent.player.win:
-							direction = agent.calculate_move_with_learning(agent.player.get_surrounding_tiles())
-							agent.player.execute_move(direction)
-							step_reward = agent.calculate_continuous_reward()
-							agent.store_reward(step_reward)
-							agent.current_reward += step_reward
-				else:
-					for agent in self.agents:
-						if agent.player and not agent.player.dead and not agent.player.win:
-							direction = agent.calculate_move(agent.player.get_surrounding_tiles())
-							agent.player.execute_move(direction)
-							agent.current_reward += agent.calculate_continuous_reward()
-
-				game.handle_inputs()
-				game.update(tick)
-				tick += 1
-
-				self.check_agent_positions(tick)
-
-				if game.display_window:
-					best_agent = self.get_best_agent()
-					elapsed_time = tick / self.tick_rate
-					living_agents = sum(1 for a in self.agents if a.player and not a.player.dead and not a.player.win)
-
-					current_fitness = max(
-						(a.player.finished_reward if a.player and a.player.finished_reward is not None else (a.player.rect.x / 10 if a.player else 0))
-						for a in self.agents
-					) if self.agents else 0.0
-
-					game.draw_text(f"Best Agent: {best_agent.current_index + 1}/{self.population_size}, Generation: {self.generation}", 10, 10, font_size=24, color=BLACK)
-					game.draw_text(f"FPS: {1000 / (game.clock.get_time() or 1):.1f}", 10, 70, font_size=24, color=BLACK)
-					game.draw_text(f"Time: {elapsed_time:.2f}s", 10, 100, font_size=24, color=BLACK)
-					if best_agent.player:
-						game.draw_text(f"Player: X: {best_agent.player.rect.x}, Y: {best_agent.player.rect.y}", 10, 130, font_size=24, color=BLACK)
-					game.draw_text(f"Checkpoint: {checkpoint_idx + 1}/{len(spawn_points)}", 10, 160, font_size=24, color=BLACK)
-					game.draw_text(f"Living agents: {living_agents}/{self.population_size}", 10, 190, font_size=24, color=BLACK)
-					game.draw_text(f"Best Fitness: {self.best_fitness_ever:.2f}", 10, 220, font_size=24, color=BLACK)
-					game.draw_text(f"Current Fitness: {current_fitness:.2f}", 10, 250, font_size=24, color=BLACK)
-					game.draw_text("Press S to skip generation", 10, 280, font_size=24, color=BLACK)
-
-					game.draw()
-
-			for agent in self.agents:
-				agent.current_reward += agent.calculate_reward()
-
-			self.should_skip_checkpoint = False
-
-		if self.agents:
-			current_max_reward = max(agent.current_reward for agent in self.agents)
-			if current_max_reward > self.best_fitness_ever:
-				self.best_fitness_ever = current_max_reward
-
-		game.quit()
+	def quit(self) -> None:
+		if self.renderer is not None:
+			self.renderer.quit()
