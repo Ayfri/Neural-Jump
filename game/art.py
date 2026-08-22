@@ -26,23 +26,35 @@ TILE_ART: Final[int] = 8  # Art pixels along a tile edge, so one art pixel is TI
 PIXEL: Final[int] = max(1, TILE_SIZE // TILE_ART)
 VARIANTS: Final[int] = 8  # Terrain speckle layouts, dealt out per tile so a wall of blocks is never flat paint
 
-# Terrain, a cool slate so the warm fitness ramp on the players stays the brightest thing on screen
-ROCK_DEEP: Final[Color] = (28, 32, 50)
-ROCK: Final[Color] = (52, 58, 84)
-ROCK_LIT: Final[Color] = (70, 78, 110)
-ROCK_EDGE: Final[Color] = (116, 130, 172)
-ROCK_CREST: Final[Color] = (174, 190, 232)
+# Terrain, a light slate: the backdrop behind it is kept dark on purpose so a platform reads as the solid
+# thing in the frame, and the outline around it is near black so its silhouette survives over any sky colour
+ROCK_SHADOW: Final[Color] = (32, 36, 58)
+ROCK_DEEP: Final[Color] = (74, 82, 112)
+ROCK: Final[Color] = (104, 114, 150)
+ROCK_LIT: Final[Color] = (132, 144, 184)
+ROCK_EDGE: Final[Color] = (186, 200, 238)
+ROCK_CREST: Final[Color] = (236, 244, 255)
 
-DECOR_FILL: Final[Color] = (38, 34, 56)
-DECOR_LINE: Final[Color] = (54, 48, 76)
+DECOR_FILL: Final[Color] = (34, 31, 50)
+DECOR_LINE: Final[Color] = (48, 43, 68)
 
-SKY_TOP: Final[Color] = (12, 14, 32)
-SKY_MID: Final[Color] = (32, 38, 74)
-SKY_LOW: Final[Color] = (76, 68, 112)
-HILL_FAR: Final[Color] = (44, 48, 88)
-HILL_NEAR: Final[Color] = (26, 28, 56)
+SKY_TOP: Final[Color] = (7, 8, 20)
+SKY_MID: Final[Color] = (19, 22, 48)
+SKY_LOW: Final[Color] = (46, 40, 76)
+# Three ranges, lightest at the back: the further one reads, the more sky haze sits between it and the level
+HILL_FAR: Final[Color] = (30, 33, 64)
+HILL_MID: Final[Color] = (21, 23, 48)
+HILL_NEAR: Final[Color] = (13, 14, 32)
 STAR: Final[Color] = (214, 224, 255)
-STAR_DIM: Final[Color] = (120, 132, 176)
+STAR_DIM: Final[Color] = (110, 122, 166)
+
+# Fraction of the camera each backdrop layer scrolls by: the further a layer reads, the slower it slides
+SKY_PARALLAX: Final[float] = 0.08
+STAR_PARALLAX: Final[float] = 0.05
+HILL_FAR_PARALLAX: Final[float] = 0.11
+HILL_MID_PARALLAX: Final[float] = 0.21
+HILL_NEAR_PARALLAX: Final[float] = 0.36
+COLORKEY: Final[Color] = (255, 0, 255)  # Backdrop layers punch out with a colour key so their empty runs blit for free
 
 COIN_COLOR: Final[Color] = (255, 196, 32)
 COIN_DARK: Final[Color] = (168, 106, 16)
@@ -130,6 +142,15 @@ def shade(color: Color, factor: float) -> Color:
 	return (min(255, int(color[0] * factor)), min(255, int(color[1] * factor)), min(255, int(color[2] * factor)))
 
 
+def tint(color: Color, amount: float) -> Color:
+	"""Blends towards white rather than scaling, so a light already close to saturation keeps its hue."""
+	return (
+		int(color[0] + (255 - color[0]) * amount),
+		int(color[1] + (255 - color[1]) * amount),
+		int(color[2] + (255 - color[2]) * amount),
+	)
+
+
 def _paint(rows: Sequence[str], palette: Mapping[str, Paint], size: tuple[int, int]) -> Surface:
 	"""A character grid blown up to `size`: one character is one art pixel, a dot is transparent."""
 	art = Surface((len(rows[0]), len(rows)), pygame.SRCALPHA)
@@ -170,7 +191,7 @@ def terrain_sprite(mask: int, variant: int) -> Surface:
 	if not mask & RIGHT:
 		art.fill(ROCK_DEEP, Rect(TILE_ART - 1, 0, 1, TILE_ART))
 	if not mask & DOWN:
-		art.fill(ROCK_DEEP, Rect(0, TILE_ART - 1, TILE_ART, 1))
+		art.fill(ROCK_SHADOW, Rect(0, TILE_ART - 1, TILE_ART, 1))
 	if not mask & UP:
 		art.fill(ROCK_EDGE, Rect(0, 0, TILE_ART, 2))
 		art.fill(ROCK_CREST, Rect(0, 0, TILE_ART, 1))
@@ -264,34 +285,152 @@ def _sky_color(ratio: float) -> Color:
 
 
 def _bake_sky(width: int, height: int) -> Surface:
-	"""The gradient, its stars and two ranges of hills, painted into the level itself so the sky costs no blit."""
+	"""The gradient on its own, opaque, so the layer behind everything else costs one straight copy."""
 	surface = Surface((width, height))
 	for y in range(0, height, PIXEL):
 		surface.fill(_sky_color(y / max(1, height - 1)), Rect(0, y, width, PIXEL))
-
-	generator = random.Random(0xC0FFEE)
-	for _ in range(width * height // 26000):
-		spot = Rect(generator.randrange(width), generator.randrange(int(height * 0.55)), PIXEL, PIXEL)
-		surface.fill(STAR if generator.random() < 0.35 else STAR_DIM, spot)
-
-	# The ranges sit near the lowest rows of the map, so they only ever show through the gaps in the terrain
-	base = height - 2.5 * TILE_SIZE
-	for color, amplitude, period, phase in ((HILL_FAR, 5.0, 41.0, 0.0), (HILL_NEAR, 3.0, 23.0, 1.7)):
-		for x in range(0, width, PIXEL):
-			ridge = int(base - amplitude * TILE_SIZE * (0.5 + 0.5 * sin(x / (period * TILE_SIZE) * tau + phase)))
-			surface.fill(color, Rect(x, ridge, PIXEL, height - ridge))
 	return surface.convert()
+
+
+def _punched(surface: Surface) -> Surface:
+	"""A layer whose key colour is cut out, run-length encoded so its empty rows are skipped at blit time."""
+	surface = surface.convert()
+	surface.set_colorkey(COLORKEY, pygame.RLEACCEL)
+	return surface
+
+
+def _bake_stars(width: int, height: int) -> Surface:
+	"""A star field that wraps horizontally: nothing is drawn in the last column, so the seam never cuts a star."""
+	surface = Surface((width, height))
+	surface.fill(COLORKEY)
+	generator = random.Random(0xC0FFEE)
+	for _ in range(width * height // 5200):
+		spot = Rect(generator.randrange(width - PIXEL), generator.randrange(height), PIXEL, PIXEL)
+		surface.fill(STAR if generator.random() < 0.35 else STAR_DIM, spot)
+	return _punched(surface)
+
+
+def _ridge_profile(width: int, waves: int, seed: int) -> list[float]:
+	"""
+	A ridge line in 0..1, one value per art pixel across the layer.
+
+	Six harmonics with a 1/f falloff and random phases, so the long swells dominate and the silhouette never
+	reads as the single sine it would be with one term. Every harmonic fits a whole number of waves in the
+	width, which is what lets the layer be tiled end to end without a seam.
+	"""
+	generator = random.Random(seed)
+	octaves = ((1, 1.0), (2, 0.62), (3, 0.30), (5, 0.16), (8, 0.08), (13, 0.04))
+	phases = [generator.random() * tau for _ in octaves]
+	raw = [
+		sum(weight * sin(x / width * tau * count * waves + phase) for (count, weight), phase in zip(octaves, phases))
+		for x in range(0, width, PIXEL)
+	]
+	low, span = min(raw), (max(raw) - min(raw)) or 1.0
+	# The power broadens the valleys and lifts the summits, gently enough that the faces stay walkable slopes
+	return [((value - low) / span) ** 1.15 for value in raw]
+
+
+def _bake_ridge(width: int, height: int, color: Color, waves: int, amplitude: float, ground: float, seed: int) -> tuple[Surface, int]:
+	"""
+	One mountain range, filled from its ridge line down to the bottom of the layer.
+
+	The shading is banded by depth under the ridge rather than by slope: a lit crest fading into the base
+	colour and then into shadow, every band parallel to the silhouette. Because a band's thickness is the
+	same in every column, nothing in the fill can flip between neighbours, which is what would show up as
+	vertical striping. A sparse dither on top keeps it from reading as flat paint.
+
+	Returns the layer and its floor, the row below which it is opaque in every column, which is where the
+	range in front of it stops needing to be drawn at all.
+	"""
+	profile = _ridge_profile(width, waves, seed)
+	surface = Surface((width, height))
+	surface.fill(COLORKEY)
+	base = height * ground
+	span = amplitude * height
+	tops = [int(base - span * value) // PIXEL * PIXEL for value in profile]
+	# Depth in art pixels under the ridge, and the colour from there down: each band overwrites the one above
+	bands = (
+		(0, tint(color, 0.30)), (1, tint(color, 0.13)), (3, tint(color, 0.05)),
+		(6, color), (15, shade(color, 0.92)), (28, shade(color, 0.84)),
+	)
+	speck = shade(color, 0.88)
+	generator = random.Random(seed ^ 0xBEEF)
+
+	for index, x in enumerate(range(0, width, PIXEL)):
+		top = tops[index]
+		for depth, band in bands:
+			y = top + depth * PIXEL
+			if y < height:
+				surface.fill(band, Rect(x, y, PIXEL, height - y))
+		for y in range(top + 4 * PIXEL, height, PIXEL):
+			if generator.random() < 0.045:
+				surface.fill(speck, Rect(x, y, PIXEL, PIXEL))
+	return _punched(surface), max(tops)
+
+
+class Background:
+	"""
+	The parallax backdrop the level is drawn over.
+
+	Four layers, each scrolled at its own fraction of the camera: the gradient barely moves, the stars drift,
+	and the two ridges slide fast enough to read as distance. Every layer is one viewport-sized surface baked
+	once, the scrolling ones tile horizontally and the key-coloured ones skip their empty rows, so a frame
+	costs six blits whatever the map size.
+	"""
+
+	def __init__(self, level: tuple[int, int], view: tuple[int, int]) -> None:
+		self._width, self._height = view
+		self._scroll_y = max(1, level[1] - self._height)
+		self._sky = _bake_sky(self._width, self._height + int(self._scroll_y * SKY_PARALLAX))
+		self._stars = _bake_stars(self._width, self._height + int(self._scroll_y * STAR_PARALLAX))
+		# Back to front, so a range can be clipped to the rows the one in front of it does not already cover
+		self._ridges = tuple(
+			(*_bake_ridge(self._width, self._height, color, waves, amplitude, ground, seed), factor)
+			for color, waves, amplitude, ground, seed, factor in (
+				(HILL_FAR, 1, 0.22, 0.82, 0x1234, HILL_FAR_PARALLAX),
+				(HILL_MID, 1, 0.28, 0.90, 0x5678, HILL_MID_PARALLAX),
+				(HILL_NEAR, 1, 0.34, 0.99, 0x9ABC, HILL_NEAR_PARALLAX),
+			)
+		)
+
+	def draw(self, screen: Surface, left: int, top: int) -> None:
+		"""`left` is the camera's x in the level and `top` its y on the level surface, so both are already positive."""
+		window = Rect(0, int(top * SKY_PARALLAX), self._width, self._height)
+		screen.blit(self._sky, (0, 0), window)
+
+		# A layer is drawn twice, one copy left of the other, so whatever the offset the viewport is covered
+		window.top = int(top * STAR_PARALLAX)
+		offset = -int(left * STAR_PARALLAX) % self._width
+		screen.blit(self._stars, (offset - self._width, 0), window)
+		screen.blit(self._stars, (offset, 0), window)
+
+		# The ridges sit at the bottom of their layer, so they slide down the screen as the camera climbs
+		tops = [int((self._scroll_y - top) * factor) for _, _, factor in self._ridges]
+		for index, (ridge, floor, factor) in enumerate(self._ridges):
+			y = tops[index]
+			if y >= self._height:
+				continue
+			# Everything under the next range's floor is hidden by it, so this one is cut off there
+			bottom = min(self._height, tops[index + 1] + self._ridges[index + 1][1]) if index + 1 < len(tops) else self._height
+			area = Rect(0, 0, self._width, max(0, bottom - y))
+			if not area.height:
+				continue
+			offset = -int(left * factor) % self._width
+			screen.blit(ridge, (offset - self._width, y), area)
+			screen.blit(ridge, (offset, y), area)
 
 
 def bake_level(kinds: NDArray[np.uint8], size: tuple[int, int], top: int) -> Surface:
 	"""
-	The whole static level on one opaque surface: sky, terrain, decoration, checkpoints and the goal.
+	The whole static level on one surface: terrain, decoration and the goal, over a punched-out backdrop.
 
-	Baking it once means a frame draws the level with a single blit whatever the map size, and the surface is
-	converted to the display format so that blit is a straight copy. Coins are left out: which of them are
-	still on the map depends on the agent being followed.
+	Baking it once means a frame draws the level with a single blit whatever the map size, and because the
+	air is a run-length encoded key colour rather than real transparency, that blit skips the empty sky
+	instead of blending it. Coins and checkpoints are drawn per frame: the coins left on the map depend on
+	the agent being followed, and a checkpoint is a translucent haze the key colour cannot carry.
 	"""
-	surface = _bake_sky(*size)
+	surface = Surface(size)
+	surface.fill(COLORKEY)
 	solid = (kinds == TileKind.SOLID).astype(np.uint8)
 	masks = np.zeros(kinds.shape, dtype=np.uint8)
 	masks[1:] |= solid[:-1] * UP
@@ -301,7 +440,8 @@ def bake_level(kinds: NDArray[np.uint8], size: tuple[int, int], top: int) -> Sur
 
 	# One layout per tile from a fixed seed: scattered enough that no pattern shows, identical on every run
 	variants = np.random.default_rng(0xA11CE).integers(0, VARIANTS, kinds.shape, dtype=np.uint8)
-	painted = np.argwhere((kinds != TileKind.AIR) & (kinds != TileKind.COIN) & (kinds != TileKind.SPAWN))
+	skipped = (TileKind.AIR, TileKind.COIN, TileKind.SPAWN, TileKind.CHECKPOINT)
+	painted = np.argwhere(~np.isin(kinds, [int(kind) for kind in skipped]))
 	blits: list[tuple[Surface, tuple[int, int]]] = []
 	for row, column in painted.tolist():
 		kind = TileKind(int(kinds[row, column]))
@@ -309,11 +449,9 @@ def bake_level(kinds: NDArray[np.uint8], size: tuple[int, int], top: int) -> Sur
 			sprite = terrain_sprite(int(masks[row, column]), int(variants[row, column]))
 		elif kind is TileKind.DECOR:
 			sprite = decor_sprite()
-		elif kind is TileKind.FLAG:
-			sprite = flag_sprite(row == 0 or kinds[row - 1, column] != TileKind.FLAG)
 		else:
-			sprite = checkpoint_sprite()
+			sprite = flag_sprite(row == 0 or kinds[row - 1, column] != TileKind.FLAG)
 		blits.append((sprite, (column * TILE_SIZE, top + row * TILE_SIZE)))
 
 	surface.blits(blits, doreturn=False)
-	return surface
+	return _punched(surface)

@@ -9,7 +9,9 @@ from numpy.typing import NDArray
 from pygame import Rect, Surface
 from pygame.font import Font
 
-from game.art import CHECKPOINT_COLOR, COIN_COLOR, bake_level, body_sprite, coin_sprite, jump_sprite, ring_sprite
+from game.art import (
+	CHECKPOINT_COLOR, COIN_COLOR, Background, bake_level, body_sprite, checkpoint_sprite, coin_sprite, jump_sprite, ring_sprite,
+)
 from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
 from game.world import PLAYER_H, PLAYER_W, World
 
@@ -193,6 +195,7 @@ class Renderer:
 		self._origin_y = min(0, world.offset_y)
 		bottom = max(SCREEN_HEIGHT, world.offset_y + world.height * TILE_SIZE)
 		size = (world.width * TILE_SIZE, bottom - self._origin_y)
+		self.background = Background(size, (SCREEN_WIDTH, SCREEN_HEIGHT))
 		self.level_surface = bake_level(world.kinds, size, self.to_surface(world.offset_y))
 		self._ranks = np.zeros(world.count, dtype=np.int64)
 		# Coins are drawn per frame instead of baked: which ones are left depends on the agent being followed.
@@ -201,6 +204,8 @@ class Renderer:
 		self._coin_ids = np.argsort(positions[:, 0], kind='stable')
 		self._coin_x = positions[self._coin_ids, 0]
 		self._coin_y = positions[self._coin_ids, 1]
+		# Checkpoints are drawn per frame too: their haze is translucent, which the baked level cannot hold
+		self._checkpoints = [(x, self.to_surface(y)) for x, y in world.checkpoints]
 
 	@staticmethod
 	def desktop_fps() -> int:
@@ -238,7 +243,9 @@ class Renderer:
 	def draw(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
 		self._move_camera(focus_index)
 		view = Rect(self.camera.left, self.to_surface(self.camera.top), self.camera.width, self.camera.height)
+		self.background.draw(self.screen, view.left, view.top)
 		self.screen.blit(self.level_surface, (0, 0), view)
+		self._draw_checkpoints()
 		self._draw_coins(focus_index)
 		self._draw_players(focus_index, fitness, hud)
 		if self.show_hud:
@@ -255,6 +262,17 @@ class Renderer:
 		self.camera.left = max(0, min(self.camera.left, self.level_surface.get_width() - SCREEN_WIDTH))
 		lowest = self._origin_y + self.level_surface.get_height() - SCREEN_HEIGHT
 		self.camera.top = max(self._origin_y, min(self.camera.top, lowest))
+
+	def _draw_checkpoints(self) -> None:
+		"""The checkpoints inside the camera: a map holds a handful, so a plain culling loop is enough."""
+		left, top = self.camera.left, self.to_surface(self.camera.top)
+		sprite = checkpoint_sprite()
+		spots = [
+			(x - left, y - top) for x, y in self._checkpoints
+			if -TILE_SIZE < x - left < SCREEN_WIDTH and -TILE_SIZE < y - top < SCREEN_HEIGHT
+		]
+		if spots:
+			self.screen.blits([(sprite, spot) for spot in spots], doreturn=False)
 
 	def _draw_coins(self, focus_index: int) -> None:
 		"""The coins the followed agent has not banked yet, culled to the camera."""
