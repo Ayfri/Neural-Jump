@@ -119,6 +119,42 @@ Training is headless by default and runs as fast as the machine allows. `--show-
 - `--speed S`: simulation speed multiplier, or `max` to run as fast as the framerate survives (default: 1)
 - `--fps N`: target framerate (default: 0, uses the display refresh rate)
 
+**Examples:**
+
+```bash
+# Fast headless training
+uv run run-ai.py --population-size 500
+
+# Smaller and dumber network, even faster
+uv run run-ai.py --population-size 1000 --hidden-sizes 64 32 16
+
+# Replay a run exactly
+uv run run-ai.py --seed 1
+
+# Watch a run at 4x speed
+uv run run-ai.py --show-window --speed 4
+
+# Watch it go as fast as the display can keep up with
+uv run run-ai.py --show-window --speed max
+```
+
+### Reading The Window
+
+The renderer encodes each agent's state in its sprite, so a glance at the screen is enough to tell the
+population apart:
+
+- **Fill color**: the agent's fitness rank in the population, from red (worst) to teal (best)
+- **Chevron**: the direction it is moving, a square when it is standing still
+- **Blue arrow above the head**: the agent is rising, so it jumped
+- **Gold outline**: an elite carried over untouched from the previous generation
+- **Violet outline**: a re-randomised agent, kept for diversity
+- **Dark outline**: the agent the camera follows, the best one still alive
+- **Grey**: dead, **violet fill**: reached the flag
+
+The panels cover the run (generation, time, living agents, best fitness, throughput and framerate), the
+followed agent, the hyper-parameters the run uses, and the fitness distribution of the population next to
+the best score of every generation so far.
+
 ### Performance
 
 The simulation and the population are both batched, so the cost of a tick is nearly flat in the number of
