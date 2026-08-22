@@ -15,9 +15,8 @@ PLAYER_W: Final[int] = int(PLAYER_WIDTH)
 PLAYER_H: Final[int] = int(PLAYER_HEIGHT)
 GRID_SIDE: Final[int] = AGENT_VISION_DISTANCE * 2 + 1
 GRID_TILES: Final[int] = GRID_SIDE * GRID_SIDE  # One solid flag each, which is the whole terrain
-GOAL_FEATURES: Final[int] = 4  # in view, its offset in x and y, is it the flag, for the closest goal tile
-COIN_FEATURES: Final[int] = 3  # in view, its offset in x and y, for the closest uncollected coin
-WINDOW_FEATURES: Final[int] = GRID_TILES + GOAL_FEATURES + COIN_FEATURES
+NEAREST_FEATURES: Final[int] = 3  # in view, its offset in x and y, for the closest tile of one kind
+WINDOW_FEATURES: Final[int] = GRID_TILES + 2 * NEAREST_FEATURES  # The closest goal tile, then the closest coin
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
 OBSERVATION_SIZE: Final[int] = WINDOW_FEATURES + PLAYER_FEATURES
 # Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
@@ -52,13 +51,12 @@ def resolve_map_path(map_path: str) -> Path:
 	return search_maps_folder(path.parent) / path.name
 
 
-def closest_tile(windows: NDArray[np.float32], flag_feature: bool) -> NDArray[np.float32]:
+def closest_tile(windows: NDArray[np.float32]) -> NDArray[np.float32]:
 	"""
-	Summarises the non-zero tiles of a window: whether one is in view, where it is, and optionally whether
-	it is the flag.
+	Summarises the non-zero tiles of a window: whether one is in view and where it sits.
 
 	A map holds a handful of goal tiles in total, so a channel per tile spends most of the observation
-	saying "still nothing here". A few numbers carry what a player can act on instead, and point at the flag
+	saying "still nothing here". Three numbers carry what a player can act on instead, and point at the tile
 	directly rather than leaving the network to read a position out of a one-hot grid.
 	"""
 	rows, columns = np.divmod(np.arange(GRID_TILES), GRID_SIDE)
@@ -71,12 +69,10 @@ def closest_tile(windows: NDArray[np.float32], flag_feature: bool) -> NDArray[np
 	closest = order[found.argmax(axis=1)]
 	in_view = found.any(axis=1)
 
-	features = np.zeros((len(windows), 4 if flag_feature else 3), dtype=np.float32)
+	features = np.zeros((len(windows), NEAREST_FEATURES), dtype=np.float32)
 	features[:, 0] = in_view
 	features[:, 1] = columns[closest] / AGENT_VISION_DISTANCE * in_view
 	features[:, 2] = rows[closest] / AGENT_VISION_DISTANCE * in_view
-	if flag_feature:
-		features[:, 3] = (windows[np.arange(len(windows)), closest] == 1) & in_view
 	return features
 
 
@@ -187,9 +183,9 @@ class World:
 
 		self._windows = np.empty((solid_windows.shape[0] * self._window_stride, WINDOW_FEATURES), dtype=OBSERVATION_DTYPE)
 		self._windows[:, :GRID_TILES] = solid_windows.reshape(-1, GRID_TILES)
+		self._windows[:, GRID_TILES:GRID_TILES + NEAREST_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES))
 		# Coins are baked like the terrain, so a window still points at one the agent has already taken
-		self._windows[:, GRID_TILES:GRID_TILES + GOAL_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES), flag_feature=True)
-		self._windows[:, GRID_TILES + GOAL_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES), flag_feature=False)
+		self._windows[:, GRID_TILES + NEAREST_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES))
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
@@ -241,8 +237,8 @@ class World:
 
 	def observe(self, out: NDArray[np.float16] | None = None) -> NDArray[np.float16]:
 		"""
-		Fills `out` (or the world's own buffer) with the (count, 56) observation: the solid flag of every
-		tile in the 7x7 window around the player, where the closest goal tile in it sits, and the
+		Fills `out` (or the world's own buffer) with the (count, 58) observation: the solid flag of every
+		tile in the 7x7 window around the player, where the closest goal tile and coin in it sit, and the
 		player's own speed and ground state.
 		"""
 		target = self._observation if out is None else out

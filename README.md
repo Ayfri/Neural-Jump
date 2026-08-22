@@ -122,9 +122,8 @@ x0.1 it can be read frame by frame.
 
 A policy over a 7x7 tile view plus the player's own state:
 
-- **Input**: 59 features. One solid flag per tile, then the closest reward tile in view as `in view, dx, dy,
-  is the flag`, then the closest coin as `in view, dx, dy`, then horizontal speed, vertical speed and ground
-  contact
+- **Input**: 58 features. One solid flag per tile, then the closest flag tile in view as `in view, dx, dy`,
+  then the closest coin the same way, then horizontal speed, vertical speed and ground contact
 - **Hidden**: 256, 128, 64 (LayerNorm on the first two, leaky ReLU)
 - **Output**: 3 logits (jump, left, right), played as an argmax
 
