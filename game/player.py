@@ -147,11 +147,10 @@ class Player(Sprite):
 
 	def calculate_near_platforms(self) -> None:
 		"""Collect platforms near the player for collision detection"""
-		platforms = [sprite for sprite in self.level.platform_list if isinstance(sprite, Platform)]
+		center_x, center_y = self.rect.centerx, self.rect.centery
 		self._near_platforms = [
-			platform for platform in platforms
-			if abs(platform.rect.centerx - self.rect.centerx) <= AGENT_NEAR_PLATFORM_DISTANCE 
-			and abs(platform.rect.centery - self.rect.centery) <= AGENT_NEAR_PLATFORM_DISTANCE
+			platform for platform in self.level.platforms_in_range(center_x - AGENT_NEAR_PLATFORM_DISTANCE, center_x + AGENT_NEAR_PLATFORM_DISTANCE)
+			if abs(platform.rect.centery - center_y) <= AGENT_NEAR_PLATFORM_DISTANCE
 		]
 
 	def execute_move(self, direction: int) -> None:

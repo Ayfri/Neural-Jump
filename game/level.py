@@ -36,6 +36,7 @@ class Level:
 		self.tile_map: list[list[str]] = []
 		self.spawn_point = (0, 0)
 		self.checkpoints: list[tuple[int, int]] = []
+		self.platform_columns: list[list[Platform]] = []
 
 	@property
 	def platforms(self) -> list[Platform]:
@@ -60,6 +61,7 @@ class Level:
 		self.width = len(lines[0].strip())
 		self.height = len(lines)
 		self.checkpoints = []
+		self.platform_columns = [[] for _ in range(self.width)]
 
 		offset_y = SCREEN_HEIGHT - (len(lines) * TILE_SIZE)
 
@@ -80,8 +82,15 @@ class Level:
 					elif not tile_data.get('is_air', False):
 						block = Platform(x * TILE_SIZE, y * TILE_SIZE + offset_y, tile_data)
 						self.platform_list.add(block)
+						self.platform_columns[x].append(block)
 
 			self.tile_map += [row]
+
+	def platforms_in_range(self, left: int, right: int) -> list[Platform]:
+		"""Returns the platforms whose column overlaps the [left, right] pixel range."""
+		first = max(0, left // TILE_SIZE)
+		last = min(len(self.platform_columns) - 1, right // TILE_SIZE)
+		return [platform for column in self.platform_columns[first:last + 1] for platform in column]
 
 	def get_random_spawn_point(self, use_checkpoints: bool = False) -> tuple[int, int]:
 		"""

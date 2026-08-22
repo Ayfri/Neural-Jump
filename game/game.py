@@ -164,7 +164,7 @@ class Game:
 	def draw(self) -> None:
 		assert self.screen is not None
 		self.screen.fill(WHITE)
-		for platform in self.level.platforms:
+		for platform in self.level.platforms_in_range(self.level.camera.left, self.level.camera.right):
 			self.draw_sprite(platform)
 		self.draw_checkpoints()
 		for active_sprite in self.active_sprite_list:
