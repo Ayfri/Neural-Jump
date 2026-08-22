@@ -29,6 +29,7 @@ ELITE_RING: Final[Color] = (240, 190, 60)
 RANDOM_RING: Final[Color] = (168, 92, 232)
 FOCUS_RING: Final[Color] = (248, 250, 255)  # Bright, because the ring sits on the dark sky as often as on terrain
 JUMP_MARKER: Final[Color] = (32, 130, 240)
+DEAD_ALPHA: Final[int] = 80  # A dead agent stays visible as a ghost instead of crowding the living ones
 
 PANEL_BACKGROUND: Final[tuple[int, int, int, int]] = (54, 59, 74, 247)
 PANEL_BORDER: Final[Color] = (108, 116, 140)
@@ -148,16 +149,16 @@ def _panel_background(width: int, height: int) -> Surface:
 	return surface.convert_alpha()
 
 
-@lru_cache(maxsize=FITNESS_BUCKETS * 12)  # Every (bucket, heading, state) sprite, so a full population never evicts one
-def _player_sprite(bucket: int, direction: int, state: int) -> Surface:
+@lru_cache(maxsize=FITNESS_BUCKETS * 24)  # Every (bucket, heading, state) sprite, so a full population never evicts one
+def _player_sprite(bucket: int, direction: int, state: int, faded: bool) -> Surface:
 	"""
 	One player sprite: the fill encodes its fitness rank, or its state once it is dead, won or human.
 
-	`state` is 0 alive, 1 dead, 2 won, 3 the human player. The whole set is tiny and fully cached, so a frame
-	only ever blits pre-rendered surfaces instead of painting a body per player.
+	`state` is 0 alive, 1 dead, 2 won, 3 the human player, and `faded` dims it. The whole set is tiny and
+	fully cached, so a frame only ever blits pre-rendered surfaces instead of painting a body per player.
 	"""
 	fill = (DEAD_COLOR, WON_COLOR, HUMAN_COLOR)[state - 1] if state else _bucket_color(bucket)
-	return body_sprite(fill, (PLAYER_W, PLAYER_H), direction, state == 1)
+	return body_sprite(fill, (PLAYER_W, PLAYER_H), direction, state == 1, DEAD_ALPHA if faded else 255)
 
 
 def _player_ring(color: Color, gap: int, thickness: int) -> Surface:
@@ -320,6 +321,7 @@ class Renderer:
 		screen_x = screen_x.tolist()
 		screen_y = screen_y.tolist()
 
+		ghost = not hud.solo  # A human run has a single body, which would be unreadable faded out
 		bodies: list[Blit] = []
 		markers: list[Blit] = []
 		jump = jump_sprite(JUMP_MARKER)
@@ -331,13 +333,16 @@ class Renderer:
 		for index in np.flatnonzero(visible).tolist():
 			x, y = screen_x[index], screen_y[index]
 			state = states[index]
-			bodies.append((_player_sprite(buckets[index], directions[index], fills[index]), (x, y)))
-			if state == 0 and rising[index]:
-				markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
-			if index < hud.elite_count:
-				markers.append((elite_ring, (x - 4, y - 4)))
-			elif index >= random_start:
-				markers.append((random_ring, (x - 4, y - 4)))
+			faded = ghost and state == 1
+			bodies.append((_player_sprite(buckets[index], directions[index], fills[index], faded), (x, y)))
+			# A ghost carries no rank marker: those are only worth reading on an agent still in the run
+			if not faded:
+				if state == 0 and rising[index]:
+					markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
+				if index < hud.elite_count:
+					markers.append((elite_ring, (x - 4, y - 4)))
+				elif index >= random_start:
+					markers.append((random_ring, (x - 4, y - 4)))
 			if index == focus_index and not hud.solo:
 				markers.append((focus_ring, (x - 7, y - 7)))
 

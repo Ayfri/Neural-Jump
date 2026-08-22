@@ -77,35 +77,52 @@ DOWN: Final[int] = 2
 LEFT: Final[int] = 4
 RIGHT: Final[int] = 8
 
-# One rounded blob with a face, painted looking forward: the flipped copy is what a player walking left is drawn with
+# A rounded blob lit from above: the top rows are tinted, the bottom ones shaded, so it reads as a volume
+# rather than a flat rectangle. Standing still it is symmetric, with both pupils centred in their whites
 BODY_ART: Final[tuple[str, ...]] = (
-	'....DDDDDDDD....',
-	'..DDBBBBBBBBDD..',
-	'.DBBBBBBBBBBBBD.',
-	'.DBBBBBBBBBBBBD.',
+	'.....DDDDDD.....',
+	'...DDLLLLLLDD...',
+	'..DLLLLLLLLLLD..',
+	'.DLLLLLLLLLLLLD.',
+	'.DLLBBBBBBBBLLD.',
 	'DBBBBBBBBBBBBBBD',
-	'DBBBWWBBBBWWBBBD',
-	'DBBBWKBBBBWKBBBD',
-	'DBBBWWBBBBWWBBBD',
-	'DBBBBBBBBBBBBBBD',
+	'DBBWWWBBBBWWWBBD',
+	'DBBWKWBBBBWKWBBD',
+	'DBBWWWBBBBWWWBBD',
 	'DBBBBBBBBBBBBBBD',
 	'DBBBBBMMMMBBBBBD',
 	'DBBBBBBBBBBBBBBD',
 	'DBBBBBBBBBBBBBBD',
-	'DBBBBBBBBBBBBBBD',
-	'DBBBBBBBBBBBBBBD',
-	'.DBBBBBBBBBBBBD.',
-	'.DBBBBBBBBBBBBD.',
-	'..DDBBBBBBBBDD..',
-	'....DDDDDDDD....',
+	'DSBBBBBBBBBBBBSD',
+	'DSSBBBBBBBBBBSSD',
+	'.DSSSBBBBBBSSSD.',
+	'..DSSSSSSSSSSD..',
+	'...DDSSSSSSDD...',
+	'.....DDDDDD.....',
 )
-# The same blob with both eyes pushed to one side, which is all a heading needs to read at this size
-_SIDE_EYES: Final[dict[int, str]] = {
-	5: 'DBBBBBWWBBWWBBBD',
-	6: 'DBBBBBWKBBWKBBBD',
-	7: 'DBBBBBWWBBWWBBBD',
-}
-BODY_ART_SIDE: Final[tuple[str, ...]] = tuple(_SIDE_EYES.get(index, row) for index, row in enumerate(BODY_ART))
+# The same blob heading right. Three cues stack up instead of the eyes alone: the whole face slides forward,
+# both pupils sit against the front of their whites, and the light moves to the leading edge
+BODY_ART_SIDE: Final[tuple[str, ...]] = (
+	'.....DDDDDD.....',
+	'...DDBBBBLLDD...',
+	'..DBBBBBBBBLLD..',
+	'.DBBBBBBBBBBLLD.',
+	'.DBBBBBBBBBBBLD.',
+	'DSBBBBBBBBBBBBLD',
+	'DSBBBBWWWBWWWBLD',
+	'DSBBBBWKKBWKKBLD',
+	'DSBBBBWWWBWWWBLD',
+	'DSBBBBBBBBBBBBLD',
+	'DSBBBBBBBMMMMBLD',
+	'DSBBBBBBBBBBBBLD',
+	'DSBBBBBBBBBBBBLD',
+	'DSSBBBBBBBBBBBLD',
+	'DSSSBBBBBBBBBBLD',
+	'.DSSSBBBBBBBBLD.',
+	'..DSSSSSSSSSSD..',
+	'...DDSSSSSSDD...',
+	'.....DDDDDD.....',
+)
 
 JUMP_ART: Final[tuple[str, ...]] = (
 	'..AA..',
@@ -255,27 +272,34 @@ def ring_sprite(color: Color, size: tuple[int, int], thickness: int) -> Surface:
 	return surface.convert_alpha()
 
 
-@lru_cache(maxsize=128)
-def body_sprite(fill: Color, size: tuple[int, int], direction: int, dead: bool) -> Surface:
+@lru_cache(maxsize=512)
+def body_sprite(fill: Color, size: tuple[int, int], direction: int, dead: bool, alpha: int = 255) -> Surface:
 	"""
-	One player: `fill` is its body, darkened for the outline and the mouth.
+	One player: `fill` is its body, darkened for the outline and the mouth, lit for the heading cues.
 
-	A heading only moves the eyes, and the left-facing sprite is the right-facing one flipped, so the whole
-	population comes out of a handful of cached surfaces whatever it is coloured by.
+	Standing still shows a symmetric face, and a heading slides the face forward and moves the light to the
+	leading edge; the left-facing sprite is the right-facing one flipped, so the whole population comes out of a handful of
+	cached surfaces whatever it is coloured by. `alpha` fades the whole sprite, which is what a dead agent
+	in a crowd is drawn with.
 	"""
 	palette: dict[str, Paint] = {
-		'D': shade(fill, 0.38),
+		'D': shade(fill, 0.36),
+		'S': shade(fill, 0.74),
 		'B': fill,
+		'L': tint(fill, 0.3),
 		'M': shade(fill, 0.5),
 		'W': EYE_CLOSED if dead else EYE_WHITE,
 		'K': EYE_CLOSED if dead else EYE_DARK,
 	}
 	sprite = _paint(BODY_ART if direction == 0 else BODY_ART_SIDE, palette, size)
-	return pygame.transform.flip(sprite, True, False) if direction < 0 else sprite
+	if direction < 0:
+		sprite = pygame.transform.flip(sprite, True, False)
+	sprite.set_alpha(alpha)
+	return sprite
 
 
 def _sky_color(ratio: float) -> Color:
-	"""Night at the top, dusk at the ground: two blends of three colours, met halfway down the map."""
+	"""Night at the top, dusk at the ground: two blends of three colours, met halfway down the layer."""
 	start, stop, blend = (SKY_TOP, SKY_MID, ratio * 2) if ratio < 0.5 else (SKY_MID, SKY_LOW, ratio * 2 - 1)
 	return (
 		int(start[0] + (stop[0] - start[0]) * blend),
