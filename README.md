@@ -145,8 +145,9 @@ agents: going from 100 to 1000 agents multiplies the throughput per second, not 
 
 | Setup | Ticks/s | Agent-steps/s |
 | --- | --- | --- |
-| 100 agents, CUDA | ~1,400 | ~140,000 |
-| 300 agents, CUDA | ~1,330 | ~400,000 |
+| 100 agents, CUDA | ~1,380 | ~138,000 |
+| 300 agents, CUDA | ~1,000 | ~300,000 |
+| 600 agents, CUDA | ~730 | ~438,000 |
 
 Two things carry that number. The 7x7x4 vision window of every tile is baked once at load time, so an
 observation is a single gather instead of a broadcast fancy index rebuilt per tick. And `--action-repeat`
@@ -156,9 +157,11 @@ At 90 ticks per in-game second, 100 agents playing a 30 second episode take abou
 
 Observations are half precision, so the host-to-device transfer every tick moves half the bytes.
 
-On CUDA the sampling pass is captured as a CUDA graph: a tick is a few dozen tiny kernels, so it is bound
-by launch latency, and replaying one captured graph is about 3x faster than launching them one by one. The
-capture falls back to eager mode on its own if the device does not support it.
+On CUDA both action passes, the argmax and the sampled one, are captured as CUDA graphs: a tick is a few
+dozen tiny kernels, so it is bound by launch latency, and replaying one captured graph is about 3x faster
+than launching them one by one. The capture falls back to eager mode on its own if the device does not
+support it. The network itself runs in half precision on CUDA, which nearly halves the forward pass and
+costs nothing when only the argmax of the logits is read. Weight files are widened back to float32.
 
 ### Play Manually
 

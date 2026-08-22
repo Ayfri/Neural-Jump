@@ -15,6 +15,11 @@ DEFAULT_HIDDEN_SIZES: Final[tuple[int, int, int]] = (256, 128, 64)
 LAYER_NORM_EPS: Final[float] = 1e-5
 
 
+def pick_dtype(device: torch.device) -> torch.dtype:
+	"""Half precision on CUDA, where it nearly halves the forward pass, full precision on CPU where it is slower."""
+	return torch.float16 if device.type == 'cuda' else torch.float32
+
+
 def seed_everything(seed: int) -> None:
 	"""Seeds python, numpy and torch, on the host and on the device, so a run can be replayed exactly."""
 	random.seed(seed)
@@ -39,12 +44,15 @@ class Population:
 	own outputs, a single Adam over these tensors trains every agent independently, and the genetic
 	operators (elites, crossover, mutation) are plain tensor ops on the same weights.
 
-	Shapes follow `nn.Linear`'s state dict on export, so a weight file stays readable as fc1/norm1/actor.
+	Shapes follow `nn.Linear`'s state dict on export, and are widened back to float32 there, so a weight file
+	stays readable as fc1/norm1/actor whatever the population runs in.
 	"""
 
 	def __init__(self, size: int, hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES, device: torch.device | None = None) -> None:
 		self.size = size
 		self.device = device if device is not None else pick_device()
+		# Only the argmax of the logits is ever read, so the mantissa half precision drops costs nothing here
+		self.dtype = pick_dtype(self.device)
 		self.hidden_sizes = hidden_sizes
 		first, second, third = hidden_sizes
 
@@ -59,16 +67,16 @@ class Population:
 		self.weights: dict[str, Tensor] = {}
 		self.biases: dict[str, Tensor] = {}
 		for name, (fan_in, fan_out) in self.linear_shapes.items():
-			self.weights[name] = torch.empty(size, fan_in, fan_out, device=self.device)
-			self.biases[name] = torch.empty(size, 1, fan_out, device=self.device)
+			self.weights[name] = torch.empty(size, fan_in, fan_out, device=self.device, dtype=self.dtype)
+			self.biases[name] = torch.empty(size, 1, fan_out, device=self.device, dtype=self.dtype)
 		for name, features in self.norm_shapes.items():
-			self.weights[name] = torch.empty(size, 1, features, device=self.device)
-			self.biases[name] = torch.empty(size, 1, features, device=self.device)
+			self.weights[name] = torch.empty(size, 1, features, device=self.device, dtype=self.dtype)
+			self.biases[name] = torch.empty(size, 1, features, device=self.device, dtype=self.dtype)
 
 		self.randomize(torch.arange(size, device=self.device))
 
-		self._graph: torch.cuda.CUDAGraph | None = None
-		self._capture_graph()
+		self._graphs: dict[bool, tuple[torch.cuda.CUDAGraph, Tensor]] = {}
+		self._capture_graphs()
 
 	def parameters(self) -> list[Tensor]:
 		return [*self.weights.values(), *self.biases.values()]
@@ -110,43 +118,46 @@ class Population:
 		gumbel = -torch.empty_like(logits).exponential_().log()
 		return (logits + gumbel).argmax(dim=-1)
 
-	def _capture_graph(self) -> None:
+	def _capture_graphs(self) -> None:
 		"""
-		Captures the sampling pass as a CUDA graph.
+		Captures both action passes as CUDA graphs, one for the argmax and one for the sampled policy.
 
 		One tick is a few dozen tiny kernels, so the pass is bound by launch latency rather than by maths.
 		Replaying a captured graph collapses those launches into one, and the shapes never change here.
-		The weights are updated in place by the optimizer and by evolution, so the graph keeps reading the
-		current values.
+		The weights are updated in place by evolution, so the graphs keep reading the current values.
 		"""
 		if self.device.type != 'cuda':
 			return
 		try:
-			self._graph_input = torch.zeros(self.size, 1, OBSERVATION_SIZE, device=self.device)
+			self._graph_input = torch.zeros(self.size, 1, OBSERVATION_SIZE, device=self.device, dtype=self.dtype)
 			warmup = torch.cuda.Stream()
 			warmup.wait_stream(torch.cuda.current_stream())
 			with torch.cuda.stream(warmup):
 				for _ in range(3):
-					self._sample(self._graph_input)
+					self._sample(self._graph_input, True)
+					self._sample(self._graph_input, False)
 			torch.cuda.current_stream().wait_stream(warmup)
 
-			self._graph = torch.cuda.CUDAGraph()
-			with torch.cuda.graph(self._graph):
-				self._graph_output = self._sample(self._graph_input)
+			for deterministic in (True, False):
+				graph = torch.cuda.CUDAGraph()
+				with torch.cuda.graph(graph):
+					self._graphs[deterministic] = (graph, self._sample(self._graph_input, deterministic))
 		except RuntimeError as error:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
-			self._graph = None
+			self._graphs.clear()
 
 	def act(self, observations: NDArray[np.float16], deterministic: bool = False) -> NDArray[np.int64]:
-		"""Picks one action per agent, sampled from the policy unless `deterministic` is set."""
+		"""Picks one action per agent, the policy's argmax unless `deterministic` is cleared."""
 		# Half precision observations halve the transfer; the widening happens on the device
-		batch = torch.from_numpy(observations).to(self.device, non_blocking=True).unsqueeze(1)
-		if self._graph is not None and not deterministic:
+		batch = torch.from_numpy(observations).to(self.device, self.dtype, non_blocking=True).unsqueeze(1)
+		captured = self._graphs.get(deterministic)
+		if captured is not None:
+			graph, output = captured
 			self._graph_input.copy_(batch)
-			self._graph.replay()
-			return self._graph_output.cpu().numpy()
+			graph.replay()
+			return output.cpu().numpy()
 
-		return self._sample(batch.float(), deterministic).cpu().numpy()
+		return self._sample(batch, deterministic).cpu().numpy()
 
 	def snapshot(self, indices: Tensor) -> list[Tensor]:
 		"""Copies the given agents out of the population, in `parameters()` order."""
@@ -191,22 +202,22 @@ class Population:
 		"""Exports one agent in plain nn.Linear / nn.LayerNorm layout, the format used by the weight files."""
 		state: dict[str, Tensor] = {}
 		for name in self.linear_shapes:
-			state[f'{name}.weight'] = self.weights[name][index].t().contiguous().cpu()
-			state[f'{name}.bias'] = self.biases[name][index, 0].contiguous().cpu()
+			state[f'{name}.weight'] = self.weights[name][index].t().float().contiguous().cpu()
+			state[f'{name}.bias'] = self.biases[name][index, 0].float().contiguous().cpu()
 		for name in self.norm_shapes:
-			state[f'{name}.weight'] = self.weights[name][index, 0].contiguous().cpu()
-			state[f'{name}.bias'] = self.biases[name][index, 0].contiguous().cpu()
+			state[f'{name}.weight'] = self.weights[name][index, 0].float().contiguous().cpu()
+			state[f'{name}.bias'] = self.biases[name][index, 0].float().contiguous().cpu()
 		return state
 
 	def load_state_dict(self, state: dict[str, Tensor]) -> None:
 		"""Loads a single agent's state dict into every agent of the population."""
 		with torch.no_grad():
 			for name in self.linear_shapes:
-				weight = state[f'{name}.weight'].to(self.device).t()
+				weight = state[f'{name}.weight'].to(self.device, self.dtype).t()
 				if weight.shape != self.weights[name].shape[1:]:
 					raise ValueError(f'{name} expects {tuple(self.weights[name].shape[1:])}, got {tuple(weight.shape)}')
 				self.weights[name][:] = weight
-				self.biases[name][:] = state[f'{name}.bias'].to(self.device)
+				self.biases[name][:] = state[f'{name}.bias'].to(self.device, self.dtype)
 			for name in self.norm_shapes:
-				self.weights[name][:] = state[f'{name}.weight'].to(self.device)
-				self.biases[name][:] = state[f'{name}.bias'].to(self.device)
+				self.weights[name][:] = state[f'{name}.weight'].to(self.device, self.dtype)
+				self.biases[name][:] = state[f'{name}.bias'].to(self.device, self.dtype)
