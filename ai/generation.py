@@ -7,16 +7,17 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from ai.a2c_trainer import A2CTrainer, RolloutBuffer
+from ai.a2c_trainer import DEFAULT_EPOCHS, DEFAULT_GAMMA, DEFAULT_LEARNING_RATE, A2CTrainer, RolloutBuffer
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device
 from game.world import OBSERVATION_SIZE, World
 
 # Generation constants
 DEFAULT_ELITE_COUNT: Final[int] = 4
 DEFAULT_MUTATION_RATE: Final[float] = 0.8
-DEFAULT_MUTATION_STRENGTH: Final[float] = 0.015
+DEFAULT_MUTATION_STRENGTH: Final[float] = 0.03  # Now that the elites are preserved, this is the only exploration the GA has left
 DEFAULT_TICK_RATE: Final[int] = 90
-DEFAULT_EPISODE_SECONDS: Final[float] = 20.0
+DEFAULT_EPISODE_SECONDS: Final[float] = 30.0
+DEFAULT_ACTION_REPEAT: Final[int] = 2  # Physics ticks a chosen action is held for, measurably better than 1 or 4 here
 MAX_SPEED: Final[str] = 'max'  # `speed='max'` tunes itself to the fastest rate the target framerate survives
 MAX_TICKS_PER_FRAME: Final[float] = 4096.0
 SPEED_HOLD_RATIO: Final[float] = 0.95  # Share of the target framerate above which the simulation asks for more work
@@ -64,6 +65,10 @@ class Generation:
 		device: str = 'auto',
 		tick_rate: int = DEFAULT_TICK_RATE,
 		episode_seconds: float = DEFAULT_EPISODE_SECONDS,
+		action_repeat: int = DEFAULT_ACTION_REPEAT,
+		learning_rate: float = DEFAULT_LEARNING_RATE,
+		gamma: float = DEFAULT_GAMMA,
+		epochs: int = DEFAULT_EPOCHS,
 		speed: float | str = 1.0,
 		fps: int = 0,
 		map_path: str = 'maps/level_1.txt',
@@ -77,6 +82,7 @@ class Generation:
 		self.use_a2c_learning = use_a2c_learning
 		self.tick_rate = tick_rate
 		self.episode_seconds = episode_seconds
+		self.action_repeat = max(1, action_repeat)
 		self.auto_speed = speed == MAX_SPEED
 		self.speed = 1.0 if self.auto_speed else float(speed)
 		self.generation = 1
@@ -98,11 +104,14 @@ class Generation:
 		self.last_position_check = 0.0
 		self._previous_x = np.zeros(population_size, dtype=np.float64)
 		self._previous_y = np.zeros(population_size, dtype=np.float64)
+		self._actions = np.zeros(population_size, dtype=np.int64)
+		self._decision_alive = np.ones(population_size, dtype=np.bool_)
+		self._window_rewards = np.zeros(population_size, dtype=np.float64)
 
 		self.a2c_trainer: A2CTrainer | None = None
 		self.rollout: RolloutBuffer | None = None
 		if self.use_a2c_learning:
-			self.a2c_trainer = A2CTrainer(self.population)
+			self.a2c_trainer = A2CTrainer(self.population, learning_rate=learning_rate, gamma=gamma, epochs=epochs)
 			self.rollout = RolloutBuffer(self.rollout_capacity(), population_size)
 			print(self.a2c_trainer.get_training_summary())
 
@@ -127,7 +136,7 @@ class Generation:
 
 	def rollout_capacity(self) -> int:
 		"""Number of transitions kept for one A2C update, bounded by the memory budget."""
-		wanted = int(self.episode_seconds * self.tick_rate) * len(self.spawn_points())
+		wanted = int(self.episode_seconds * self.tick_rate) // self.action_repeat * len(self.spawn_points())
 		per_step = self.population_size * OBSERVATION_SIZE * 2  # float16 observations dominate the buffer
 		return max(1, min(wanted, ROLLOUT_MEMORY_BUDGET // per_step))
 
@@ -192,20 +201,30 @@ class Generation:
 		return self.should_skip_checkpoint or self.manual_stop or bool(self.world.win.any()) or not self.world.alive().any()
 
 	def simulate_tick(self, tick: int) -> None:
-		"""One simulation tick: observe, act, step, reward, record."""
+		"""
+		One simulation tick: observe and decide on the first tick of a window, then step, reward and record.
+
+		Holding an action for `action_repeat` ticks is both cheaper and easier to learn from: a jump arc lasts
+		about 42 ticks, so at one decision per tick no reachable discount factor reaches the far side of a gap.
+		A window cut short by the end of an episode is simply dropped, its observation slot gets reused.
+		"""
 		alive = self.world.alive()
-		# The world writes straight into the rollout's row, so a recorded tick costs no extra copy
-		observations = self.world.observe(self.rollout.next_slot() if self.rollout is not None else None)
-		actions = self.population.act(observations)
+		if tick % self.action_repeat == 0:
+			# The world writes straight into the rollout's row, so a recorded tick costs no extra copy
+			observations = self.world.observe(self.rollout.next_slot() if self.rollout is not None else None)
+			self._actions = self.population.act(observations)
+			self._decision_alive = alive
+			self._window_rewards.fill(0.0)
 
 		np.copyto(self._previous_x, self.world.x)
 		np.copyto(self._previous_y, self.world.y)
-		self.world.step(actions, tick)
+		self.world.step(self._actions, tick)
 
 		step_rewards = self.continuous_rewards(alive, self._previous_x, self._previous_y)
 		self.rewards += step_rewards
-		if self.rollout is not None:
-			self.rollout.commit(actions, step_rewards, alive)
+		self._window_rewards += step_rewards
+		if self.rollout is not None and tick % self.action_repeat == self.action_repeat - 1:
+			self.rollout.commit(self._actions, self._window_rewards, self._decision_alive)
 
 		self.check_agent_positions(tick)
 		self.total_ticks += 1
@@ -302,9 +321,11 @@ class Generation:
 			return [*rows, ('Learning', 'Genetic')]
 		return [
 			*rows,
-			('Learning', 'A2C + Genetic'),
+			('Learning', 'PPO + Genetic'),
 			('Learning Rate', f'{self.a2c_trainer.learning_rate:g}'),
+			('Gamma', f'{self.a2c_trainer.gamma:g}'),
 			('Entropy', f'{self.a2c_trainer.entropy_coef:.4f}'),
+			('Act Repeat', f'{self.action_repeat}'),
 		]
 
 	def render(self, checkpoint_index: int, checkpoint_count: int, tick: int) -> None:

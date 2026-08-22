@@ -20,8 +20,8 @@ Neural-Jump is an interactive platformer game featuring AI agents that learn to 
 ## Features
 
 - **Platformer Gameplay**: Classic side-scrolling platformer mechanics with jumping, movement, and collision detection
-- **A2C + Neuroevolution**: Agents learn by advantage actor-critic within a generation and by genetic selection between generations
-- **Batched A2C**: One Adam trains the entire population at once, gradients clipped per agent
+- **PPO + Neuroevolution**: Agents learn by clipped policy optimisation within a generation and by genetic selection between generations
+- **Batched PPO**: One Adam trains the entire population at once, gradients clipped per agent, elites left untouched
 - **Batched Simulation**: The whole population is simulated as numpy arrays, so hundreds of agents run in parallel far faster than real time
 - **Batched Networks**: The population is one set of `(agents, in, out)` weight tensors evaluated in a single batched matmul per layer
 - **Reward Shaping**: Sophisticated reward system that encourages forward progress, penalizes backward movement, and rewards level completion
@@ -86,13 +86,17 @@ Training is headless by default and runs as fast as the machine allows. `--show-
 - `--population-size N`: Number of agents per generation (default: 100)
 - `--elite-count N`: Agents carried over untouched and used as parents (default: 4)
 - `--mutation-rate R`: Probability of mutating a given weight tensor (default: 0.8, range: 0.0-1.0)
-- `--mutation-strength S`: Scale of mutations (default: 0.015)
+- `--mutation-strength S`: Scale of mutations (default: 0.03)
 - `--hidden-sizes N N N`: Sizes of the three shared hidden layers (default: 256 128 64), smaller is faster and dumber
-- `--no-use-a2c`: Disable A2C and evolve with the genetic algorithm only
+- `--no-use-a2c`: Disable PPO and evolve with the genetic algorithm only
+- `--action-repeat N`: Physics ticks a chosen action is held for (default: 2)
+- `--learning-rate R`: Adam learning rate (default: 0.0003)
+- `--gamma G`: Discount factor per decision, not per tick (default: 0.98)
+- `--ppo-epochs N`: Passes over each rollout (default: 4)
 - `--device auto|cpu|cuda`: Where the population runs (default: auto)
 - `--threads N`: Torch CPU threads (default: 4)
 - `--tick-rate N`: Simulation ticks per in-game second (default: 90)
-- `--episode-seconds S`: In-game time budget per spawn point (default: 20)
+- `--episode-seconds S`: In-game time budget per spawn point (default: 30)
 - `--generations N`: Stop after N generations (default: 0, runs forever)
 - `--speed S`: Simulation speed multiplier while rendering, or `max` to run as fast as the target framerate survives (default: 1)
 - `--fps N`: Target framerate, only with `--show-window` (default: 0, uses the display refresh rate)
@@ -141,11 +145,14 @@ agents: going from 100 to 1000 agents multiplies the throughput per second, not 
 
 | Setup | Ticks/s | Agent-steps/s |
 | --- | --- | --- |
-| 100 agents, A2C + genetic, CUDA | ~620 | ~62,000 |
-| 100 agents, genetic only, CUDA | ~820 | ~41,000 |
-| 1000 agents, A2C + genetic, CUDA | ~155 | ~155,000 |
+| 100 agents, PPO + genetic, CUDA | ~1,150 | ~115,000 |
+| 100 agents, genetic only, CUDA | ~1,400 | ~140,000 |
 
-At 90 ticks per in-game second, 100 agents playing a 20 second episode take about 3 seconds of wall clock.
+Two things carry that number. The 7x7x4 vision window of every tile is baked once at load time, so an
+observation is a single gather instead of a broadcast fancy index rebuilt per tick. And `--action-repeat`
+holds each decision for two physics ticks, which halves the network calls and the rollout.
+
+At 90 ticks per in-game second, 100 agents playing a 30 second episode take about 2.5 seconds of wall clock.
 
 Observations are half precision end to end: the world writes them straight into the rollout buffer's row,
 so recording a tick costs no extra copy and the host-to-device transfer moves half the bytes.
@@ -212,12 +219,20 @@ plain `nn.Linear` / `nn.LayerNorm` layout (`fc1.weight`, `norm1.bias`, `actor.we
 
 ### How the two learning signals combine
 
-- **Within a generation**: every transition goes into a rollout buffer. At the end of the generation the
-  trainer replays it in chunks of 256 timesteps, so the autograd graph never covers the whole episode, and
-  applies one A2C update (normalised discounted returns, entropy bonus, gradients clipped per agent).
+- **Within a generation**: every decision goes into a rollout buffer, together with the shaping rewards of
+  the ticks it covers. The end of episode reward (death, win, distance) is folded into the last transition
+  of each episode, which is also flagged terminal so returns cannot cross a spawn point reset. The trainer
+  then builds GAE(0.95) advantages over rewards divided by the spread of their own discounted return,
+  normalises the advantages over the whole batch, and runs four clipped PPO epochs in minibatches of 256
+  timesteps, one optimizer step each, with gradients clipped per agent.
 - **Between generations**: agents are ranked by fitness, the elites are copied untouched, most of the
   population is a mutated crossover of two elites, and a few are re-randomised. The Adam moments are reset
   afterwards because the agents behind each slot have changed.
+
+The elites sit out the PPO update entirely: they are the exact weights that earned their rank, and a fresh
+Adam step moves every one of their weights by the full learning rate, which undoes the selection. That step
+was also the population's main source of exploration, so `--mutation-strength` carries it now and defaults
+to 0.03 rather than 0.015.
 
 `--no-use-a2c` keeps only the second half.
 

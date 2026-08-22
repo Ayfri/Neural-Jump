@@ -8,18 +8,19 @@ from numpy.typing import NDArray
 from ai.population import Population
 from game.world import OBSERVATION_DTYPE, OBSERVATION_SIZE
 
-DEFAULT_LEARNING_RATE: Final[float] = 0.003
-DEFAULT_GAMMA: Final[float] = 0.95
+DEFAULT_LEARNING_RATE: Final[float] = 3e-4
+DEFAULT_GAMMA: Final[float] = 0.98  # Per decision, so with an action repeat of 2 at 90 ticks/s the horizon is ~1.1s
 DEFAULT_GAE_LAMBDA: Final[float] = 0.95  # Bias/variance knob of the advantage estimator, 1.0 is plain Monte Carlo
-RETURN_SCALE_DECAY: Final[float] = 0.9  # Smoothing of the running return scale the rewards are divided by
 MIN_RETURN_SCALE: Final[float] = 1e-3
 DEFAULT_VALUE_LOSS_COEF: Final[float] = 0.3
-DEFAULT_ENTROPY_COEF: Final[float] = 0.005
+DEFAULT_ENTROPY_COEF: Final[float] = 0.005  # Held low on purpose: a fuzzy policy makes the measured fitness a lottery
+DEFAULT_CLIP_RANGE: Final[float] = 0.2  # PPO trust region, the standard value across implementations
+DEFAULT_EPOCHS: Final[int] = 4  # Passes over one rollout, what the clipped objective buys over plain A2C
 DEFAULT_MAX_GRAD_NORM: Final[float] = 0.5
 DEFAULT_CHUNK_SIZE: Final[int] = 256  # Timesteps replayed per backward pass, caps the autograd graph size
-ENTROPY_DECAY_START: Final[int] = 20  # Generation after which the entropy bonus starts decaying
+ENTROPY_DECAY_START: Final[int] = 10  # Generation after which the entropy bonus starts decaying
 ENTROPY_DECAY_RATE: Final[float] = 0.95
-MIN_ENTROPY_COEF: Final[float] = 0.001
+MIN_ENTROPY_COEF: Final[float] = 0.002
 
 
 class RolloutBuffer:
@@ -84,7 +85,7 @@ class RolloutBuffer:
 
 class A2CTrainer:
 	"""
-	Advantage actor-critic over a batched Population.
+	Clipped policy optimisation (PPO) over a batched Population.
 
 	One Adam covers every agent: because an agent's weights only ever touch its own outputs, the gradient
 	of the summed loss is exactly each agent's own gradient, so a single step trains the whole population
@@ -99,6 +100,8 @@ class A2CTrainer:
 		gae_lambda: float = DEFAULT_GAE_LAMBDA,
 		value_loss_coef: float = DEFAULT_VALUE_LOSS_COEF,
 		entropy_coef: float = DEFAULT_ENTROPY_COEF,
+		clip_range: float = DEFAULT_CLIP_RANGE,
+		epochs: int = DEFAULT_EPOCHS,
 		max_grad_norm: float = DEFAULT_MAX_GRAD_NORM,
 		chunk_size: int = DEFAULT_CHUNK_SIZE,
 	) -> None:
@@ -106,9 +109,11 @@ class A2CTrainer:
 		self.learning_rate = learning_rate
 		self.gamma = gamma
 		self.gae_lambda = gae_lambda
-		self.return_scale = 0.0  # Running scale of the returns, set from the first rollout
+		self.return_scale = 1.0  # Scale the last rollout's rewards were divided by, kept for the HUD
 		self.value_loss_coef = value_loss_coef
 		self.entropy_coef = entropy_coef
+		self.clip_range = clip_range
+		self.epochs = epochs
 		self.max_grad_norm = max_grad_norm
 		self.chunk_size = chunk_size
 		self.optimizer = torch.optim.Adam(population.parameters(), lr=learning_rate)
@@ -118,15 +123,25 @@ class A2CTrainer:
 		self.optimizer = torch.optim.Adam(self.population.parameters(), lr=self.learning_rate)
 
 	@torch.no_grad()
-	def _values(self, buffer: RolloutBuffer) -> torch.Tensor:
-		"""State values for the whole rollout, `(length, agents)`, needed before the advantages can be built."""
+	def _evaluate(self, buffer: RolloutBuffer) -> tuple[torch.Tensor, torch.Tensor]:
+		"""
+		The behaviour policy's values and log probabilities over the whole rollout, `(length, agents)`.
+
+		Recomputed here rather than stored during the rollout: the weights have not moved since, so this is
+		the same policy that acted, and the sampling path stays a single CUDA graph replay per tick.
+		"""
 		device = self.population.device
 		values = torch.zeros(buffer.length, self.population.size, device=device)
+		log_probs = torch.zeros(buffer.length, self.population.size, device=device)
 		for start in range(0, buffer.length, self.chunk_size):
 			stop = min(start + self.chunk_size, buffer.length)
 			observations = torch.from_numpy(buffer.observations[start:stop]).to(device).float().transpose(0, 1)
-			values[start:stop] = self.population.forward(observations)[1].t()
-		return values
+			actions = torch.from_numpy(buffer.actions[start:stop]).to(device).t()
+			logits, chunk_values = self.population.forward(observations)
+			taken = F.log_softmax(logits, dim=-1).gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+			values[start:stop] = chunk_values.t()
+			log_probs[start:stop] = taken.t()
+		return values, log_probs
 
 	def _advantages(self, buffer: RolloutBuffer, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		"""
@@ -142,8 +157,7 @@ class A2CTrainer:
 		mask = torch.from_numpy(buffer.alive[:length]).to(device).float()
 		keep = (1.0 - torch.from_numpy(buffer.done[:length]).to(device).float()) * mask
 
-		scale = self._update_return_scale(rewards * mask, keep)
-		rewards = rewards * mask / scale
+		rewards = self._rescale(rewards * mask, keep)
 
 		advantages = torch.zeros_like(rewards)
 		running = torch.zeros(buffer.size, device=device)
@@ -155,25 +169,35 @@ class A2CTrainer:
 			next_value = values[step]
 		return advantages, advantages + values, mask
 
-	def _update_return_scale(self, rewards: torch.Tensor, keep: torch.Tensor) -> float:
-		"""Tracks the standard deviation of the discounted return, the scale the rewards are measured against."""
+	def _rescale(self, rewards: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+		"""
+		Divides the rewards by the spread of their own discounted return.
+
+		The scale is taken from the rollout at hand rather than carried across generations: the reward a
+		generation collects grows as the population gets further, and a lagging scale leaves the critic
+		chasing a target that drifts out from under it every update.
+		"""
 		returns = torch.zeros_like(rewards)
 		running = torch.zeros(rewards.shape[1], device=rewards.device)
 		for step in range(rewards.shape[0] - 1, -1, -1):
 			running = rewards[step] + self.gamma * running * keep[step]
 			returns[step] = running
-		observed = float(returns.std()) if returns.numel() > 1 else 0.0
-		observed = max(observed, MIN_RETURN_SCALE)
-		self.return_scale = observed if self.return_scale == 0.0 else self.return_scale * RETURN_SCALE_DECAY + observed * (1.0 - RETURN_SCALE_DECAY)
-		return self.return_scale
+		self.return_scale = max(float(returns.std()) if returns.numel() > 1 else 0.0, MIN_RETURN_SCALE)
+		return rewards / self.return_scale
 
 	def train_step(self, buffer: RolloutBuffer) -> dict[str, float]:
-		"""Replays the rollout in chunks, accumulates the A2C gradients and applies one optimizer step."""
+		"""
+		Runs several clipped policy iterations over the rollout, one optimizer step per minibatch.
+
+		A single step per rollout is what kept the critic pinned at its initial loss: with fresh Adam moments
+		every generation, one step is `lr * sign(gradient)` on every weight and nothing converges. The PPO
+		ratio is what makes the extra passes legal, since the data goes stale as soon as the policy moves.
+		"""
 		if buffer.length == 0:
-			return {'avg_total_loss': 0.0, 'avg_actor_loss': 0.0, 'avg_critic_loss': 0.0, 'num_trained_agents': 0}
+			return {'avg_total_loss': 0.0, 'avg_actor_loss': 0.0, 'avg_critic_loss': 0.0, 'avg_entropy': 0.0, 'approx_kl': 0.0, 'return_scale': self.return_scale, 'num_trained_agents': 0}
 
 		device = self.population.device
-		values = self._values(buffer)
+		values, old_log_probs = self._evaluate(buffer)
 		advantages, returns, mask = self._advantages(buffer, values)
 		total_steps = mask.sum().clamp(min=1.0)
 		trained_agents = int((mask.sum(dim=0) > 0).sum().item())
@@ -184,38 +208,56 @@ class A2CTrainer:
 		spread = ((((advantages - mean) * mask) ** 2).sum() / total_steps).sqrt()
 		advantages = (advantages - mean) / (spread + 1e-8)
 
-		self.optimizer.zero_grad(set_to_none=True)
-		totals = torch.zeros(3, device=device)
+		starts = list(range(0, buffer.length, self.chunk_size))
+		totals = torch.zeros(5, device=device)
+		updates = 0
 
-		for start in range(0, buffer.length, self.chunk_size):
-			stop = min(start + self.chunk_size, buffer.length)
-			observations = torch.from_numpy(buffer.observations[start:stop]).to(device).float().transpose(0, 1)
-			actions = torch.from_numpy(buffer.actions[start:stop]).to(device).t()
-			chunk_mask = mask[start:stop].t()
-			chunk_returns = returns[start:stop].t()
-			chunk_advantages = advantages[start:stop].t()
+		for _ in range(self.epochs):
+			for index in torch.randperm(len(starts)).tolist():
+				start = starts[index]
+				stop = min(start + self.chunk_size, buffer.length)
+				observations = torch.from_numpy(buffer.observations[start:stop]).to(device).float().transpose(0, 1)
+				actions = torch.from_numpy(buffer.actions[start:stop]).to(device).t()
+				chunk_mask = mask[start:stop].t()
+				chunk_steps = chunk_mask.sum().clamp(min=1.0)
+				chunk_returns = returns[start:stop].t()
+				chunk_advantages = advantages[start:stop].t()
+				chunk_old = old_log_probs[start:stop].t()
 
-			logits, chunk_values = self.population.forward(observations)
-			log_probs = F.log_softmax(logits, dim=-1)
-			probs = log_probs.exp()
-			taken = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+				logits, chunk_values = self.population.forward(observations)
+				log_probs = F.log_softmax(logits, dim=-1)
+				probs = log_probs.exp()
+				taken = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
 
-			actor_loss = -(taken * chunk_advantages * chunk_mask).sum() / total_steps
-			entropy = -((probs * log_probs).sum(dim=-1) * chunk_mask).sum() / total_steps
-			critic_loss = (((chunk_values - chunk_returns) ** 2) * chunk_mask).sum() / total_steps
-			loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy
-			loss.backward()
+				ratio = (taken - chunk_old).exp()
+				clipped = ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range)
+				surrogate = torch.min(ratio * chunk_advantages, clipped * chunk_advantages)
+				actor_loss = -(surrogate * chunk_mask).sum() / chunk_steps
+				entropy = -((probs * log_probs).sum(dim=-1) * chunk_mask).sum() / chunk_steps
+				critic_loss = (((chunk_values - chunk_returns) ** 2) * chunk_mask).sum() / chunk_steps
+				loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy
 
-			totals += torch.stack([loss.detach(), actor_loss.detach(), critic_loss.detach()])
+				self.optimizer.zero_grad(set_to_none=True)
+				loss.backward()
+				self._clip_gradients()
+				self.optimizer.step()
 
-		self._clip_gradients()
-		self.optimizer.step()
+				with torch.no_grad():
+					# Mean entropy and the usual PPO staleness probe, the two numbers that say whether the
+					# extra epochs are still learning or already off policy
+					divergence = ((chunk_old - taken) * chunk_mask).sum() / chunk_steps
+				totals += torch.stack([loss.detach(), actor_loss.detach(), critic_loss.detach(), entropy.detach(), divergence])
+				updates += 1
+
 		buffer.clear()
-
+		totals /= max(1, updates)
 		return {
 			'avg_total_loss': float(totals[0]),
 			'avg_actor_loss': float(totals[1]),
 			'avg_critic_loss': float(totals[2]),
+			'avg_entropy': float(totals[3]),
+			'approx_kl': float(totals[4]),
+			'return_scale': self.return_scale,
 			'num_trained_agents': trained_agents,
 		}
 
