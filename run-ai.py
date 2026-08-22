@@ -27,7 +27,7 @@ def speed_value(text: str) -> float | str:
 
 def main() -> None:
 	argparser = argparse.ArgumentParser()
-	argparser.add_argument("--population-size", type=int, default=100)
+	argparser.add_argument("--population-size", type=int, default=300, help="A tick costs almost the same at 300 agents as at 100, and the extra mutations are what break a plateau")
 	argparser.add_argument("--elite-count", type=int, default=DEFAULT_ELITE_COUNT)
 	argparser.add_argument("--mutation-rate", type=float, default=DEFAULT_MUTATION_RATE)
 	argparser.add_argument("--mutation-strength", type=float, default=DEFAULT_MUTATION_STRENGTH)

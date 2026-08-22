@@ -83,7 +83,9 @@ Training is headless by default and runs as fast as the machine allows. `--show-
 
 **Command-line options:**
 
-- `--population-size N`: Number of agents per generation (default: 100)
+- `--population-size N`: Number of agents per generation (default: 300). A tick costs almost the same at 300
+  agents as at 100, because the simulation is bound by numpy call overhead rather than by the data, and the
+  extra mutations per generation are what break a plateau
 - `--elite-count N`: Agents carried over untouched and used as parents (default: 4)
 - `--mutation-rate R`: Probability of mutating a given weight tensor (default: 0.8, range: 0.0-1.0)
 - `--mutation-strength S`: Scale of mutations (default: 0.03)
@@ -150,6 +152,7 @@ agents: going from 100 to 1000 agents multiplies the throughput per second, not 
 | --- | --- | --- |
 | 100 agents, PPO + genetic, CUDA | ~1,150 | ~115,000 |
 | 100 agents, genetic only, CUDA | ~1,400 | ~140,000 |
+| 300 agents, genetic only, CUDA | ~1,330 | ~400,000 |
 
 Two things carry that number. The 7x7x4 vision window of every tile is baked once at load time, so an
 observation is a single gather instead of a broadcast fancy index rebuilt per tick. And `--action-repeat`
