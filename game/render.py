@@ -71,6 +71,7 @@ class Hud:
 	tick_rate: int = 60
 	checkpoint: tuple[int, int] = (1, 1)
 	best_ever: float = 0.0
+	best_time: float = 0.0  # Fastest win in seconds, 0 while the flag has never been touched
 	elite_count: int = 0
 	random_count: int = 0
 	speed: float = 0.0  # Simulation ticks per real second
@@ -295,7 +296,7 @@ class Renderer:
 			('Time', f'{hud.tick / max(1, hud.tick_rate):.1f}s' + (f'  ckpt {checkpoint}/{checkpoints}' if checkpoints > 1 else '')),
 			Gauge('Alive', f'{alive}/{world.count}', alive / max(1, world.count)),
 			('Best', f'{float(fitness.max()) if fitness.size else 0.0:.1f}'),
-			('Record', f'{hud.best_ever:.1f}'),
+			('Record', f'{hud.best_ever:.1f}' + (f'  {hud.best_time:.2f}s' if hud.best_time > 0 else '')),
 			('Ticks/s', f'{hud.speed:,.0f}  x{hud.sim_speed:.0f}'),
 			Gauge('FPS', f'{fps:.0f}/{self.target_fps}', fps / max(1, self.target_fps)),
 		])

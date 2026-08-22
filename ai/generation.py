@@ -8,6 +8,7 @@ import torch
 from numpy.typing import NDArray
 
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
+from game.settings import TILE_SIZE
 from game.world import World
 
 if TYPE_CHECKING:
@@ -45,8 +46,10 @@ FALLING_PENALTY: Final[float] = -0.02
 FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
 
 DEATH_PENALTY: Final[float] = -20.0
-WIN_TIME_BONUS_MULTIPLIER: Final[float] = 100.0
-WIN_TIME_BONUS_BASE: Final[float] = 10.0
+WIN_BASE_BONUS: Final[float] = 200.0  # Paid for touching the flag at all, whatever the time taken
+WIN_SPEED_BONUS: Final[float] = 1200.0  # Paid on top, scaled by how much of the episode was still left
+WIN_SPEED_EXPONENT: Final[float] = 2.0  # Bends the scale, so shaving ticks off an already fast run pays the most
+PROGRESS_SPEED_BONUS: Final[float] = 100.0  # Same idea for agents that never reach the flag, on how fast they got as far as they did
 DISTANCE_REWARD_DIVISOR: Final[float] = 10.0
 PROGRESS_REWARD_DIVISOR: Final[float] = 20.0
 MIN_REWARD: Final[float] = -30.0
@@ -106,6 +109,7 @@ class Generation:
 
 		self.generation = 1
 		self.best_fitness_ever = 0.0
+		self.best_time_ever = 0.0  # Fastest run to the flag in seconds, 0 while nobody has reached it
 		self.should_skip_checkpoint = False
 		self.manual_stop = False
 		self.last_speed = 0.0
@@ -118,6 +122,7 @@ class Generation:
 		self.rewards = np.zeros(population_size, dtype=np.float64)
 
 		self.max_x_reached = np.zeros(population_size, dtype=np.float64)
+		self.max_x_tick = np.zeros(population_size, dtype=np.float64)  # Tick each record was set on, so progress is scored on time too
 		self.ticks_stationary = np.zeros(population_size, dtype=np.int32)
 		self.position_history: list[NDArray[np.float64]] = []
 		self.last_position_check = 0.0
@@ -144,6 +149,10 @@ class Generation:
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
 
+	@property
+	def max_ticks(self) -> int:
+		return int(self.episode_seconds * self.tick_rate)
+
 	def skip_checkpoint(self) -> None:
 		self.should_skip_checkpoint = True
 
@@ -160,7 +169,7 @@ class Generation:
 		"""Runs the whole population through every spawn point and fills `self.rewards`."""
 		points = self.spawn_points()
 		self.rewards.fill(0.0)
-		max_ticks = int(self.episode_seconds * self.tick_rate)
+		max_ticks = self.max_ticks
 		started = time.perf_counter()
 		self._speed_time = started
 		self._speed_ticks = self.total_ticks
@@ -170,6 +179,7 @@ class Generation:
 			self.world.reset(spawn_x, spawn_y)
 			self.decide()
 			self.max_x_reached[:] = self.world.x
+			self.max_x_tick.fill(0.0)
 			self.ticks_stationary.fill(0)
 			self.position_history.clear()
 			self.last_position_check = 0.0
@@ -193,14 +203,23 @@ class Generation:
 						break
 
 			self.rewards += self.final_rewards()
+			self.record_best_time()
 			self.should_skip_checkpoint = False
 
 		self.best_fitness_ever = max(self.best_fitness_ever, float(self.rewards.max()))
 		elapsed = time.perf_counter() - started
 		self.last_speed = ticks_done / elapsed if elapsed else 0.0
 
+	def record_best_time(self) -> None:
+		"""Keeps the fastest run to the flag seen so far, in seconds."""
+		times = self.world.win_tick[self.world.win & (self.world.win_tick >= 0)]
+		if times.size == 0:
+			return
+		best = float(times.min()) / self.tick_rate
+		self.best_time_ever = best if self.best_time_ever == 0.0 else min(self.best_time_ever, best)
+
 	def episode_over(self) -> bool:
-		return self.should_skip_checkpoint or self.manual_stop or bool(self.world.win.any()) or not self.world.alive().any()
+		return self.should_skip_checkpoint or self.manual_stop or not self.world.alive().any()
 
 	def simulate_tick(self, tick: int) -> None:
 		"""
@@ -222,7 +241,7 @@ class Generation:
 		if (tick + 1) % self.action_repeat == 0:
 			self.decide()
 
-		self.rewards += self.continuous_rewards(alive, self._previous_x, self._previous_y)
+		self.rewards += self.continuous_rewards(alive, self._previous_x, self._previous_y, tick)
 
 		self.check_agent_positions(tick)
 		self.total_ticks += 1
@@ -263,15 +282,17 @@ class Generation:
 		self.live_speed = instant if self.live_speed == 0.0 else self.live_speed * 0.6 + instant * 0.4
 		self._speed_time, self._speed_ticks = now, self.total_ticks
 
-	def continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64]) -> NDArray[np.float64]:
+	def continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64], tick: int) -> NDArray[np.float64]:
 		"""Per-tick micro rewards, computed for the whole population at once."""
 		# Every term is a masked add rather than a mask multiplied by its value, which halves the numpy calls
 		x_delta = self.world.x - previous_x
 		rewards = np.zeros(self.population_size, dtype=np.float64)
 
 		forward = x_delta > 0
+		record = forward & alive & (self.world.x > self.max_x_reached)
 		np.add(rewards, FORWARD_MOVEMENT_REWARD, out=rewards, where=forward)
-		np.add(rewards, NEW_MAX_POSITION_BONUS, out=rewards, where=forward & (self.world.x > self.max_x_reached))
+		np.add(rewards, NEW_MAX_POSITION_BONUS, out=rewards, where=record)
+		np.copyto(self.max_x_tick, float(tick), where=record)
 		np.maximum(self.max_x_reached, self.world.x, out=self.max_x_reached, where=forward)
 
 		np.add(rewards, BACKWARD_MOVEMENT_PENALTY, out=rewards, where=x_delta < 0)
@@ -285,12 +306,26 @@ class Generation:
 		rewards *= alive
 		return rewards
 
+	def speed_ratio(self, ticks: NDArray[np.float64]) -> NDArray[np.float64]:
+		"""How much of the episode was still left after `ticks`, bent by `WIN_SPEED_EXPONENT`, in [0, 1]."""
+		return np.clip(1.0 - ticks / self.max_ticks, 0.0, 1.0) ** WIN_SPEED_EXPONENT
+
 	def final_rewards(self) -> NDArray[np.float64]:
 		"""End of episode reward: win bonus, reward tile value, or distance travelled minus the death penalty."""
 		world = self.world
-		time_taken = np.where(world.win_tick >= 0, world.win_tick / self.tick_rate, WIN_TIME_BONUS_BASE)
-		win_reward = world.x / DISTANCE_REWARD_DIVISOR + np.maximum(0.0, WIN_TIME_BONUS_BASE - time_taken) * WIN_TIME_BONUS_MULTIPLIER
-		progress = np.maximum(MIN_REWARD, self.max_x_reached / PROGRESS_REWARD_DIVISOR + world.dead * DEATH_PENALTY)
+		# Winners are ranked by the tick the flag was touched on: the whole episode is the scale, so there is a
+		# gradient the entire way instead of a cliff, and the exponent makes a fast run worth beating further
+		win_ticks = np.where(world.win_tick >= 0, world.win_tick.astype(np.float64), float(self.max_ticks))
+		win_reward = world.x / DISTANCE_REWARD_DIVISOR + WIN_BASE_BONUS + WIN_SPEED_BONUS * self.speed_ratio(win_ticks)
+
+		# Same shape for the rest, scaled by how far they got, so getting nowhere fast is worth nothing
+		reached = np.clip(self.max_x_reached / (world.width * TILE_SIZE), 0.0, 1.0)
+		progress = np.maximum(
+			MIN_REWARD,
+			self.max_x_reached / PROGRESS_REWARD_DIVISOR
+			+ PROGRESS_SPEED_BONUS * reached * self.speed_ratio(self.max_x_tick)
+			+ world.dead * DEATH_PENALTY,
+		)
 
 		rewards = np.where(world.finished_reward != 0, world.finished_reward * DISTANCE_REWARD_DIVISOR, progress)
 		return np.where(world.win, win_reward, rewards)
@@ -341,6 +376,7 @@ class Generation:
 			tick_rate=self.tick_rate,
 			checkpoint=(checkpoint_index + 1, checkpoint_count),
 			best_ever=self.best_fitness_ever,
+			best_time=self.best_time_ever,
 			elite_count=self.elite_count if self.generation > 1 else 0,
 			random_count=min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0,
 			speed=self.live_speed,
@@ -369,6 +405,7 @@ class Generation:
 			'weights': self.population.state_dict(0),
 			'hidden_sizes': self.population.hidden_sizes,
 			'best_fitness': self.best_fitness_ever,
+			'best_time': self.best_time_ever,
 			'mutation_rate': self.mutation_rate,
 			'mutation_strength': self.mutation_strength,
 		}, WEIGHTS_FOLDER / f'generation_{self.generation}.pth')
@@ -389,6 +426,7 @@ class Generation:
 			self.population.load_state_dict(weights)
 			if isinstance(data, dict):
 				self.best_fitness_ever = float(data.get('best_fitness', 0.0))
+				self.best_time_ever = float(data.get('best_time', 0.0))
 				self.mutation_rate = float(data.get('mutation_rate', self.mutation_rate))
 				self.mutation_strength = float(data.get('mutation_strength', self.mutation_strength))
 

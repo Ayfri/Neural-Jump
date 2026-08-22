@@ -100,8 +100,12 @@ of two random elites, and a few slots are re-randomised for diversity.
 
 - **Forward**: +0.02 per step, **+0.1** on a new distance record
 - **Backward**: -0.1, **stationary**: -0.05 after 5 ticks, **falling**: -0.02 past 5 pixels
-- **Death**: -20, **progress**: max distance / 20, floored at -30
-- **Win**: distance / 10, plus 100 per second saved under the 10 second target
+- **Death**: -20, **progress**: max distance / 20, plus up to 100 for how early the record was set, floored at -30
+- **Win**: distance / 10, +200 for the flag, plus up to 1200 on the square of the episode time left
+
+Time is part of the fitness on both paths: an agent that touches the flag halfway through the episode scores
+300 of the 1200, one that touches it in the first tenth scores 970. An episode runs until every agent is dead
+or has finished, so the winners of a generation are ranked against each other by the tick they arrived on.
 
 Agents that stand still for 2 seconds, or end up behind where they were 6 seconds earlier, are killed so the
 generation ends sooner.
