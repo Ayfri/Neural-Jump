@@ -9,11 +9,11 @@ import torch
 from numpy.typing import NDArray
 
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
-from game.settings import TILE_SIZE
+from game.settings import COIN_COLOR, TILE_SIZE
 from game.world import World
 
 if TYPE_CHECKING:
-	from game.render import Renderer
+	from game.render import Renderer, Row
 
 # Evolution
 DEFAULT_POPULATION_SIZE: Final[int] = 300
@@ -417,9 +417,9 @@ class Generation:
 		if len(self.position_history) >= 4:
 			self.world.kill(alive & (self.world.x < self.position_history[0]))
 
-	def training_rows(self) -> list[tuple[str, str]]:
+	def training_rows(self) -> 'list[Row]':
 		"""The knobs that shape the run, laid out for the HUD's training panel."""
-		rows = [
+		rows: 'list[Row]' = [
 			('Population', f'{self.population_size}'),
 			('Mutation Rate', f'{self.mutation_rate:.3f}'),
 			('Mutation Str', f'{self.mutation_strength:.4f}'),
@@ -435,29 +435,46 @@ class Generation:
 		]
 
 	def render(self, checkpoint_index: int, checkpoint_count: int, tick: int) -> None:
+		"""Builds the overlay for the current tick and hands it to the renderer, which only lays it out."""
 		assert self.renderer is not None
-		from game.render import Hud
+		from game.render import TRAINING_LEGEND, Fitness, Gauge, Hud, Legend, Panel
 
 		self.renderer.poll_events()
 		self._sample_live_speed()
-		best = int(np.argmax(np.where(self.world.alive(), self.rewards, -np.inf)))
+		world = self.world
+		best = int(np.argmax(np.where(world.alive(), self.rewards, -np.inf)))
+		alive = int(world.alive().sum())
+		fps = self.renderer.measured_fps()
+		best_coins = int(world.coins.max())
+		elite_count = self.elite_count if self.generation > 1 else 0
+		random_count = min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0
+
+		run = Panel('Run', [
+			('Generation', f'{self.generation}'),
+			('Time', f'{tick / max(1, self.tick_rate):.1f}s'
+				+ (f'  ckpt {checkpoint_index + 1}/{checkpoint_count}' if checkpoint_count > 1 else '')
+				+ ('  PAUSED' if self.paused else '')),
+			Gauge('Alive', f'{alive}/{world.count}', alive / max(1, world.count)),
+			('Best', f'{float(self.rewards.max()):.1f}'),
+			('Record', f'{self.best_fitness_ever:.1f}' + (f'  {self.best_time_ever:.2f}s' if self.best_time_ever > 0 else '')),
+			Gauge('Coins', f'{best_coins}/{world.coin_count}', best_coins / max(1, world.coin_count), COIN_COLOR),
+			('Ticks/s', f'{self.live_speed:,.0f}  x{self.live_speed / self.tick_rate:.0f}'),
+			Gauge('FPS', f'{fps:.0f}/{self.renderer.target_fps}', fps / max(1, self.renderer.target_fps)),
+		])
+		focus = Panel('Focus', [
+			('Agent', f'#{best}' + (' elite' if best < elite_count else '')),
+			('Fitness', f'{float(self.rewards[best]):.1f}'),
+			('Position', f'{int(world.x[best])}, {int(world.y[best])}'),
+			('Coins', f'{int(world.coins[best])}/{world.coin_count}'),
+		])
+
 		self.renderer.draw(best, self.rewards, Hud(
-			generation=self.generation,
-			tick=tick,
-			tick_rate=self.tick_rate,
-			checkpoint=(checkpoint_index + 1, checkpoint_count),
-			best_ever=self.best_fitness_ever,
-			best_time=self.best_time_ever,
-			elite_count=self.elite_count if self.generation > 1 else 0,
-			random_count=min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0,
-			coins=int(self.world.coins[best]),
-			best_coins=int(self.world.coins.max()) if self.population_size else 0,
-			coin_count=self.world.coin_count,
-			paused=self.paused,
-			speed=self.live_speed,
-			sim_speed=self.live_speed / self.tick_rate,
-			training=self.training_rows(),
-			history=self.fitness_history,
+			left=[run, focus],
+			right=[Panel('Training', self.training_rows())],
+			legend=Legend(TRAINING_LEGEND, self.renderer.key_hints(), ramp=True),
+			fitness=Fitness(self.rewards, self.fitness_history),
+			elite_count=elite_count,
+			random_count=random_count,
 		))
 
 	def evolve_generation(self) -> None:

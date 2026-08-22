@@ -17,12 +17,14 @@ from game.world import PLAYER_H, PLAYER_W, World
 
 type Color = tuple[int, int, int]
 type Blit = tuple[Surface, tuple[int, int]]
+type Row = tuple[str, str] | Gauge  # A plain label/value line, or one with a bar under it
 
 # Fitness ramp, walked from worst to best rank in the living population
 FITNESS_RAMP: Final[tuple[Color, ...]] = ((198, 40, 62), (226, 118, 38), (226, 196, 46), (128, 200, 60), (36, 190, 168))
 FITNESS_BUCKETS: Final[int] = 12
 DEAD_COLOR: Final[Color] = (176, 178, 188)
 WON_COLOR: Final[Color] = (58, 120, 246)
+HUMAN_COLOR: Final[Color] = (120, 232, 176)  # A human run has no rank to color by, so it gets its own fill
 ELITE_RING: Final[Color] = (240, 190, 60)
 RANDOM_RING: Final[Color] = (168, 92, 232)
 FOCUS_RING: Final[Color] = (24, 24, 30)
@@ -44,7 +46,11 @@ TITLE_SIZE: Final[int] = 14
 BODY_SIZE: Final[int] = 15
 SMALL_SIZE: Final[int] = 13
 LABEL_COLUMN: Final[int] = 116
+LEGEND_COLUMNS: Final[int] = 3
 HINT_COLUMNS: Final[int] = 2  # Key bindings are laid out side by side, one column would own the panel
+BANNER_SIZE: Final[int] = 30
+PANEL_WIDTH: Final[int] = 236
+LEGEND_WIDTH: Final[int] = 250
 HISTOGRAM_BINS: Final[int] = 18
 HISTORY_LENGTH: Final[int] = 80
 SPARKLINE_GUTTER: Final[int] = 34  # Room kept on the right of the curve for its scale labels
@@ -63,28 +69,52 @@ class Gauge:
 @dataclass(slots=True)
 class Panel:
 	title: str
-	rows: list[tuple[str, str] | Gauge] = field(default_factory=list)
+	rows: list[Row] = field(default_factory=list)
+	width: int = PANEL_WIDTH
+
+
+@dataclass(slots=True)
+class Legend:
+	"""Bottom-left panel: what the colors on the level mean, then the key bindings."""
+	entries: Sequence[tuple[Color, str]] = ()
+	hints: Sequence[tuple[str, str]] = ()
+	ramp: bool = False  # Whether the fitness gradient is worth explaining, which only a population run is
+
+
+@dataclass(slots=True)
+class Fitness:
+	"""Bottom-right panel: how the population is spread right now, next to its best score per generation."""
+	values: NDArray[np.float64]
+	history: Sequence[float] = ()
 
 
 @dataclass(slots=True)
 class Hud:
-	"""Everything the renderer cannot read off the World itself."""
-	generation: int = 1
-	tick: int = 0
-	tick_rate: int = 60
-	checkpoint: tuple[int, int] = (1, 1)
-	best_ever: float = 0.0
-	best_time: float = 0.0  # Fastest win in seconds, 0 while the flag has never been touched
-	coins: int = 0  # Coins banked by the focused agent
-	best_coins: int = 0
-	coin_count: int = 0  # Coins the map holds in total
-	paused: bool = False
+	"""
+	Everything drawn over the level.
+
+	The caller fills the panels because it is the only side that knows what its numbers mean; the renderer
+	only lays them out, so a training run and a human run share one overlay.
+	"""
+	left: list[Panel] = field(default_factory=list)  # Stacked down from the top left corner
+	right: list[Panel] = field(default_factory=list)  # Stacked down from the top right corner
+	legend: Legend | None = None
+	fitness: Fitness | None = None
+	banner: str = ''  # Centred message, drawn even with the panels hidden
 	elite_count: int = 0
 	random_count: int = 0
-	speed: float = 0.0  # Simulation ticks per real second
-	sim_speed: float = 1.0  # How many in-game seconds pass per real second
-	training: list[tuple[str, str]] = field(default_factory=list)
-	history: Sequence[float] = ()
+	solo: bool = False  # One human body instead of a ranked population
+
+
+TRAINING_LEGEND: Final[tuple[tuple[Color, str], ...]] = (
+	(ELITE_RING, 'Elite'), (RANDOM_RING, 'Random'), (FOCUS_RING, 'Focus'),
+	(JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'), (WON_COLOR, 'Won'),
+	(COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'),
+)
+PLAY_LEGEND: Final[tuple[tuple[Color, str], ...]] = (
+	(HUMAN_COLOR, 'You'), (JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'),
+	(WON_COLOR, 'Won'), (COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'),
+)
 
 
 def _shade(color: Color, factor: float) -> Color:
@@ -114,7 +144,7 @@ def _text(size: int, text: str, color: Color) -> Surface:
 	return _font(size).render(text, True, color)
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=32)
 def _panel_background(width: int, height: int) -> Surface:
 	surface = Surface((width, height), pygame.SRCALPHA)
 	pygame.draw.rect(surface, PANEL_BACKGROUND, Rect(0, 0, width, height), border_radius=6)
@@ -122,15 +152,15 @@ def _panel_background(width: int, height: int) -> Surface:
 	return surface
 
 
-@lru_cache(maxsize=FITNESS_BUCKETS * 9)  # Every (bucket, heading, state) sprite, so a full population never evicts one
+@lru_cache(maxsize=FITNESS_BUCKETS * 12)  # Every (bucket, heading, state) sprite, so a full population never evicts one
 def _body_sprite(bucket: int, direction: int, state: int) -> Surface:
 	"""
 	One player sprite: fill encodes the fitness rank, the stroke its state, the chevron its heading.
 
-	`state` is 0 alive, 1 dead, 2 won. The whole set is tiny and fully cached, so a frame only ever blits
-	pre-rendered surfaces instead of drawing shapes per player.
+	`state` is 0 alive, 1 dead, 2 won, 3 the human player. The whole set is tiny and fully cached, so a frame
+	only ever blits pre-rendered surfaces instead of drawing shapes per player.
 	"""
-	fill = (DEAD_COLOR, WON_COLOR)[state - 1] if state else _bucket_color(bucket)
+	fill = (DEAD_COLOR, WON_COLOR, HUMAN_COLOR)[state - 1] if state else _bucket_color(bucket)
 	surface = Surface((PLAYER_W, PLAYER_H), pygame.SRCALPHA)
 	body = Rect(0, 0, PLAYER_W, PLAYER_H)
 	pygame.draw.rect(surface, fill, body, border_radius=3)
@@ -251,6 +281,10 @@ class Renderer:
 	def add_key_action(self, key: int, action: Callable[[], None], description: str = '') -> None:
 		self.key_actions[key] = (action, description)
 
+	def key_hints(self) -> list[tuple[str, str]]:
+		"""The described bindings, as the legend prints them: an empty description hides a binding."""
+		return [(pygame.key.name(key).upper(), description) for key, (_, description) in self.key_actions.items() if description]
+
 	def toggle_hud(self) -> None:
 		self.show_hud = not self.show_hud
 
@@ -268,7 +302,9 @@ class Renderer:
 		self._draw_coins(focus_index)
 		self._draw_players(focus_index, fitness, hud)
 		if self.show_hud:
-			self._draw_hud(focus_index, fitness, hud)
+			self._draw_hud(hud)
+		if hud.banner:
+			self._draw_banner(hud.banner)
 		pygame.display.flip()
 		# Under vsync the flip already paces the loop; capping on top of it would make us miss every other frame
 		self.clock.tick(0 if self.vsync else self.target_fps)
@@ -315,6 +351,8 @@ class Renderer:
 		# Read as python lists: pulling 300 values out of an array one index at a time costs more than the loop
 		buckets = self._fitness_buckets(fitness).tolist()
 		states = (world.dead.astype(np.int64) + world.win.astype(np.int64) * 2).tolist()
+		# A human body has no rank to be colored by, so its alive state points at the player fill instead
+		fills = [state or 3 for state in states] if hud.solo else states
 		directions = np.sign(world.change_x).astype(np.int64).tolist()
 		rising = (world.change_y < 0).tolist()
 		screen_x = screen_x.tolist()
@@ -331,51 +369,44 @@ class Renderer:
 		for index in np.flatnonzero(visible).tolist():
 			x, y = screen_x[index], screen_y[index]
 			state = states[index]
-			bodies.append((_body_sprite(buckets[index], directions[index], state), (x, y)))
+			bodies.append((_body_sprite(buckets[index], directions[index], fills[index]), (x, y)))
 			if state == 0 and rising[index]:
 				markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
 			if index < hud.elite_count:
 				markers.append((elite_ring, (x - 4, y - 4)))
 			elif index >= random_start:
 				markers.append((random_ring, (x - 4, y - 4)))
-			if index == focus_index:
+			if index == focus_index and not hud.solo:
 				markers.append((focus_ring, (x - 7, y - 7)))
 
 		self.screen.blits(bodies, doreturn=False)
 		if markers:
 			self.screen.blits(markers, doreturn=False)
 
-	def _draw_hud(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
-		world = self.world
-		alive = int(world.alive().sum())
-		checkpoint, checkpoints = hud.checkpoint
-		fps = self.measured_fps()
+	def _draw_hud(self, hud: Hud) -> None:
+		"""Stacks the panels down both top corners, then places the two fixed-corner ones under them."""
+		y = MARGIN
+		for panel in hud.left:
+			self._draw_panel(panel, MARGIN, y, panel.width)
+			y += self._panel_height(panel) + MARGIN
 
-		run = Panel('Run', [
-			('Generation', f'{hud.generation}'),
-			('Time', f'{hud.tick / max(1, hud.tick_rate):.1f}s'
-				+ (f'  ckpt {checkpoint}/{checkpoints}' if checkpoints > 1 else '')
-				+ ('  PAUSED' if hud.paused else '')),
-			Gauge('Alive', f'{alive}/{world.count}', alive / max(1, world.count)),
-			('Best', f'{float(fitness.max()) if fitness.size else 0.0:.1f}'),
-			('Record', f'{hud.best_ever:.1f}' + (f'  {hud.best_time:.2f}s' if hud.best_time > 0 else '')),
-			Gauge('Coins', f'{hud.best_coins}/{hud.coin_count}', hud.best_coins / max(1, hud.coin_count), COIN_COLOR),
-			('Ticks/s', f'{hud.speed:,.0f}  x{hud.sim_speed:.0f}'),
-			Gauge('FPS', f'{fps:.0f}/{self.target_fps}', fps / max(1, self.target_fps)),
-		])
-		focus = Panel('Focus', [
-			('Agent', f'#{focus_index}' + (' elite' if focus_index < hud.elite_count else '')),
-			('Fitness', f'{float(fitness[focus_index]):.1f}'),
-			('Position', f'{int(world.x[focus_index])}, {int(world.y[focus_index])}'),
-			('Coins', f'{hud.coins}/{hud.coin_count}'),
-		])
+		y = MARGIN
+		for panel in hud.right:
+			self._draw_panel(panel, SCREEN_WIDTH - MARGIN - panel.width, y, panel.width)
+			y += self._panel_height(panel) + MARGIN
 
-		width, right_width = 236, 236
-		self._draw_panel(run, MARGIN, MARGIN, width)
-		self._draw_panel(focus, MARGIN, MARGIN + self._panel_height(run) + MARGIN, width)
-		self._draw_panel(Panel('Training', list(hud.training)), SCREEN_WIDTH - MARGIN - right_width, MARGIN, right_width)
-		self._draw_fitness_panel(fitness, hud)
-		self._draw_legend()
+		if hud.fitness is not None:
+			self._draw_fitness_panel(hud.fitness)
+		if hud.legend is not None:
+			self._draw_legend(hud.legend)
+
+	def _draw_banner(self, text: str) -> None:
+		"""A centred message near the top, used for the end of a run: it reads without pulling the eye off the player."""
+		label = _text(BANNER_SIZE, text, VALUE_COLOR)
+		width, height = label.get_width() + 4 * PADDING, label.get_height() + 2 * PADDING
+		x, y = (SCREEN_WIDTH - width) // 2, MARGIN * 5
+		self.screen.blit(_panel_background(width, height), (x, y))
+		self.screen.blit(label, (x + 2 * PADDING, y + PADDING))
 
 	@staticmethod
 	def _panel_height(panel: Panel) -> int:
@@ -403,7 +434,7 @@ class Renderer:
 				pygame.draw.rect(self.screen, row.color, bar)
 			row_y += GAUGE_HEIGHT
 
-	def _draw_fitness_panel(self, fitness: NDArray[np.float64], hud: Hud) -> None:
+	def _draw_fitness_panel(self, fitness: Fitness) -> None:
 		width, height = 300, 196
 		x = SCREEN_WIDTH - MARGIN - width
 		y = SCREEN_HEIGHT - MARGIN - height
@@ -412,12 +443,12 @@ class Renderer:
 		self.screen.blit(_text(SMALL_SIZE, 'Population Spread', LABEL_COLOR), (x + PADDING, y + PADDING + ROW_HEIGHT))
 
 		plot = Rect(x + PADDING, y + PADDING + 2 * ROW_HEIGHT + 2, width - 2 * PADDING, 56)
-		self._draw_histogram(plot, fitness)
+		self._draw_histogram(plot, fitness.values)
 
 		self.screen.blit(_text(SMALL_SIZE, 'Best Per Generation', LABEL_COLOR), (x + PADDING, plot.bottom + ROW_HEIGHT))
 		# The right gutter holds the scale labels, so they never sit on top of the curve
 		sparkline = Rect(x + PADDING, plot.bottom + 2 * ROW_HEIGHT + 6, width - 2 * PADDING - SPARKLINE_GUTTER, 38)
-		self._draw_sparkline(sparkline, hud.history)
+		self._draw_sparkline(sparkline, fitness.history)
 
 	def _draw_histogram(self, plot: Rect, fitness: NDArray[np.float64]) -> None:
 		"""Population fitness distribution, each bar tinted with the ramp used on the players themselves."""
@@ -455,45 +486,45 @@ class Renderer:
 		self.screen.blit(_text(SMALL_SIZE, f'{high:.0f}', VALUE_COLOR), (plot.right + 5, plot.top - 3))
 		self.screen.blit(_text(SMALL_SIZE, f'{low:.0f}', LABEL_COLOR), (plot.right + 5, plot.bottom - 13))
 
-	def _draw_legend(self) -> None:
-		"""Bottom-left: what the shapes and colors on the players mean, plus the key bindings."""
-		entries = [
-			(ELITE_RING, 'Elite'), (RANDOM_RING, 'Random'), (FOCUS_RING, 'Focus'),
-			(JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'), (WON_COLOR, 'Won'),
-			(COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'),
-		]
-		swatch_rows = (len(entries) + 2) // 3
-		hints = [(key, description) for key, (_, description) in self.key_actions.items() if description]
-		hint_rows = (len(hints) + HINT_COLUMNS - 1) // HINT_COLUMNS
-		width = 250
-		height = PADDING * 2 + ROW_HEIGHT * (2 + swatch_rows + hint_rows) + 12
+	@staticmethod
+	def _legend_height(legend: Legend) -> int:
+		swatch_rows = (len(legend.entries) + LEGEND_COLUMNS - 1) // LEGEND_COLUMNS
+		hint_rows = (len(legend.hints) + HINT_COLUMNS - 1) // HINT_COLUMNS
+		rows = 1 + swatch_rows + hint_rows + legend.ramp
+		return PADDING * 2 + ROW_HEIGHT * rows + (12 if legend.ramp else 4)
+
+	def _draw_legend(self, legend: Legend) -> None:
+		"""Bottom-left: what the colors on the level mean, plus the key bindings."""
+		width = LEGEND_WIDTH
+		height = self._legend_height(legend)
 		x, y = MARGIN, SCREEN_HEIGHT - MARGIN - height
 		self.screen.blit(_panel_background(width, height), (x, y))
 		self.screen.blit(_text(TITLE_SIZE, 'Legend', TITLE_COLOR), (x + PADDING, y + PADDING))
 
-		ramp = Rect(x + PADDING, y + PADDING + ROW_HEIGHT + 4, width - 2 * PADDING, 6)
-		slice_width = ramp.width / FITNESS_BUCKETS
-		for bucket in range(FITNESS_BUCKETS):
-			piece = Rect(int(ramp.left + bucket * slice_width), ramp.top, int(slice_width) + 1, ramp.height)
-			pygame.draw.rect(self.screen, _bucket_color(bucket), piece)
-		self.screen.blit(_text(SMALL_SIZE, 'Fitness Low', LABEL_COLOR), (x + PADDING, ramp.bottom + 2))
-		high = _text(SMALL_SIZE, 'High', LABEL_COLOR)
-		self.screen.blit(high, (ramp.right - high.get_width(), ramp.bottom + 2))
+		row_y = y + PADDING + ROW_HEIGHT + 4
+		if legend.ramp:
+			ramp = Rect(x + PADDING, row_y, width - 2 * PADDING, 6)
+			slice_width = ramp.width / FITNESS_BUCKETS
+			for bucket in range(FITNESS_BUCKETS):
+				piece = Rect(int(ramp.left + bucket * slice_width), ramp.top, int(slice_width) + 1, ramp.height)
+				pygame.draw.rect(self.screen, _bucket_color(bucket), piece)
+			self.screen.blit(_text(SMALL_SIZE, 'Fitness Low', LABEL_COLOR), (x + PADDING, ramp.bottom + 2))
+			high = _text(SMALL_SIZE, 'High', LABEL_COLOR)
+			self.screen.blit(high, (ramp.right - high.get_width(), ramp.bottom + 2))
+			row_y = ramp.bottom + ROW_HEIGHT + 2
 
-		row_y = ramp.bottom + ROW_HEIGHT + 2
-		for index, (color, label) in enumerate(entries):
-			column = x + PADDING + (index % 3) * 78
-			if index and index % 3 == 0:
+		for index, (color, label) in enumerate(legend.entries):
+			if index and index % LEGEND_COLUMNS == 0:
 				row_y += ROW_HEIGHT
+			column = x + PADDING + (index % LEGEND_COLUMNS) * (width - 2 * PADDING) // LEGEND_COLUMNS
 			pygame.draw.rect(self.screen, color, Rect(column, row_y + 3, 8, 8), border_radius=2)
 			self.screen.blit(_text(SMALL_SIZE, label, LABEL_COLOR), (column + 13, row_y))
 
 		row_y += ROW_HEIGHT
-		for index, (key, description) in enumerate(hints):
+		for index, (name, description) in enumerate(legend.hints):
 			if index and index % HINT_COLUMNS == 0:
 				row_y += ROW_HEIGHT
 			column = x + PADDING + (index % HINT_COLUMNS) * (width - 2 * PADDING) // HINT_COLUMNS
-			name = pygame.key.name(key).upper()
 			self.screen.blit(_text(SMALL_SIZE, f'{name:<5} {description}', LABEL_COLOR), (column, row_y))
 
 	@staticmethod
