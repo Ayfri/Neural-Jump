@@ -26,6 +26,10 @@ MAX_FALL_SPEED: Final[float] = 20.0  # Normalisation divisor for the vertical sp
 ON_GROUND_SPEED: Final[float] = 2.0  # Vertical speed under which the player counts as grounded
 DEATH_ROW_MARGIN: Final[int] = 2  # Rows above the bottom of the map that kill the player
 GRID_PADDING: Final[int] = 32  # Air border baked around the grids so lookups never need bounds checks
+GRID_ORIGIN: Final[int] = GRID_PADDING * TILE_SIZE  # Pixels the padding adds to a tile coordinate
+
+MOVE_SPEEDS: Final[NDArray[np.float64]] = np.zeros(3)  # Horizontal speed per action, jumping keeps the current one
+MOVE_SPEEDS[[MOVE_LEFT, MOVE_RIGHT]] = (-PLAYER_SPEED, PLAYER_SPEED)
 
 
 def search_maps_folder(folder: str) -> str:
@@ -44,6 +48,11 @@ def resolve_map_path(map_path: str) -> str:
 	"""Resolves a map path like 'maps/level_1.txt' to an absolute path."""
 	folder = search_maps_folder(os.path.dirname(map_path))
 	return folder + os.sep + os.path.basename(map_path)
+
+
+def tile_of(values: NDArray[np.float64]) -> NDArray[np.int64]:
+	"""Tile index of a pixel coordinate, dividing then flooring: `np.floor_divide` on floats costs twice as much."""
+	return np.floor(values / TILE_SIZE).astype(np.int64)
 
 
 class World:
@@ -71,6 +80,8 @@ class World:
 
 		self._observation = np.zeros((count, OBSERVATION_SIZE), dtype=OBSERVATION_DTYPE)
 		self._offsets = np.arange(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1)
+		self._box = np.zeros((4, count), dtype=np.float64)  # Scratch the collision passes rebuild every call
+		self._cell_limits = np.array([[self._max_row], [self._max_row], [self._max_column], [self._max_column]])
 
 	def _load_map(self, map_path: str) -> None:
 		with open(resolve_map_path(map_path)) as file:
@@ -112,6 +123,16 @@ class World:
 		], axis=-1).astype(OBSERVATION_DTYPE)
 		self._max_row = self.height + 2 * GRID_PADDING - 1
 		self._max_column = self.width + 2 * GRID_PADDING - 1
+		# Collision lookups index these flat views: `take` on one flat array beats a broadcast fancy index
+		self._padded_width = self.width + 2 * GRID_PADDING
+		self._flat_solid = self.padded_solid.ravel()
+		self._flat_reward = self.padded_reward.ravel()
+		# True where any of the 2x2 tiles from (row, column) carries a reward: one lookup then skips the whole pass
+		rewarding = self.padded_reward != 0
+		near_reward = rewarding.copy()
+		near_reward[:-1] |= rewarding[1:]
+		near_reward[:, :-1] |= near_reward[:, 1:].copy()
+		self._flat_near_reward = near_reward.ravel()
 
 		# Every 7x7x4 window of the map, flattened and baked once: an observation is then a single gather of
 		# contiguous rows instead of a broadcast fancy index rebuilt per tick.
@@ -138,21 +159,31 @@ class World:
 	def kill(self, mask: NDArray[np.bool_]) -> None:
 		self.dead |= mask
 
-	def _tile_columns(self) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-		left = np.floor_divide(self.x, TILE_SIZE).astype(np.int64)
-		right = np.floor_divide(self.x + PLAYER_W - 1, TILE_SIZE).astype(np.int64)
-		return left, right
+	def _cells(self, y: NDArray[np.float64]) -> NDArray[np.int64]:
+		"""
+		The four tiles the player box touches at (x, y): top row, bottom row, left column, right column.
 
-	def _tile_rows(self, y: NDArray[np.float64]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-		top = np.floor_divide(y - self.offset_y, TILE_SIZE).astype(np.int64)
-		bottom = np.floor_divide(y + PLAYER_H - 1 - self.offset_y, TILE_SIZE).astype(np.int64)
-		return top, bottom
+		They come back as one (4, count) block of padded grid coordinates, built in a handful of numpy calls
+		over the whole block, because on 300 players a call costs far more than the arithmetic inside it.
+		Coordinates are clamped into the air border, which only ever moves a player already off the map.
+		"""
+		# The padding is added here in pixels, so the coordinates come out of the floor already padded
+		box = self._box
+		np.subtract(y, self.offset_y - GRID_ORIGIN, out=box[0])
+		np.add(box[0], PLAYER_H - 1, out=box[1])
+		np.add(self.x, GRID_ORIGIN, out=box[2])
+		np.add(box[2], PLAYER_W - 1, out=box[3])
 
-	def _gather(self, padded_grid: NDArray[np.bool_] | NDArray[np.float32], rows: NDArray[np.int64], columns: NDArray[np.int64]) -> NDArray[np.bool_] | NDArray[np.float32]:
-		"""Gathers padded_grid at every (row, column) pair, so a 2x(2) index pair returns a (2, 2, count) block."""
-		row_index = np.clip(rows + GRID_PADDING, 0, self._max_row)
-		column_index = np.clip(columns + GRID_PADDING, 0, self._max_column)
-		return padded_grid[row_index[:, None, :], column_index[None, :, :]]
+		np.divide(box, TILE_SIZE, out=box)
+		np.floor(box, out=box)
+		cells = box.astype(np.int64)
+		np.maximum(cells, 0, out=cells)
+		np.minimum(cells, self._cell_limits, out=cells)
+		return cells
+
+	def _row_offsets(self, cells: NDArray[np.int64]) -> NDArray[np.int64]:
+		"""The two rows of a `_cells` block as offsets into the flat padded grid."""
+		return cells[:2] * self._padded_width
 
 	def on_ground(self) -> NDArray[np.bool_]:
 		"""Players whose vertical speed is small enough to count as standing on something."""
@@ -165,8 +196,8 @@ class World:
 		player's own speed and ground state.
 		"""
 		target = self._observation if out is None else out
-		tile_x = np.floor_divide(self.x + PLAYER_W / 2, TILE_SIZE).astype(np.int64)
-		tile_y = np.floor_divide(self.y + PLAYER_H / 2 - self.offset_y, TILE_SIZE).astype(np.int64)
+		tile_x = tile_of(self.x + PLAYER_W / 2)
+		tile_y = tile_of(self.y + (PLAYER_H / 2 - self.offset_y))
 
 		# The window table is indexed by its top-left corner, so the centre clamp becomes a corner clamp
 		rows = np.clip(tile_y + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self._max_window_row)
@@ -184,8 +215,8 @@ class World:
 		"""Applies one action per player then advances the physics by one tick."""
 		alive = self.alive()
 
-		np.copyto(self.change_x, -PLAYER_SPEED, where=alive & (actions == MOVE_LEFT))
-		np.copyto(self.change_x, PLAYER_SPEED, where=alive & (actions == MOVE_RIGHT))
+		# One table lookup instead of a mask per direction; jumping leaves the horizontal speed alone
+		np.copyto(self.change_x, MOVE_SPEEDS[actions], where=alive & (actions != MOVE_JUMP))
 		self._jump(alive & (actions == MOVE_JUMP))
 
 		# Falling players accelerate, resting ones get the initial nudge that unsticks them from the floor
@@ -209,60 +240,62 @@ class World:
 	def _jump(self, mask: NDArray[np.bool_]) -> None:
 		if not mask.any():
 			return
-		left, right = self._tile_columns()
-		_, bottom = self._tile_rows(self.y + 2.0)
-		block = self._gather(self.padded_solid, np.stack([bottom, bottom]), np.stack([left, right]))
-		grounded = block[0, 0] | block[0, 1]
+		cells = self._cells(self.y + 2.0)
+		row = cells[1] * self._padded_width
+		solid = self._flat_solid
+		grounded = np.take(solid, row + cells[2]) | np.take(solid, row + cells[3])
 		np.copyto(self.change_y, PLAYER_JUMP_STRENGTH, where=mask & grounded)
 
 	def _resolve_horizontal(self, alive: NDArray[np.bool_]) -> None:
-		left, right = self._tile_columns()
-		top, bottom = self._tile_rows(self.y)
-		two_rows = bottom > top
-		two_columns = right > left
+		cells = self._cells(self.y)
+		rows = self._row_offsets(cells)
+		left, right = cells[2], cells[3]
 
-		block = self._gather(self.padded_solid, np.stack([top, bottom]), np.stack([left, right]))
-		hit_left = block[0, 0] | (block[1, 0] & two_rows)
-		hit_right = (block[0, 1] | (block[1, 1] & two_rows)) & two_columns
+		# A player one row tall gathers the same row twice, so the two rows can be OR'd without a guard
+		solid = self._flat_solid
+		hit_left = np.take(solid, rows[0] + left) | np.take(solid, rows[1] + left)
+		hit_right = (np.take(solid, rows[0] + right) | np.take(solid, rows[1] + right)) & (right > left)
 
+		# The blocking column and the side of the player touching it are one select each way
 		going_right = self.change_x > 0
-		going_left = self.change_x < 0
-		x = self.x
-		x = np.where(going_right & hit_right, right * TILE_SIZE - PLAYER_W, x)
-		x = np.where(going_right & hit_left & ~hit_right, left * TILE_SIZE - PLAYER_W, x)
-		x = np.where(going_left & hit_left, (left + 1) * TILE_SIZE, x)
-		x = np.where(going_left & hit_right & ~hit_left, (right + 1) * TILE_SIZE, x)
-		np.copyto(self.x, x, where=alive)
+		column = np.where(going_right, np.where(hit_right, right, left), np.where(hit_left, left, right))
+		snapped = column * TILE_SIZE + np.where(going_right, -PLAYER_W - GRID_ORIGIN, TILE_SIZE - GRID_ORIGIN)
+		np.copyto(self.x, snapped, where=alive & (hit_left | hit_right) & (self.change_x != 0))
 
 	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
 		"""Resolves the vertical move and hands back the tile columns, which the reward pass reuses as is."""
-		left, right = self._tile_columns()
-		top, bottom = self._tile_rows(self.y)
-		two_rows = bottom > top
-		two_columns = right > left
+		cells = self._cells(self.y)
+		rows = self._row_offsets(cells)
+		top, bottom = cells[0], cells[1]
+		left, right = cells[2], cells[3]
 
-		block = self._gather(self.padded_solid, np.stack([top, bottom]), np.stack([left, right]))
-		hit_top = block[0, 0] | (block[0, 1] & two_columns)
-		hit_bottom = (block[1, 0] | (block[1, 1] & two_columns)) & two_rows
+		# A player one column wide gathers the same column twice, so the two columns can be OR'd without a guard
+		solid = self._flat_solid
+		hit_top = np.take(solid, rows[0] + left) | np.take(solid, rows[0] + right)
+		hit_bottom = (np.take(solid, rows[1] + left) | np.take(solid, rows[1] + right)) & (bottom > top)
 
 		going_down = self.change_y > 0
-		going_up = self.change_y < 0
-		y = self.y
-		y = np.where(going_down & hit_bottom, bottom * TILE_SIZE + self.offset_y - PLAYER_H, y)
-		y = np.where(going_down & hit_top & ~hit_bottom, top * TILE_SIZE + self.offset_y - PLAYER_H, y)
-		y = np.where(going_up & hit_top, (top + 1) * TILE_SIZE + self.offset_y, y)
-		y = np.where(going_up & hit_bottom & ~hit_top, (bottom + 1) * TILE_SIZE + self.offset_y, y)
+		row = np.where(going_down, np.where(hit_bottom, bottom, top), np.where(hit_top, top, bottom))
+		snapped = row * TILE_SIZE + (self.offset_y - GRID_ORIGIN) + np.where(going_down, -PLAYER_H, TILE_SIZE)
 
-		blocked = (going_down | going_up) & (hit_top | hit_bottom)
-		np.copyto(self.y, y, where=alive)
-		np.copyto(self.change_y, 0.0, where=alive & blocked)
+		blocked = alive & (hit_top | hit_bottom) & (self.change_y != 0)
+		np.copyto(self.y, snapped, where=blocked)
+		np.copyto(self.change_y, 0.0, where=blocked)
 		return left, right
 
 	def _collect_rewards(self, alive: NDArray[np.bool_], tick: int, columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
 		left, right = columns
-		top, bottom = self._tile_rows(self.y)
-		values = self._gather(self.padded_reward, np.stack([top, bottom]), np.stack([left, right]))
-		best = values.reshape(4, -1).max(axis=0)
+		rows = self._row_offsets(self._cells(self.y))
+
+		# Reward tiles are rare, so the whole gather is skipped unless someone actually stands next to one
+		if not np.take(self._flat_near_reward, rows[0] + left).any():
+			return
+
+		values = self._flat_reward
+		best = np.maximum(
+			np.maximum(np.take(values, rows[0] + left), np.take(values, rows[0] + right)),
+			np.maximum(np.take(values, rows[1] + left), np.take(values, rows[1] + right)),
+		)
 
 		touched = alive & (best != 0)
 		np.copyto(self.finished_reward, best, where=touched)
