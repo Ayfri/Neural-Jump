@@ -85,8 +85,8 @@ class Population:
 		self.actions: NDArray[np.int64] = self._host_actions.numpy()
 
 		self._pending: Tensor | None = None  # Result of a pass run eagerly, where no graph could be captured
-		self._graphs: dict[bool, tuple[torch.cuda.CUDAGraph, Tensor]] = {}
-		self._capture_graphs()
+		self._graph: tuple[torch.cuda.CUDAGraph, Tensor] | None = None
+		self._capture_graph()
 
 	def parameters(self) -> list[Tensor]:
 		return [*self.weights.values(), *self.biases.values()]
@@ -120,21 +120,16 @@ class Population:
 		return self._linear(x, 'actor')
 
 	@torch.no_grad()
-	def _sample(self, observations: Tensor, deterministic: bool = False) -> Tensor:
-		logits = self.forward(observations).squeeze(1)
-		if deterministic:
-			return logits.argmax(dim=-1)
-		# Gumbel-max: argmax(logits + Gumbel noise) samples exactly like softmax + multinomial, in fewer kernels
-		gumbel = -torch.empty_like(logits).exponential_().log()
-		return (logits + gumbel).argmax(dim=-1)
+	def _greedy(self, observations: Tensor) -> Tensor:
+		return self.forward(observations).squeeze(1).argmax(dim=-1)
 
-	def _capture_graphs(self) -> None:
+	def _capture_graph(self) -> None:
 		"""
-		Captures both action passes as CUDA graphs, one for the argmax and one for the sampled policy.
+		Captures the action pass as a CUDA graph.
 
 		One tick is a few dozen tiny kernels, so the pass is bound by launch latency rather than by maths.
 		Replaying a captured graph collapses those launches into one, and the shapes never change here.
-		The weights are updated in place by evolution, so the graphs keep reading the current values.
+		The weights are updated in place by evolution, so the graph keeps reading the current values.
 		"""
 		if self.device.type != 'cuda':
 			return
@@ -144,38 +139,35 @@ class Population:
 			warmup.wait_stream(torch.cuda.current_stream())
 			with torch.cuda.stream(warmup):
 				for _ in range(3):
-					self._sample(self._graph_input, True)
-					self._sample(self._graph_input, False)
+					self._greedy(self._graph_input)
 			torch.cuda.current_stream().wait_stream(warmup)
 
-			for deterministic in (True, False):
-				graph = torch.cuda.CUDAGraph()
-				with torch.cuda.graph(graph):
-					self._graphs[deterministic] = (graph, self._sample(self._graph_input, deterministic))
+			graph = torch.cuda.CUDAGraph()
+			with torch.cuda.graph(graph):
+				self._graph = (graph, self._greedy(self._graph_input))
 		except RuntimeError as error:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
-			self._graphs.clear()
+			self._graph = None
 
-	def act(self, deterministic: bool = False) -> NDArray[np.int64]:
-		"""Picks one action per agent from the observations staged in `self.observations`, the argmax unless cleared."""
-		self.submit(deterministic)
+	def act(self) -> NDArray[np.int64]:
+		"""Picks one action per agent from the observations staged in `self.observations`."""
+		self.submit()
 		return self.collect()
 
-	def submit(self, deterministic: bool = False) -> None:
+	def submit(self) -> None:
 		"""
 		Starts the pass over the staged observations and returns before it lands.
 
 		Waiting for the device is most of what a decision costs, so the caller starts the pass one tick
 		early and spends that tick on physics instead. Nothing reads the staging buffers until `collect`.
 		"""
-		captured = self._graphs.get(deterministic)
-		if captured is None:
+		if self._graph is None:
 			# Half precision observations halve the transfer; the widening happens on the device
 			batch = self._host_observations.to(self.device, self.dtype, non_blocking=True)
-			self._pending = self._sample(batch, deterministic)
+			self._pending = self._greedy(batch)
 			return
 
-		graph, output = captured
+		graph, output = self._graph
 		self._graph_input.copy_(self._host_observations, non_blocking=True)
 		graph.replay()
 		self._host_actions.copy_(output, non_blocking=True)

@@ -48,7 +48,6 @@ def build_parser() -> argparse.ArgumentParser:
 	evolution.add_argument('--elite-count', type=int, default=DEFAULT_ELITE_COUNT, help='agents carried over untouched and used as parents')
 	evolution.add_argument('--mutation-rate', type=float, default=DEFAULT_MUTATION_RATE, help="probability that a child's weight tensor is mutated at all")
 	evolution.add_argument('--mutation-strength', type=float, default=DEFAULT_MUTATION_STRENGTH, help='scale of the noise added to a mutated tensor')
-	evolution.add_argument('--sampled', dest='deterministic', action='store_false', default=True, help="sample actions instead of playing the argmax, which turns a generation's scores into a lottery")
 
 	network = parser.add_argument_group('network', 'Shape and placement of the policy')
 	network.add_argument('--hidden-sizes', type=int, nargs=3, default=list(DEFAULT_HIDDEN_SIZES), metavar=('N1', 'N2', 'N3'), help='sizes of the three hidden layers, smaller is faster and dumber')
@@ -87,7 +86,6 @@ def main() -> None:
 		elite_count=args.elite_count,
 		mutation_rate=args.mutation_rate,
 		mutation_strength=args.mutation_strength,
-		deterministic_actions=args.deterministic,
 		hidden_sizes=tuple(args.hidden_sizes),
 		device=args.device,
 		map_path=args.map,

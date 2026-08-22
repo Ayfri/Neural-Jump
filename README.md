@@ -29,7 +29,6 @@ works too, it is just slower.
 - `--elite-count N`: agents carried over untouched and used as parents (default: 4)
 - `--mutation-rate R`: probability that a child's weight tensor is mutated at all (default: 0.8)
 - `--mutation-strength S`: scale of the noise added to a mutated tensor (default: 0.008)
-- `--sampled`: sample actions instead of playing the argmax, which turns a generation's scores into a lottery
 
 *network* - shape and placement of the policy
 
@@ -84,7 +83,6 @@ best score of every generation so far.
 | `1` | Back to speed x1 |
 | `M` | Speed `max`, which tunes itself to the framerate |
 | `-` / `=` | Halve or double the speed, also on the numpad. From `max` it starts at the multiplier it had reached |
-| `A` | Switch the policy between argmax and sampled |
 | `G` | Skip to the next spawn point |
 | `S` | End the generation now and breed from what it scored |
 | `R` | Start the whole run over: random weights, generation 1, records cleared |
@@ -128,11 +126,15 @@ generation ends sooner.
 
 ## Why the argmax
 
-Sampling from the policy makes fitness a lottery: the same weights replayed a hundred times score anywhere
-from 40 to 730, mean 207, standard deviation 130. Selection then picks whoever drew the luckiest samples,
-that agent regresses to its mean next generation, and the best fitness saws up and down instead of climbing.
-The argmax removes the variance entirely: elites re-score exactly what earned them their rank, and the best
-fitness becomes a monotonic staircase. `--sampled` restores the lottery.
+The policy always plays the argmax of its logits. Sampling from it instead makes fitness a lottery: the same
+weights replayed a hundred times score anywhere from 40 to 730, mean 207, standard deviation 130. Selection
+then picks whoever drew the luckiest samples, that agent regresses to its mean next generation, and the best
+fitness saws up and down instead of climbing. The argmax has no variance: elites re-score exactly what earned
+them their rank, and the best fitness becomes a monotonic staircase.
+
+Nothing is lost by dropping the noise. Exploration here comes from mutating weights, not from mutating
+actions, and there is no policy gradient to feed a sampled action back into. Only the ordering of the logits
+is ever read, so their spread is never shaped into a distribution worth sampling from.
 
 ## Picking the mutation strength
 
@@ -180,8 +182,8 @@ page-locked buffer the device copies from, so a tick crosses PCIe once each way 
 between.
 
 **The forward pass is one graph replay.** A pass is a few dozen tiny kernels, so it is bound by launch
-latency: both action passes, argmax and sampled, are captured as CUDA graphs, which is about 3x faster than
-launching them one by one, and the capture falls back to eager mode if the device cannot do it. The network
+latency: the action pass is captured as a CUDA graph, which is about 3x faster than launching its kernels one
+by one, and the capture falls back to eager mode if the device cannot do it. The network
 runs in half precision, which nearly halves the pass and costs nothing when only the argmax is read.
 
 **The device works while the CPU does.** Waiting on the device is most of what a decision costs, so a pass is

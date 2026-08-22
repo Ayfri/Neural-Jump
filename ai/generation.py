@@ -71,7 +71,6 @@ class Generation:
 		elite_count: int = DEFAULT_ELITE_COUNT,
 		mutation_rate: float = DEFAULT_MUTATION_RATE,
 		mutation_strength: float = DEFAULT_MUTATION_STRENGTH,
-		deterministic_actions: bool = True,
 		# Network
 		hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES,
 		device: str = 'auto',
@@ -93,9 +92,6 @@ class Generation:
 		self.elite_count = min(elite_count, population_size)
 		self.mutation_rate = mutation_rate
 		self.mutation_strength = mutation_strength
-		# Sampling makes the measured fitness a lottery, which is fatal to selection, so the population
-		# plays its argmax and an elite re-scores exactly what it scored before
-		self.deterministic_actions = deterministic_actions
 
 		self.map_path = map_path
 		self.episode_seconds = episode_seconds
@@ -155,7 +151,6 @@ class Generation:
 				(pygame.K_m, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
 				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), 'Slower'),
 				(pygame.K_EQUALS, lambda: self.scale_speed(SPEED_STEP), 'Faster'),
-				(pygame.K_a, self.toggle_sampling, 'Actions'),
 				(pygame.K_g, self.skip_checkpoint, 'Skip ckpt'),
 				(pygame.K_s, self.stop_generation, 'Stop gen'),
 				(pygame.K_r, self.restart_run, 'Restart'),
@@ -176,9 +171,6 @@ class Generation:
 
 	def toggle_pause(self) -> None:
 		self.paused = not self.paused
-
-	def toggle_sampling(self) -> None:
-		self.deterministic_actions = not self.deterministic_actions
 
 	def set_speed(self, speed: float | str) -> None:
 		"""Switches between a fixed multiplier and `max`, the mode that tunes itself to the framerate."""
@@ -325,7 +317,7 @@ class Generation:
 	def decide(self) -> None:
 		"""Stages the current observations and starts the pass whose actions the next window plays."""
 		self.world.observe(self.population.observations)
-		self.population.submit(self.deterministic_actions)
+		self.population.submit()
 
 	def _adapt_ticks_per_frame(self) -> None:
 		"""
@@ -435,7 +427,6 @@ class Generation:
 		]
 		return [
 			*rows,
-			('Actions', 'argmax' if self.deterministic_actions else 'sampled'),
 			('Act Repeat', f'{self.action_repeat}'),
 			('Speed', MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),
 		]
