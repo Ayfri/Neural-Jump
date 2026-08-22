@@ -89,6 +89,9 @@ Training is headless by default and runs as fast as the machine allows. `--show-
 - `--mutation-strength S`: Scale of mutations (default: 0.03)
 - `--hidden-sizes N N N`: Sizes of the three shared hidden layers (default: 256 128 64), smaller is faster and dumber
 - `--no-use-a2c`: Disable PPO and evolve with the genetic algorithm only
+- `--deterministic` / `--sampled`: Play the policy's argmax, or sample from it. Argmax is the default without
+  PPO and makes a generation's scores repeatable; sampling is the default with PPO, which needs it to learn
+- `--seed N`: Seed python, numpy and torch so a run replays exactly
 - `--action-repeat N`: Physics ticks a chosen action is held for (default: 2)
 - `--learning-rate R`: Adam learning rate (default: 0.0003)
 - `--gamma G`: Discount factor per decision, not per tick (default: 0.98)
@@ -235,6 +238,14 @@ was also the population's main source of exploration, so `--mutation-strength` c
 to 0.03 rather than 0.015.
 
 `--no-use-a2c` keeps only the second half.
+
+### Why the action selection matters to the genetic algorithm
+
+Sampling from the policy makes an agent's measured fitness a lottery: the same weights replayed a hundred
+times score anywhere from 40 to 730, mean 207, standard deviation 130. Selection then picks whichever agent
+drew the luckiest samples, and next generation that agent regresses to its mean, so the best fitness saws up
+and down instead of climbing. Playing the argmax removes the variance entirely, elites re-score exactly, and
+the best fitness becomes a monotonic staircase. That is why `--deterministic` is the default without PPO.
 
 ### Reward System
 

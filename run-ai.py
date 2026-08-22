@@ -47,7 +47,10 @@ def main() -> None:
 	argparser.add_argument("--load-latest-generation-weights", action="store_true")
 	argparser.add_argument("--show-window", action="store_true")
 	argparser.add_argument("--checkpoints", action="store_true", help="Use checkpoints as spawn points")
-	argparser.add_argument("--no-use-a2c", dest="use_a2c", action="store_false", default=True, help="Disable A2C and use only genetic algorithm")
+	argparser.add_argument("--no-use-a2c", dest="use_a2c", action="store_false", default=True, help="Disable PPO and use only genetic algorithm")
+	argparser.add_argument("--deterministic", dest="deterministic", action="store_true", default=None, help="Play the policy's argmax, which makes a generation's scores repeatable (default without PPO)")
+	argparser.add_argument("--sampled", dest="deterministic", action="store_false", help="Sample actions from the policy, which PPO needs to learn (default with PPO)")
+	argparser.add_argument("--seed", type=int, default=None, help="Seed python, numpy and torch so a run replays exactly")
 	args = argparser.parse_args()
 
 	torch.set_num_threads(max(1, min(args.threads, os.cpu_count() or 1)))
@@ -63,6 +66,8 @@ def main() -> None:
 		show_window=args.show_window,
 		use_checkpoints=args.checkpoints,
 		use_a2c_learning=args.use_a2c,
+		deterministic_actions=args.deterministic,
+		seed=args.seed,
 		hidden_sizes=tuple(args.hidden_sizes),
 		device=args.device,
 		tick_rate=args.tick_rate,

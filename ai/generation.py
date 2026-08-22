@@ -8,7 +8,7 @@ import torch
 from numpy.typing import NDArray
 
 from ai.a2c_trainer import DEFAULT_EPOCHS, DEFAULT_GAMMA, DEFAULT_LEARNING_RATE, A2CTrainer, RolloutBuffer
-from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device
+from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
 from game.world import OBSERVATION_SIZE, World
 
 # Generation constants
@@ -61,6 +61,8 @@ class Generation:
 		show_window: bool = True,
 		use_checkpoints: bool = False,
 		use_a2c_learning: bool = True,
+		deterministic_actions: bool | None = None,
+		seed: int | None = None,
 		hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES,
 		device: str = 'auto',
 		tick_rate: int = DEFAULT_TICK_RATE,
@@ -80,6 +82,12 @@ class Generation:
 		self.show_window = show_window
 		self.use_checkpoints = use_checkpoints
 		self.use_a2c_learning = use_a2c_learning
+		# Sampling makes the measured fitness a lottery, which is fatal to selection; only the policy
+		# gradient actually needs it, so without A2C the population plays its argmax
+		self.deterministic_actions = (not use_a2c_learning) if deterministic_actions is None else deterministic_actions
+		self.seed = seed
+		if seed is not None:
+			seed_everything(seed)
 		self.tick_rate = tick_rate
 		self.episode_seconds = episode_seconds
 		self.action_repeat = max(1, action_repeat)
@@ -212,7 +220,7 @@ class Generation:
 		if tick % self.action_repeat == 0:
 			# The world writes straight into the rollout's row, so a recorded tick costs no extra copy
 			observations = self.world.observe(self.rollout.next_slot() if self.rollout is not None else None)
-			self._actions = self.population.act(observations)
+			self._actions = self.population.act(observations, self.deterministic_actions)
 			self._decision_alive = alive
 			self._window_rewards.fill(0.0)
 
@@ -318,10 +326,11 @@ class Generation:
 			('Device', str(self.population.device)),
 		]
 		if self.a2c_trainer is None:
-			return [*rows, ('Learning', 'Genetic')]
+			return [*rows, ('Learning', 'Genetic'), ('Actions', 'argmax' if self.deterministic_actions else 'sampled')]
 		return [
 			*rows,
 			('Learning', 'PPO + Genetic'),
+			('Actions', 'argmax' if self.deterministic_actions else 'sampled'),
 			('Learning Rate', f'{self.a2c_trainer.learning_rate:g}'),
 			('Gamma', f'{self.a2c_trainer.gamma:g}'),
 			('Entropy', f'{self.a2c_trainer.entropy_coef:.4f}'),

@@ -1,4 +1,5 @@
 import math
+import random
 from typing import Final
 
 import numpy as np
@@ -13,6 +14,15 @@ ACTION_COUNT: Final[int] = 3
 DEFAULT_HIDDEN_SIZES: Final[tuple[int, int, int]] = (256, 128, 64)
 CRITIC_HIDDEN_SIZE: Final[int] = 32
 LAYER_NORM_EPS: Final[float] = 1e-5
+
+
+def seed_everything(seed: int) -> None:
+	"""Seeds python, numpy and torch, on the host and on the device, so a run can be replayed exactly."""
+	random.seed(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	if torch.cuda.is_available():
+		torch.cuda.manual_seed_all(seed)
 
 
 def pick_device(name: str = 'auto') -> torch.device:
