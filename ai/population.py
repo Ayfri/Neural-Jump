@@ -150,6 +150,17 @@ class Population:
 
 		return self._sample(batch.float(), deterministic).cpu().numpy()
 
+	def snapshot(self, indices: Tensor) -> list[Tensor]:
+		"""Copies the given agents out of the population, in `parameters()` order."""
+		with torch.no_grad():
+			return [tensor[indices].clone() for tensor in self.parameters()]
+
+	def restore(self, snapshot: list[Tensor], start: int = 0) -> None:
+		"""Writes a snapshot back into `len(snapshot[0])` consecutive slots starting at `start`."""
+		with torch.no_grad():
+			for tensor, saved in zip(self.parameters(), snapshot, strict=True):
+				tensor[start:start + saved.shape[0]] = saved
+
 	def evolve(self, fitness: NDArray[np.float32], elite_count: int, random_count: int, mutation_rate: float, mutation_strength: float) -> NDArray[np.int64]:
 		"""
 		Builds the next generation in place: elites are copied untouched, the middle is a mutated crossover

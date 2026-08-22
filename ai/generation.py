@@ -328,6 +328,12 @@ class Generation:
 	def evolve_generation(self) -> None:
 		"""Runs the A2C update, selects the elites, breeds the next generation and saves the best weights."""
 		self.fitness_history.append(float(self.rewards.max()))
+		fitness = self.rewards.astype(np.float32)
+		elite_slots = torch.from_numpy(np.ascontiguousarray(np.argsort(-fitness)[:self.elite_count])).to(self.population.device)
+		# The elites are exactly the weights that scored, so they sit out the update: a fresh Adam step moves
+		# every one of their weights by the full learning rate, which undoes the selection it was given
+		elite_weights = self.population.snapshot(elite_slots) if self.a2c_trainer is not None else None
+
 		if self.a2c_trainer is not None and self.rollout is not None:
 			print('Performing A2C learning step...')
 			stats = self.a2c_trainer.train_step(self.rollout)
@@ -335,12 +341,14 @@ class Generation:
 			self.a2c_trainer.decay_entropy(self.generation)
 
 		elites = self.population.evolve(
-			self.rewards.astype(np.float32),
+			fitness,
 			self.elite_count,
 			min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)),
 			self.mutation_rate,
 			self.mutation_strength,
 		)
+		if elite_weights is not None:
+			self.population.restore(elite_weights)
 		print(f'Selected {len(elites)} elites: {[f"{self.rewards[i]:.2f}" for i in elites]}')
 
 		if self.a2c_trainer is not None:
