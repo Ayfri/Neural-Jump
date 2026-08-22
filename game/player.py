@@ -1,14 +1,13 @@
 import pygame
 from pygame.sprite import Sprite
 
-from game.constants import AGENT_NEAR_PLATFORM_DISTANCE, AGENT_VISION_DISTANCE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
+from game.constants import AGENT_NEAR_PLATFORM_DISTANCE
 from game.level import Level
 from game.platform import Platform
 from game.settings import (
 	BLACK, PLAYER_SPEED, PLAYER_WIDTH, PLAYER_HEIGHT, PLAYER_COLOR,
 	PLAYER_GRAVITY, PLAYER_JUMP_STRENGTH, SCREEN_HEIGHT, TILE_SIZE,
 )
-from game.tiles import Tile, TILES
 
 
 class Player(Sprite):
@@ -68,7 +67,7 @@ class Player(Sprite):
 		for block in self.rect.collideobjectsall(self._near_platforms):
 			if not isinstance(block, Platform):
 				continue
-				
+
 			if block.tile_data.get('reward', False):
 				self.finished_reward = block.tile_data['reward']
 				if block.tile_data['reward'] == 1:
@@ -132,21 +131,6 @@ class Player(Sprite):
 		self.change_x = 0.0
 		self.change_y = 0.0
 
-	def get_surrounding_tiles(self) -> list[list[Tile]]:
-		grid: list[list[Tile]] = []
-		for dy in range(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1):
-			row: list[Tile] = []
-			for dx in range(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1):
-				x = (self.rect.centerx // TILE_SIZE) + dx
-				y = (self.rect.centery // TILE_SIZE) + dy
-				if 0 <= x < self.level.width and 0 <= y < self.level.height and y < len(self.level.tile_map) and x < len(self.level.tile_map[y]):
-					tile = self.level.tile_map[round(y)][round(x)]
-					row.append(TILES[tile])
-				else:
-					row.append({})
-			grid.append(row)
-		return grid
-
 	def calculate_near_platforms(self) -> None:
 		"""Collect platforms near the player for collision detection"""
 		center_x, center_y = self.rect.centerx, self.rect.centery
@@ -154,12 +138,3 @@ class Player(Sprite):
 			platform for platform in self.level.platforms_in_range(center_x - AGENT_NEAR_PLATFORM_DISTANCE, center_x + AGENT_NEAR_PLATFORM_DISTANCE)
 			if abs(platform.rect.centery - center_y) <= AGENT_NEAR_PLATFORM_DISTANCE
 		]
-
-	def execute_move(self, direction: int) -> None:
-		"""Execute movement (MOVE_JUMP: jump, MOVE_LEFT: left, MOVE_RIGHT: right)"""
-		if direction == MOVE_JUMP:
-			self.jump()
-		elif direction == MOVE_LEFT:
-			self.go_left()
-		elif direction == MOVE_RIGHT:
-			self.go_right()
