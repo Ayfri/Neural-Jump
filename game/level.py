@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pygame
@@ -13,14 +13,17 @@ if TYPE_CHECKING:
 	from game.player import Player
 
 
-def _search_maps_folder(folder: str) -> str:
+def _search_maps_folder(folder: str | Path) -> Path:
 	"""Returns the absolute path to the maps folder, walking up from this file until it is found."""
-	current_folder: str = os.path.dirname(os.path.abspath(__file__))
-	while current_folder != '/':
-		if folder in os.listdir(current_folder):
-			return os.path.join(current_folder, folder)
-		current_folder = os.path.dirname(current_folder)
-	return ''
+	current_folder = Path(__file__).resolve().parent
+	while True:
+		candidate = current_folder / folder
+		if candidate.exists():
+			return candidate
+		parent = current_folder.parent
+		if parent == current_folder:
+			return Path()
+		current_folder = parent
 
 
 class Level:
@@ -49,9 +52,9 @@ class Level:
 		self.platform_list.draw(screen)
 
 	def load_map(self, map_path: str) -> None:
-		maps_folder = os.path.dirname(map_path)
-		maps_path = _search_maps_folder(maps_folder) + os.sep + os.path.basename(map_path)
-		with open(maps_path) as file:
+		path = Path(map_path)
+		maps_path = _search_maps_folder(path.parent) / path.name
+		with maps_path.open() as file:
 			lines = file.readlines()
 
 		self.map = map_path
@@ -100,7 +103,6 @@ class Level:
 		"""Centers the camera on the player horizontally, keeping a fixed height."""
 		self.camera.centerx = player.rect.centerx
 		self.camera.centery = TILE_SIZE * 12
-		return
 
 	def restart(self) -> None:
 		if self.map is None:

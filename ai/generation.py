@@ -1,6 +1,6 @@
-import os
 import re
 import time
+from pathlib import Path
 from typing import Final
 
 import numpy as np
@@ -48,7 +48,7 @@ DISTANCE_REWARD_DIVISOR: Final[float] = 10.0
 PROGRESS_REWARD_DIVISOR: Final[float] = 20.0
 MIN_REWARD: Final[float] = -30.0
 
-WEIGHTS_FOLDER: Final[str] = 'weights'
+WEIGHTS_FOLDER: Final[Path] = Path('weights')
 
 
 class Generation:
@@ -361,24 +361,24 @@ class Generation:
 		self.generation += 1
 		self.manual_stop = False
 
-		os.makedirs(WEIGHTS_FOLDER, exist_ok=True)
+		WEIGHTS_FOLDER.mkdir(exist_ok=True)
 		torch.save({
 			'weights': self.population.state_dict(0),
 			'hidden_sizes': self.population.hidden_sizes,
 			'best_fitness': self.best_fitness_ever,
 			'mutation_rate': self.mutation_rate,
 			'mutation_strength': self.mutation_strength,
-		}, f'{WEIGHTS_FOLDER}/generation_{self.generation}.pth')
+		}, WEIGHTS_FOLDER / f'generation_{self.generation}.pth')
 
 	def load_latest_generation_weights(self) -> None:
 		"""Loads the most recent weight file into every agent, then immediately breeds from it."""
 		try:
 			latest = max(
-				int(filename.split('_')[1].split('.')[0])
-				for filename in os.listdir(WEIGHTS_FOLDER)
-				if re.match(r'generation_\d+\.pth', filename)
+				int(path.stem.split('_')[1])
+				for path in WEIGHTS_FOLDER.iterdir()
+				if re.match(r'generation_\d+\.pth', path.name)
 			)
-			data = torch.load(f'{WEIGHTS_FOLDER}/generation_{latest}.pth', weights_only=True, map_location='cpu')
+			data = torch.load(WEIGHTS_FOLDER / f'generation_{latest}.pth', weights_only=True, map_location='cpu')
 			weights = data['weights'] if isinstance(data, dict) and 'weights' in data else data
 			if not isinstance(weights, dict):
 				raise ValueError('invalid weights format')

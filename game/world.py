@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 from typing import Final
 
 import numpy as np
@@ -32,22 +32,23 @@ MOVE_SPEEDS: Final[NDArray[np.float64]] = np.zeros(3)  # Horizontal speed per ac
 MOVE_SPEEDS[[MOVE_LEFT, MOVE_RIGHT]] = (-PLAYER_SPEED, PLAYER_SPEED)
 
 
-def search_maps_folder(folder: str) -> str:
+def search_maps_folder(folder: str | Path) -> Path:
 	"""Returns the absolute path to the maps folder, walking up from this file until it is found."""
-	current_folder = os.path.dirname(os.path.abspath(__file__))
+	current_folder = Path(__file__).resolve().parent
 	while True:
-		if folder in os.listdir(current_folder):
-			return os.path.join(current_folder, folder)
-		parent = os.path.dirname(current_folder)
+		candidate = current_folder / folder
+		if candidate.exists():
+			return candidate
+		parent = current_folder.parent
 		if parent == current_folder:
-			return ''
+			return Path()
 		current_folder = parent
 
 
-def resolve_map_path(map_path: str) -> str:
+def resolve_map_path(map_path: str) -> Path:
 	"""Resolves a map path like 'maps/level_1.txt' to an absolute path."""
-	folder = search_maps_folder(os.path.dirname(map_path))
-	return folder + os.sep + os.path.basename(map_path)
+	path = Path(map_path)
+	return search_maps_folder(path.parent) / path.name
 
 
 def closest_reward(windows: NDArray[np.float32]) -> NDArray[np.float32]:
@@ -110,7 +111,7 @@ class World:
 		self._cell_limits = np.array([[self._max_row], [self._max_row], [self._max_column], [self._max_column]])
 
 	def _load_map(self, map_path: str) -> None:
-		with open(resolve_map_path(map_path)) as file:
+		with resolve_map_path(map_path).open() as file:
 			lines = [line.strip() for line in file.readlines() if line.strip()]
 
 		self.height = len(lines)
