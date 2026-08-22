@@ -9,10 +9,8 @@ from numpy.typing import NDArray
 from pygame import Rect, Surface
 from pygame.font import Font
 
-from game.settings import (
-	CHECKPOINT_ALPHA, CHECKPOINT_COLOR, CHECKPOINT_GLOW, COIN_COLOR, COIN_SHINE, SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE, WHITE,
-)
-from game.tiles import TILES
+from game.art import CHECKPOINT_COLOR, COIN_COLOR, bake_level, body_sprite, coin_sprite, jump_sprite, ring_sprite
+from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
 from game.world import PLAYER_H, PLAYER_W, World
 
 type Color = tuple[int, int, int]
@@ -27,7 +25,7 @@ WON_COLOR: Final[Color] = (58, 120, 246)
 HUMAN_COLOR: Final[Color] = (120, 232, 176)  # A human run has no rank to color by, so it gets its own fill
 ELITE_RING: Final[Color] = (240, 190, 60)
 RANDOM_RING: Final[Color] = (168, 92, 232)
-FOCUS_RING: Final[Color] = (24, 24, 30)
+FOCUS_RING: Final[Color] = (248, 250, 255)  # Bright, because the ring sits on the dark sky as often as on terrain
 JUMP_MARKER: Final[Color] = (32, 130, 240)
 
 PANEL_BACKGROUND: Final[tuple[int, int, int, int]] = (54, 59, 74, 247)
@@ -117,10 +115,6 @@ PLAY_LEGEND: Final[tuple[tuple[Color, str], ...]] = (
 )
 
 
-def _shade(color: Color, factor: float) -> Color:
-	return (min(255, int(color[0] * factor)), min(255, int(color[1] * factor)), min(255, int(color[2] * factor)))
-
-
 @lru_cache(maxsize=FITNESS_BUCKETS)
 def _bucket_color(bucket: int) -> Color:
 	position = bucket / max(1, FITNESS_BUCKETS - 1) * (len(FITNESS_RAMP) - 1)
@@ -141,7 +135,7 @@ def _font(size: int) -> Font:
 
 @lru_cache(maxsize=2048)
 def _text(size: int, text: str, color: Color) -> Surface:
-	return _font(size).render(text, True, color)
+	return _font(size).render(text, True, color).convert_alpha()
 
 
 @lru_cache(maxsize=32)
@@ -149,70 +143,25 @@ def _panel_background(width: int, height: int) -> Surface:
 	surface = Surface((width, height), pygame.SRCALPHA)
 	pygame.draw.rect(surface, PANEL_BACKGROUND, Rect(0, 0, width, height), border_radius=6)
 	pygame.draw.rect(surface, PANEL_BORDER, Rect(0, 0, width, height), width=1, border_radius=6)
-	return surface
+	return surface.convert_alpha()
 
 
 @lru_cache(maxsize=FITNESS_BUCKETS * 12)  # Every (bucket, heading, state) sprite, so a full population never evicts one
-def _body_sprite(bucket: int, direction: int, state: int) -> Surface:
+def _player_sprite(bucket: int, direction: int, state: int) -> Surface:
 	"""
-	One player sprite: fill encodes the fitness rank, the stroke its state, the chevron its heading.
+	One player sprite: the fill encodes its fitness rank, or its state once it is dead, won or human.
 
 	`state` is 0 alive, 1 dead, 2 won, 3 the human player. The whole set is tiny and fully cached, so a frame
-	only ever blits pre-rendered surfaces instead of drawing shapes per player.
+	only ever blits pre-rendered surfaces instead of painting a body per player.
 	"""
 	fill = (DEAD_COLOR, WON_COLOR, HUMAN_COLOR)[state - 1] if state else _bucket_color(bucket)
-	surface = Surface((PLAYER_W, PLAYER_H), pygame.SRCALPHA)
-	body = Rect(0, 0, PLAYER_W, PLAYER_H)
-	pygame.draw.rect(surface, fill, body, border_radius=3)
-	pygame.draw.rect(surface, _shade(fill, 0.45), body, width=2, border_radius=3)
-
-	center_x, center_y = PLAYER_W // 2, PLAYER_H // 2
-	mark = _shade(fill, 0.3) if state == 0 else _shade(fill, 0.55)
-	if direction > 0:
-		pygame.draw.polygon(surface, mark, [(center_x - 3, center_y - 6), (center_x + 5, center_y), (center_x - 3, center_y + 6)])
-	elif direction < 0:
-		pygame.draw.polygon(surface, mark, [(center_x + 3, center_y - 6), (center_x - 5, center_y), (center_x + 3, center_y + 6)])
-	else:
-		pygame.draw.rect(surface, mark, Rect(center_x - 3, center_y - 3, 6, 6), border_radius=1)
-	return surface
+	return body_sprite(fill, (PLAYER_W, PLAYER_H), direction, state == 1)
 
 
-@lru_cache(maxsize=8)
-def _ring_sprite(color: Color, gap: int, thickness: int) -> Surface:
-	size = (PLAYER_W + 2 * (gap + thickness), PLAYER_H + 2 * (gap + thickness))
-	surface = Surface(size, pygame.SRCALPHA)
-	pygame.draw.rect(surface, color, Rect(0, 0, *size), width=thickness, border_radius=5)
-	return surface
-
-
-@lru_cache(maxsize=2)
-def _coin_sprite() -> Surface:
-	"""A coin, drawn narrower than its tile so a trail of them reads as a line of dots rather than a wall."""
-	surface = Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
-	center = (TILE_SIZE // 2, TILE_SIZE // 2)
-	pygame.draw.circle(surface, _shade(COIN_COLOR, 0.6), center, 11)
-	pygame.draw.circle(surface, COIN_COLOR, center, 9)
-	pygame.draw.circle(surface, COIN_SHINE, (center[0] - 3, center[1] - 3), 3)
-	return surface
-
-
-@lru_cache(maxsize=2)
-def _checkpoint_sprite() -> Surface:
-	"""A checkpoint: a translucent violet cell with a bright frame, so it reads over both terrain and sky."""
-	surface = Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
-	body = Rect(0, 0, TILE_SIZE, TILE_SIZE)
-	pygame.draw.rect(surface, (*CHECKPOINT_COLOR, CHECKPOINT_ALPHA), body, border_radius=4)
-	pygame.draw.rect(surface, (*CHECKPOINT_GLOW, 255), body, width=3, border_radius=4)
-	pygame.draw.polygon(surface, (*CHECKPOINT_GLOW, 235), [(14, 9), (28, 15), (14, 21)])
-	pygame.draw.rect(surface, (*CHECKPOINT_GLOW, 235), Rect(11, 9, 3, 22))
-	return surface
-
-
-@lru_cache(maxsize=2)
-def _jump_sprite() -> Surface:
-	surface = Surface((12, 9), pygame.SRCALPHA)
-	pygame.draw.polygon(surface, JUMP_MARKER, [(6, 0), (11, 8), (0, 8)])
-	return surface
+def _player_ring(color: Color, gap: int, thickness: int) -> Surface:
+	"""An outline around a player, `gap` pixels off its body, drawn from the same top-left corner minus the pad."""
+	pad = gap + thickness
+	return ring_sprite(color, (PLAYER_W + 2 * pad, PLAYER_H + 2 * pad), thickness)
 
 
 class Renderer:
@@ -242,11 +191,16 @@ class Renderer:
 		self.show_hud = True
 		# World y and surface y differ by `_origin_y` on maps taller than the screen, where the map starts above it
 		self._origin_y = min(0, world.offset_y)
-		self.level_surface = self._bake_level(world)
+		bottom = max(SCREEN_HEIGHT, world.offset_y + world.height * TILE_SIZE)
+		size = (world.width * TILE_SIZE, bottom - self._origin_y)
+		self.level_surface = bake_level(world.kinds, size, self.to_surface(world.offset_y))
 		self._ranks = np.zeros(world.count, dtype=np.int64)
-		# Coins are drawn per frame instead of baked: which ones are left depends on the agent being followed
+		# Coins are drawn per frame instead of baked: which ones are left depends on the agent being followed.
+		# Sorted by x, so a frame slices the column of them the camera covers instead of testing the whole map
 		positions = np.array(world.coin_positions, dtype=np.int64).reshape(-1, 2)
-		self._coin_x, self._coin_y = positions[:, 0], positions[:, 1]
+		self._coin_ids = np.argsort(positions[:, 0], kind='stable')
+		self._coin_x = positions[self._coin_ids, 0]
+		self._coin_y = positions[self._coin_ids, 1]
 
 	@staticmethod
 	def desktop_fps() -> int:
@@ -259,20 +213,6 @@ class Renderer:
 
 	def measured_fps(self) -> float:
 		return self.clock.get_fps()
-
-	def _bake_level(self, world: World) -> Surface:
-		bottom = max(SCREEN_HEIGHT, world.offset_y + world.height * TILE_SIZE)
-		surface = Surface((world.width * TILE_SIZE, bottom - self._origin_y))
-		surface.fill(WHITE)
-		for y in range(world.height):
-			for x in range(world.width):
-				tile = TILES.get(str(world.chars[y, x]), {})
-				color = tile.get('color')
-				if color is not None and not tile.get('is_coin', False):
-					surface.fill(color, Rect(x * TILE_SIZE, self.to_surface(y * TILE_SIZE + world.offset_y), TILE_SIZE, TILE_SIZE))
-		for checkpoint_x, checkpoint_y in world.checkpoints:
-			surface.blit(_checkpoint_sprite(), (checkpoint_x, self.to_surface(checkpoint_y)))
-		return surface
 
 	def to_surface(self, world_y: int) -> int:
 		"""World y to level surface y: the two only differ when the map reaches above the top of the screen."""
@@ -318,18 +258,22 @@ class Renderer:
 
 	def _draw_coins(self, focus_index: int) -> None:
 		"""The coins the followed agent has not banked yet, culled to the camera."""
-		if not len(self._coin_x):
-			return
 		left, top = self.camera.left, self.camera.top
-		x = self._coin_x - left
-		y = self._coin_y - top
-		visible = (x > -TILE_SIZE) & (x < SCREEN_WIDTH) & (y > -TILE_SIZE) & (y < SCREEN_HEIGHT)
-		visible &= ~self.world.collected[focus_index]
+		# Two binary searches cut the map down to the coins in the camera's column, whatever the map holds
+		start = int(np.searchsorted(self._coin_x, left - TILE_SIZE, side='right'))
+		stop = int(np.searchsorted(self._coin_x, left + SCREEN_WIDTH))
+		if start >= stop:
+			return
+
+		y = self._coin_y[start:stop] - top
+		visible = (y > -TILE_SIZE) & (y < SCREEN_HEIGHT)
+		visible &= ~self.world.collected[focus_index, self._coin_ids[start:stop]]
 		if not visible.any():
 			return
 
-		coin = _coin_sprite()
-		self.screen.blits([(coin, position) for position in zip(x[visible].tolist(), y[visible].tolist())], doreturn=False)
+		coin = coin_sprite()
+		x = self._coin_x[start:stop] - left
+		self.screen.blits([(coin, spot) for spot in zip(x[visible].tolist(), y[visible].tolist())], doreturn=False)
 
 	def _fitness_buckets(self, fitness: NDArray[np.float64]) -> NDArray[np.int64]:
 		"""Buckets agents by their rank rather than their raw fitness, so the colors stay readable."""
@@ -360,16 +304,16 @@ class Renderer:
 
 		bodies: list[Blit] = []
 		markers: list[Blit] = []
-		jump = _jump_sprite()
-		elite_ring = _ring_sprite(ELITE_RING, 2, 2)
-		random_ring = _ring_sprite(RANDOM_RING, 2, 2)
-		focus_ring = _ring_sprite(FOCUS_RING, 5, 2)
+		jump = jump_sprite(JUMP_MARKER)
+		elite_ring = _player_ring(ELITE_RING, 2, 2)
+		random_ring = _player_ring(RANDOM_RING, 2, 2)
+		focus_ring = _player_ring(FOCUS_RING, 5, 2)
 		random_start = world.count - hud.random_count
 
 		for index in np.flatnonzero(visible).tolist():
 			x, y = screen_x[index], screen_y[index]
 			state = states[index]
-			bodies.append((_body_sprite(buckets[index], directions[index], fills[index]), (x, y)))
+			bodies.append((_player_sprite(buckets[index], directions[index], fills[index]), (x, y)))
 			if state == 0 and rising[index]:
 				markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
 			if index < hud.elite_count:

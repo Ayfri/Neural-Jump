@@ -7,7 +7,8 @@ import pygame
 
 from game.constants import MOVE_IDLE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
 from game.render import PLAY_LEGEND, Gauge, Hud, Legend, Panel, Renderer
-from game.settings import COIN_COLOR, PLAYER_SPEED, TILE_SIZE
+from game.art import COIN_COLOR
+from game.settings import PLAYER_SPEED, TILE_SIZE
 from game.world import World
 
 DEFAULT_TICK_RATE: Final[int] = 90  # The rate the agents are trained at, so a human run is comparable to theirs
