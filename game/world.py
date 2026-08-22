@@ -117,6 +117,8 @@ class World:
 		self._observation = np.zeros((count, OBSERVATION_SIZE), dtype=OBSERVATION_DTYPE)
 		self._offsets = np.arange(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1)
 		self._box = np.zeros((4, count), dtype=np.float64)  # Scratch the collision passes rebuild every call
+		self._corners = np.zeros((4, count), dtype=np.int64)  # Scratch the coin pass gathers its four corners through
+		self._box_extent = np.array([[PLAYER_H - 1.0], [PLAYER_W - 1.0]])  # Bottom row and right column, off the top row and the left column
 		self._cell_limits = np.array([[self._max_row], [self._max_row], [self._max_column], [self._max_column]])
 
 	def _pixels(self, cell: NDArray[np.int64]) -> tuple[int, int]:
@@ -205,7 +207,7 @@ class World:
 	def kill(self, mask: NDArray[np.bool_]) -> None:
 		self.dead |= mask
 
-	def _cells(self, y: NDArray[np.float64]) -> NDArray[np.int64]:
+	def _cells(self, y: NDArray[np.float64], down: float = 0.0) -> NDArray[np.int64]:
 		"""
 		The four tiles the player box touches at (x, y): top row, bottom row, left column, right column.
 
@@ -215,10 +217,10 @@ class World:
 		"""
 		# The padding is added here in pixels, so the coordinates come out of the floor already padded
 		box = self._box
-		np.subtract(y, self.offset_y - GRID_ORIGIN, out=box[0])
-		np.add(box[0], PLAYER_H - 1, out=box[1])
+		np.subtract(y, self.offset_y - GRID_ORIGIN - down, out=box[0])
 		np.add(self.x, GRID_ORIGIN, out=box[2])
-		np.add(box[2], PLAYER_W - 1, out=box[3])
+		# The far side of the box is one extent past the near side on both axes, so both come out of one add
+		np.add(box[::2], self._box_extent, out=box[1::2])
 
 		np.divide(box, TILE_SIZE, out=box)
 		np.floor(box, out=box)
@@ -230,6 +232,11 @@ class World:
 	def _row_offsets(self, cells: NDArray[np.int64]) -> NDArray[np.int64]:
 		"""The two rows of a `_cells` block as offsets into the flat padded grid."""
 		return cells[:2] * self._padded_width
+
+	def _touch_block(self, y: NDArray[np.float64]) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
+		"""The flat row offsets and the two tile columns of the box at `y`, which is all a grid lookup reads."""
+		cells = self._cells(y)
+		return self._row_offsets(cells), cells[2], cells[3]
 
 	def on_ground(self) -> NDArray[np.bool_]:
 		"""Players whose vertical speed is small enough to count as standing on something."""
@@ -251,7 +258,7 @@ class World:
 		rows *= self._window_stride
 		rows += columns
 
-		np.take(self._windows, rows, axis=0, out=target[:, :WINDOW_FEATURES])
+		self._windows.take(rows, axis=0, out=target[:, :WINDOW_FEATURES])
 		target[:, WINDOW_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
 		target[:, WINDOW_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
 		target[:, WINDOW_FEATURES + 2] = self.on_ground()
@@ -279,17 +286,18 @@ class World:
 
 		np.add(self.y, self.change_y, out=self.y, where=alive)
 		np.trunc(self.y, out=self.y, where=alive)
-		# x is final once the horizontal pass is done, so the last two passes share its tile columns
-		columns = self._resolve_vertical(alive)
-		self._touch_goal(alive, tick, columns)
-		self._collect_coins(alive, columns)
+		self._resolve_vertical(alive)
+		# Both remaining passes read the same tiles, so the box is resolved once here rather than inside each
+		block = self._touch_block(self.y)
+		self._touch_goal(alive, tick, block)
+		self._collect_coins(alive, block)
 
 	def grounded(self) -> NDArray[np.bool_]:
 		"""Players with solid ground right under their feet, which is the only state a jump fires from."""
-		cells = self._cells(self.y + 2.0)
+		cells = self._cells(self.y, 2.0)
 		row = cells[1] * self._padded_width
 		solid = self._flat_solid
-		return np.take(solid, row + cells[2]) | np.take(solid, row + cells[3])
+		return solid.take(row + cells[2]) | solid.take(row + cells[3])
 
 	def _jump(self, mask: NDArray[np.bool_]) -> None:
 		if not mask.any():
@@ -297,14 +305,12 @@ class World:
 		np.copyto(self.change_y, PLAYER_JUMP_STRENGTH, where=mask & self.grounded())
 
 	def _resolve_horizontal(self, alive: NDArray[np.bool_]) -> None:
-		cells = self._cells(self.y)
-		rows = self._row_offsets(cells)
-		left, right = cells[2], cells[3]
+		rows, left, right = self._touch_block(self.y)
 
 		# A player one row tall gathers the same row twice, so the two rows can be OR'd without a guard
 		solid = self._flat_solid
-		hit_left = np.take(solid, rows[0] + left) | np.take(solid, rows[1] + left)
-		hit_right = (np.take(solid, rows[0] + right) | np.take(solid, rows[1] + right)) & (right > left)
+		hit_left = solid.take(rows[0] + left) | solid.take(rows[1] + left)
+		hit_right = (solid.take(rows[0] + right) | solid.take(rows[1] + right)) & (right > left)
 
 		# The blocking column and the side of the player touching it are one select each way
 		going_right = self.change_x > 0
@@ -312,8 +318,7 @@ class World:
 		snapped = column * TILE_SIZE + np.where(going_right, -PLAYER_W - GRID_ORIGIN, TILE_SIZE - GRID_ORIGIN)
 		np.copyto(self.x, snapped, where=alive & (hit_left | hit_right) & (self.change_x != 0))
 
-	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-		"""Resolves the vertical move and hands back the tile columns, which the goal pass reuses as is."""
+	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> None:
 		cells = self._cells(self.y)
 		rows = self._row_offsets(cells)
 		top, bottom = cells[0], cells[1]
@@ -321,8 +326,8 @@ class World:
 
 		# A player one column wide gathers the same column twice, so the two columns can be OR'd without a guard
 		solid = self._flat_solid
-		hit_top = np.take(solid, rows[0] + left) | np.take(solid, rows[0] + right)
-		hit_bottom = (np.take(solid, rows[1] + left) | np.take(solid, rows[1] + right)) & (bottom > top)
+		hit_top = solid.take(rows[0] + left) | solid.take(rows[0] + right)
+		hit_bottom = (solid.take(rows[1] + left) | solid.take(rows[1] + right)) & (bottom > top)
 
 		going_down = self.change_y > 0
 		row = np.where(going_down, np.where(hit_bottom, bottom, top), np.where(hit_top, top, bottom))
@@ -331,44 +336,53 @@ class World:
 		blocked = alive & (hit_top | hit_bottom) & (self.change_y != 0)
 		np.copyto(self.y, snapped, where=blocked)
 		np.copyto(self.change_y, 0.0, where=blocked)
-		return left, right
 
-	def _touch_goal(self, alive: NDArray[np.bool_], tick: int, columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
+	def _touch_goal(self, alive: NDArray[np.bool_], tick: int, block: tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]) -> None:
 		"""Wins the episode for every player whose box overlaps the flag, on the tick it got there."""
-		left, right = columns
-		rows = self._row_offsets(self._cells(self.y))
+		rows, left, right = block
 
 		# The flag is a handful of tiles on a whole map, so the gather is skipped unless someone stands next to it
-		if not np.take(self._flat_near_goal, rows[0] + left).any():
+		if not self._flat_near_goal.take(rows[0] + left).any():
 			return
 
 		goal = self._flat_goal
-		hit = np.take(goal, rows[0] + left) != 0
-		hit |= np.take(goal, rows[0] + right) != 0
-		hit |= np.take(goal, rows[1] + left) != 0
-		hit |= np.take(goal, rows[1] + right) != 0
+		hit = goal.take(rows[0] + left) != 0
+		hit |= goal.take(rows[0] + right) != 0
+		hit |= goal.take(rows[1] + left) != 0
+		hit |= goal.take(rows[1] + right) != 0
 
 		won = alive & hit
 		np.copyto(self.win_tick, tick, where=won)
 		self.win |= won
 
-	def _collect_coins(self, alive: NDArray[np.bool_], columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
+	def _collect_coins(self, alive: NDArray[np.bool_], block: tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]) -> None:
 		"""Banks every coin the player box overlaps, once each: `collected` is one bit per agent per coin."""
 		if not self.coin_count:
 			return
 
-		left, right = columns
-		rows = self._row_offsets(self._cells(self.y))
-		if not np.take(self._flat_near_coin, rows[0] + left).any():
+		rows, left, right = block
+		if not self._flat_near_coin.take(rows[0] + left).any():
 			return
 
+		# The four corners of the box are one gather rather than four, and one test rules the whole pass out
+		corners = self._corners
+		np.add(rows[0], left, out=corners[0])
+		np.add(rows[0], right, out=corners[1])
+		np.add(rows[1], left, out=corners[2])
+		np.add(rows[1], right, out=corners[3])
+		ids = self._flat_coins.take(corners)
+		standing = ids >= 0
+		standing &= alive
+		if not standing.any():
+			return
+
+		# Clamped index: an agent standing on no coin reads slot 0 and is masked out anyway
+		np.maximum(ids, 0, out=ids)
 		agents = self._agents
-		for row in rows:
-			for column in (left, right):
-				ids = np.take(self._flat_coins, row + column)
-				# Clamped index: an agent standing on no coin reads slot 0 and is masked out anyway
-				fresh = alive & (ids >= 0) & ~self.collected[agents, np.maximum(ids, 0)]
-				if not fresh.any():
-					continue
-				self.collected[agents[fresh], ids[fresh]] = True
-				self.coins += fresh
+		# Still one corner at a time, because a box wide enough to touch the same coin twice must only bank it once
+		for slots, on_coin in zip(ids, standing):
+			fresh = on_coin & ~self.collected[agents, slots]
+			if not fresh.any():
+				continue
+			self.collected[agents[fresh], slots[fresh]] = True
+			self.coins += fresh
