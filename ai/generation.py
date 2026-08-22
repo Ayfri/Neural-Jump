@@ -10,24 +10,29 @@ from numpy.typing import NDArray
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
 from game.world import World
 
-# Generation constants
+# Evolution
+DEFAULT_POPULATION_SIZE: Final[int] = 300
 DEFAULT_ELITE_COUNT: Final[int] = 4
 DEFAULT_MUTATION_RATE: Final[float] = 0.8
-DEFAULT_MUTATION_STRENGTH: Final[float] = 0.03  # Now that the elites are preserved, this is the only exploration the GA has left
+DEFAULT_MUTATION_STRENGTH: Final[float] = 0.03  # The elites are preserved, so this is the only exploration the population has
+RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
+
+# Simulation
 DEFAULT_TICK_RATE: Final[int] = 90
 DEFAULT_EPISODE_SECONDS: Final[float] = 30.0
 DEFAULT_ACTION_REPEAT: Final[int] = 2  # Physics ticks a chosen action is held for, measurably better than 1 or 4 here
+POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
+STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
+
+# Display pacing
 MAX_SPEED: Final[str] = 'max'  # `speed='max'` tunes itself to the fastest rate the target framerate survives
 MAX_TICKS_PER_FRAME: Final[float] = 4096.0
 SPEED_HOLD_RATIO: Final[float] = 0.95  # Share of the target framerate above which the simulation asks for more work
 SPEED_DROP_RATIO: Final[float] = 0.88  # Share under which it backs off
 SPEED_ADAPT_FRAMES: Final[int] = 12  # Frames between two adjustments, so the framerate average settles first
 SPEED_SAMPLE_SECONDS: Final[float] = 0.25
-RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
-POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
-STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
 
-# Reward constants
+# Rewards
 FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
 NEW_MAX_POSITION_BONUS: Final[float] = 0.1
 BACKWARD_MOVEMENT_PENALTY: Final[float] = -0.1
@@ -51,41 +56,51 @@ class Generation:
 
 	def __init__(
 		self,
-		population_size: int,
+		population_size: int = DEFAULT_POPULATION_SIZE,
+		# Evolution
 		elite_count: int = DEFAULT_ELITE_COUNT,
 		mutation_rate: float = DEFAULT_MUTATION_RATE,
 		mutation_strength: float = DEFAULT_MUTATION_STRENGTH,
-		load_latest_generation_weights: bool = False,
-		show_window: bool = True,
-		use_checkpoints: bool = False,
 		deterministic_actions: bool = True,
-		seed: int | None = None,
+		# Network
 		hidden_sizes: tuple[int, int, int] = DEFAULT_HIDDEN_SIZES,
 		device: str = 'auto',
-		tick_rate: int = DEFAULT_TICK_RATE,
+		# Simulation
+		map_path: str = 'maps/level_1.txt',
 		episode_seconds: float = DEFAULT_EPISODE_SECONDS,
+		tick_rate: int = DEFAULT_TICK_RATE,
 		action_repeat: int = DEFAULT_ACTION_REPEAT,
+		use_checkpoints: bool = False,
+		# Run
+		seed: int | None = None,
+		load_latest_generation_weights: bool = False,
+		# Display
+		show_window: bool = True,
 		speed: float | str = 1.0,
 		fps: int = 0,
-		map_path: str = 'maps/level_1.txt',
 	) -> None:
 		self.population_size = population_size
 		self.elite_count = min(elite_count, population_size)
 		self.mutation_rate = mutation_rate
 		self.mutation_strength = mutation_strength
-		self.show_window = show_window
-		self.use_checkpoints = use_checkpoints
 		# Sampling makes the measured fitness a lottery, which is fatal to selection, so the population
 		# plays its argmax and an elite re-scores exactly what it scored before
 		self.deterministic_actions = deterministic_actions
+
+		self.map_path = map_path
+		self.episode_seconds = episode_seconds
+		self.tick_rate = tick_rate
+		self.action_repeat = max(1, action_repeat)
+		self.use_checkpoints = use_checkpoints
+
 		self.seed = seed
 		if seed is not None:
 			seed_everything(seed)
-		self.tick_rate = tick_rate
-		self.episode_seconds = episode_seconds
-		self.action_repeat = max(1, action_repeat)
+
+		self.show_window = show_window
 		self.auto_speed = speed == MAX_SPEED
 		self.speed = 1.0 if self.auto_speed else float(speed)
+
 		self.generation = 1
 		self.best_fitness_ever = 0.0
 		self.should_skip_checkpoint = False

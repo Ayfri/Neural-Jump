@@ -81,62 +81,43 @@ uv run run-ai.py
 
 Training is headless by default and runs as fast as the machine allows. `--show-window` paces it with `--speed` so the run stays watchable, and draws a HUD that reads the population's state straight off the screen.
 
-**Command-line options:**
+**Command-line options**, grouped the way `--help` prints them:
 
-- `--population-size N`: Number of agents per generation (default: 300). A tick costs almost the same at 300
-  agents as at 100, because the simulation is bound by numpy call overhead rather than by the data, and the
-  extra mutations per generation are what break a plateau
-- `--elite-count N`: Agents carried over untouched and used as parents (default: 4)
-- `--mutation-rate R`: Probability of mutating a given weight tensor (default: 0.8, range: 0.0-1.0)
-- `--mutation-strength S`: Scale of mutations (default: 0.03)
-- `--hidden-sizes N N N`: Sizes of the three shared hidden layers (default: 256 128 64), smaller is faster and dumber
-- `--sampled`: Sample actions from the policy instead of playing its argmax, which makes a generation's scores a lottery
-- `--seed N`: Seed python, numpy and torch so a run replays exactly
-- `--action-repeat N`: Physics ticks a chosen action is held for (default: 2)
-- `--device auto|cpu|cuda`: Where the population runs (default: auto)
-- `--threads N`: Torch CPU threads (default: 4)
-- `--tick-rate N`: Simulation ticks per in-game second (default: 90)
-- `--episode-seconds S`: In-game time budget per spawn point (default: 30)
-- `--generations N`: Stop after N generations (default: 0, runs forever)
-- `--speed S`: Simulation speed multiplier while rendering, or `max` to run as fast as the target framerate survives (default: 1)
-- `--fps N`: Target framerate, only with `--show-window` (default: 0, uses the display refresh rate)
-- `--map PATH`: Level file to train on (default: maps/level_1.txt)
-- `--load-latest-generation-weights`: Load weights from the latest saved generation
-- `--show-window`: Display the game window during training
-- `--checkpoints`: Use checkpoint platforms as spawn points
+*evolution* - how a generation is selected and bred
 
-**Examples:**
+- `--population-size N`: agents per generation (default: 300). A tick costs almost the same at 300 agents as
+  at 100, because the simulation is bound by numpy call overhead rather than by the data, and the extra
+  mutations per generation are what break a plateau
+- `--elite-count N`: agents carried over untouched and used as parents (default: 4)
+- `--mutation-rate R`: probability that a child's weight tensor is mutated at all (default: 0.8)
+- `--mutation-strength S`: scale of the noise added to a mutated tensor (default: 0.03)
+- `--sampled`: sample actions instead of playing the argmax, which turns a generation's scores into a lottery
 
-```bash
-# Fast headless training
-uv run run-ai.py --population-size 500
+*network* - shape and placement of the policy
 
-# Smaller and dumber network, even faster
-uv run run-ai.py --population-size 1000 --hidden-sizes 64 32 16
+- `--hidden-sizes N1 N2 N3`: sizes of the three hidden layers (default: 256 128 64), smaller is faster and dumber
+- `--device auto|cpu|cuda`: where the population runs (default: auto)
+- `--threads N`: torch CPU threads (default: 4)
 
-# Watch a run at 4x speed
-uv run run-ai.py --show-window --speed 4
+*simulation* - the level and the episode played on it
 
-# Watch it go as fast as the display can keep up with
-uv run run-ai.py --show-window --speed max
-```
+- `--map PATH`: level file to train on (default: maps/level_1.txt)
+- `--episode-seconds S`: in-game time budget per spawn point (default: 30)
+- `--tick-rate N`: simulation ticks per in-game second (default: 90)
+- `--action-repeat N`: physics ticks a chosen action is held for (default: 2)
+- `--checkpoints`: use the level checkpoints as extra spawn points
 
-### Reading The Window
+*run* - where the run starts and when it stops
 
-The renderer encodes each agent's state in its sprite, so a glance at the screen is enough to tell the
-population apart:
+- `--generations N`: stop after N generations (default: 0, runs forever)
+- `--seed N`: seed python, numpy and torch so a run replays exactly
+- `--load-latest-generation-weights`: start from the most recent weight file
 
-- **Fill color**: the agent's fitness rank in the population, from red (worst) to teal (best)
-- **Chevron**: the direction it is moving, a square when it is standing still
-- **Blue arrow above the head**: the agent is rising, so it jumped
-- **Gold outline**: an elite carried over untouched from the previous generation
-- **Violet outline**: a re-randomised agent, kept for diversity
-- **Dark outline**: the agent the camera follows, the best one still alive
-- **Grey**: dead, **violet fill**: reached the flag
+*display* - only meaningful together with `--show-window`
 
-The panels cover the run (generation, time, living agents, best fitness, throughput and framerate), the
-followed agent, the hyper-parameters the run uses, and the fitness distribution of the population next to
-the best score of every generation so far.
+- `--show-window`: render the run instead of training headless
+- `--speed S`: simulation speed multiplier, or `max` to run as fast as the framerate survives (default: 1)
+- `--fps N`: target framerate (default: 0, uses the display refresh rate)
 
 ### Performance
 
