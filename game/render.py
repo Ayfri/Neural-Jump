@@ -114,7 +114,7 @@ def _panel_background(width: int, height: int) -> Surface:
 	return surface
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=FITNESS_BUCKETS * 9)  # Every (bucket, heading, state) sprite, so a full population never evicts one
 def _body_sprite(bucket: int, direction: int, state: int) -> Surface:
 	"""
 	One player sprite: fill encodes the fitness rank, the stroke its state, the chevron its heading.
@@ -251,10 +251,13 @@ class Renderer:
 		if not visible.any():
 			return
 
-		buckets = self._fitness_buckets(fitness)
-		states = world.dead.astype(np.int64) + world.win.astype(np.int64) * 2
-		directions = np.sign(world.change_x).astype(np.int64)
-		rising = world.change_y < 0
+		# Read as python lists: pulling 300 values out of an array one index at a time costs more than the loop
+		buckets = self._fitness_buckets(fitness).tolist()
+		states = (world.dead.astype(np.int64) + world.win.astype(np.int64) * 2).tolist()
+		directions = np.sign(world.change_x).astype(np.int64).tolist()
+		rising = (world.change_y < 0).tolist()
+		screen_x = screen_x.tolist()
+		screen_y = screen_y.tolist()
 
 		bodies: list[Blit] = []
 		markers: list[Blit] = []
@@ -264,10 +267,10 @@ class Renderer:
 		focus_ring = _ring_sprite(FOCUS_RING, 5, 2)
 		random_start = world.count - hud.random_count
 
-		for index in np.flatnonzero(visible):
-			x, y = int(screen_x[index]), int(screen_y[index])
-			state = int(states[index])
-			bodies.append((_body_sprite(int(buckets[index]), int(directions[index]), state), (x, y)))
+		for index in np.flatnonzero(visible).tolist():
+			x, y = screen_x[index], screen_y[index]
+			state = states[index]
+			bodies.append((_body_sprite(buckets[index], directions[index], state), (x, y)))
 			if state == 0 and rising[index]:
 				markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
 			if index < hud.elite_count:
