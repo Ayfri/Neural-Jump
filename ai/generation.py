@@ -178,7 +178,10 @@ class Generation:
 					if self.episode_over():
 						break
 
-			self.rewards += self.final_rewards()
+			final = self.final_rewards()
+			self.rewards += final
+			if self.rollout is not None:
+				self.rollout.finish_episode(final)
 			self.should_skip_checkpoint = False
 
 		self.best_fitness_ever = max(self.best_fitness_ever, float(self.rewards.max()))
