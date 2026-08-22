@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 
 	evolution = parser.add_argument_group('evolution', 'How a generation is selected and bred')
-	evolution.add_argument('--population-size', type=int, default=DEFAULT_POPULATION_SIZE, help='agents per generation, a tick costs almost the same at 300 as at 100')
+	evolution.add_argument('--population-size', type=int, default=DEFAULT_POPULATION_SIZE, help='agents per generation, a tick at 300 costs about 1.4x a tick at 100')
 	evolution.add_argument('--elite-count', type=int, default=DEFAULT_ELITE_COUNT, help='agents carried over untouched and used as parents')
 	evolution.add_argument('--mutation-rate', type=float, default=DEFAULT_MUTATION_RATE, help="probability that a child's weight tensor is mutated at all")
 	evolution.add_argument('--mutation-strength', type=float, default=DEFAULT_MUTATION_STRENGTH, help='scale of the noise added to a mutated tensor')
