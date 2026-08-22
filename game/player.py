@@ -42,18 +42,18 @@ class Player(Sprite):
 
 		self.calculate_near_platforms()
 
-		# Check horizontal collisions
+		# x is resolved fully before y moves at all, so a diagonal move can't tunnel through a corner
 		for block in self.rect.collideobjectsall(self._near_platforms):
 			if not isinstance(block, Platform):
 				continue
-				
+
 			if block.tile_data.get('reward', False):
 				self.finished_reward = block.tile_data['reward']
 				if block.tile_data['reward'] == 1:
 					self.win = True
 					if tick is not None:
 						self.win_tick = tick
-				break
+				break  # A reward tile isn't solid, so nothing after it should push the player back out
 
 			if not block.tile_data.get('is_solid', False):
 				continue
@@ -65,7 +65,6 @@ class Player(Sprite):
 
 		self.rect.y += self.change_y
 
-		# Check vertical collisions
 		for block in self.rect.collideobjectsall(self._near_platforms):
 			if not isinstance(block, Platform):
 				continue
@@ -76,7 +75,7 @@ class Player(Sprite):
 					self.win = True
 					if tick is not None:
 						self.win_tick = tick
-				break
+				break  # Same as above: a reward tile is never solid
 
 			if not block.tile_data.get('is_solid', False):
 				continue
@@ -90,11 +89,13 @@ class Player(Sprite):
 
 	def calc_grav(self) -> None:
 		if self.change_y == 0.0:
+			# Nudge instead of leaving it at 0, otherwise a grounded player never reports as falling
 			self.change_y = 1.0
 		else:
 			self.change_y += PLAYER_GRAVITY
 
 	def check_death(self) -> bool:
+		# 2 rows of margin: dying exactly at the bottom row would clip the sprite off-screen before the death shows
 		if self.rect.top >= (self.level.height - 2) * TILE_SIZE:
 			self.set_dead()
 			return True
@@ -108,6 +109,7 @@ class Player(Sprite):
 		if self.check_death():
 			return
 
+		# Probe one pixel below by nudging the rect down, since standing still means zero overlap with the ground
 		self.rect.y += 2
 		platform_hit_list = self.rect.collideobjectsall(self._near_platforms)
 		self.rect.y -= 2

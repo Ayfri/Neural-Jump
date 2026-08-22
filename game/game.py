@@ -52,7 +52,6 @@ class Game:
 		self.additional_draws: list[tuple[Surface, tuple[int, int]]] = []
 
 	def add_key_action(self, key: int, action: Callable[[], None], description: str = "") -> None:
-		"""Add a custom key action to the game."""
 		self.key_actions[key] = (action, description)
 
 	def handle_inputs(self) -> None:
@@ -61,7 +60,6 @@ class Game:
 				pygame.quit()
 
 			if event.type == pygame.KEYDOWN:
-				# Handle custom key actions first
 				if event.key in self.key_actions:
 					action, _ = self.key_actions[event.key]
 					action()
@@ -84,12 +82,12 @@ class Game:
 
 			if event.type == pygame.KEYUP:
 				if self.player is not None:
+					# Guarded by the sign of change_x, so releasing one key while the other is still held doesn't stop the player
 					if event.key == pygame.K_LEFT and self.player.change_x < 0:
 						self.player.stop()
 					if event.key == pygame.K_RIGHT and self.player.change_x > 0:
 						self.player.stop()
 
-			# Restart the game when typing R
 			if event.type == pygame.KEYDOWN and event.key == pygame.K_r and self.player is not None:
 				self.level.restart()
 				spawn_point = self.level.get_random_spawn_point(self.use_checkpoints)
@@ -140,9 +138,8 @@ class Game:
 		if not alive_players:
 			return
 
+		# The camera follows whoever is furthest along, so a leading player never scrolls out of view
 		alive_players.sort(key=lambda player: player.rect.x, reverse=True)
-
-		# Update followed players (no need for is_followed attribute)
 		self.followed_player = alive_players[0]
 		self.level.follow_player(self.followed_player)
 
@@ -170,7 +167,6 @@ class Game:
 		for active_sprite in self.active_sprite_list:
 			self.draw_sprite(active_sprite)
 
-		# Draw keyboard shortcuts with reduced opacity
 		y_offset = SCREEN_HEIGHT - 100
 		self.draw_text("R - Restart", 10, y_offset, font_size=16, alpha=128)
 		y_offset += 20
@@ -179,7 +175,6 @@ class Game:
 		self.draw_text("Arrow Keys - Move", 10, y_offset, font_size=16, alpha=128)
 		y_offset += 20
 
-		# Draw custom key actions
 		for key, (_, description) in self.key_actions.items():
 			if description:
 				key_name = pygame.key.name(key).upper()

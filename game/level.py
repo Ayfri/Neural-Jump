@@ -14,10 +14,7 @@ if TYPE_CHECKING:
 
 
 def _search_maps_folder(folder: str) -> str:
-	"""
-	Returns the absolute path to the maps folder.
-	Search into the folder of the current script, then goes into parent folder until root folder.
-	"""
+	"""Returns the absolute path to the maps folder, walking up from this file until it is found."""
 	current_folder: str = os.path.dirname(os.path.abspath(__file__))
 	while current_folder != '/':
 		if folder in os.listdir(current_folder):
@@ -93,21 +90,14 @@ class Level:
 		return [platform for column in self.platform_columns[first:last + 1] for platform in column]
 
 	def get_random_spawn_point(self, use_checkpoints: bool = False) -> tuple[int, int]:
-		"""
-		Returns a random spawn point from the available checkpoints or the default spawn point.
-		:param use_checkpoints: Whether to use checkpoints as spawn points
-		:return: A tuple containing the x and y coordinates of the spawn point
-		"""
+		"""Returns a random checkpoint, or the default spawn point if checkpoints are off or there are none."""
 		if use_checkpoints and self.checkpoints:
 			import random
 			return random.choice(self.checkpoints)
 		return self.spawn_point
 
 	def follow_player(self, player: 'Player'):
-		"""
-		Shift the world according to the player's position.
-		:param player: The player object
-		"""
+		"""Centers the camera on the player horizontally, keeping a fixed height."""
 		self.camera.centerx = player.rect.centerx
 		self.camera.centery = TILE_SIZE * 12
 		return
