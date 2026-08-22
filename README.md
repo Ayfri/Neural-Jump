@@ -67,8 +67,10 @@ uv run run-ai.py --show-window --speed 4                          # watchable
 
 Every agent's state is in its sprite, so one glance reads the whole population:
 
-- **Body color**: fitness rank, red (worst) to teal (best). **Grey with shut eyes**: dead. **Blue body**: reached the flag
-- **Eyes**: heading, pushed left or right, centred while standing still. **Blue arrow above the head**: rising, so it jumped
+- **Body color**: fitness rank, red (worst) to teal (best). **Blue body**: reached the flag
+- **Faded grey ghost with shut eyes**: dead, dimmed out of the way of the agents still running, and carrying no outline
+- **Heading**: the face slides forward, both pupils sit against the front of their whites and the light moves to the
+  leading edge; standing still, the face is centred and symmetric. **Blue arrow above the head**: rising, so it jumped
 - **Gold outline**: an elite carried over untouched. **Violet outline**: a re-randomised agent, kept for diversity
 - **White outline**: the agent the camera follows, the best one still alive
 
@@ -257,16 +259,24 @@ What is left is the pass itself, bound by reading every agent's weights: 300 age
 parameters is 34 MB, near the memory bandwidth of the card. That is also why the observation is worth
 keeping small, and why `--hidden-sizes` is the last lever on it.
 
-**A frame is a blit and two lists.** The sky, the terrain, the checkpoints and the goal never move, so the
-whole level is painted once into a single opaque surface in the display's own format and a frame draws it with
-one copy of the camera rectangle, whatever the map size. Over it go two batched `blits` calls, one for the
-bodies and one for the markers, filled only with what the camera actually covers: the players are tested
-against the screen as one numpy mask, and the coins are held sorted by x so two binary searches cut the map
-down to the column in view.
+**A frame is a handful of blits and two lists.** Behind everything sits a parallax backdrop: a sky gradient, a
+star field and three mountain ranges, each one a viewport-sized surface baked at startup and scrolled at its own
+fraction of the camera, from 0.05 for the stars to 0.36 for the nearest range. The scrolling layers tile
+horizontally, so each is drawn twice side by side whatever the offset, and a range is clipped to the rows the one
+in front of it does not already cover.
+
+The terrain and the goal never move, so the whole level is painted once into a single surface in the display's
+own format, with the air left as a run-length encoded key colour. That makes the level blit skip the empty sky
+instead of blending it, which is worth about a hundred times the cost of the same copy with a real alpha channel.
+Over it go two batched `blits` calls, one for the bodies and one for the markers, filled only with what the camera
+actually covers: the players are tested against the screen as one numpy mask, and the coins are held sorted by x
+so two binary searches cut the map down to the column in view. Coins and checkpoints are the two things drawn per
+frame rather than baked, the coins because which are left depends on the agent being followed, the checkpoints
+because their haze is translucent and a key colour cannot carry that.
 
 **Nothing is painted twice.** Every sprite is a character grid blown up with nearest-neighbour scaling, cached
 under the values that shaped it, and there are few enough of those to cache the lot: sixteen terrain blocks
-per speckle layout, one sprite per fitness bucket, heading and state. A frame never draws a shape, it only
+per speckle layout, one sprite per fitness bucket, heading, state and fade. A frame never draws a shape, it only
 copies surfaces.
 
 ## Layout
