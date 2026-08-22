@@ -1,7 +1,7 @@
 import re
 import time
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 import torch
@@ -9,6 +9,9 @@ from numpy.typing import NDArray
 
 from ai.population import DEFAULT_HIDDEN_SIZES, Population, pick_device, seed_everything
 from game.world import World
+
+if TYPE_CHECKING:
+	from game.render import Renderer
 
 # Evolution
 DEFAULT_POPULATION_SIZE: Final[int] = 300
@@ -122,7 +125,7 @@ class Generation:
 		self._previous_y = np.zeros(population_size, dtype=np.float64)
 		self._actions = np.zeros(population_size, dtype=np.int64)
 
-		self.renderer = None
+		self.renderer: Renderer | None = None
 		self.ticks_per_frame = 1.0
 		self._tick_budget = 0.0
 		self._speed_time = 0.0

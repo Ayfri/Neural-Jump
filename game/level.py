@@ -99,7 +99,7 @@ class Level:
 			return random.choice(self.checkpoints)
 		return self.spawn_point
 
-	def follow_player(self, player: 'Player'):
+	def follow_player(self, player: 'Player') -> None:
 		"""Centers the camera on the player horizontally, keeping a fixed height."""
 		self.camera.centerx = player.rect.centerx
 		self.camera.centery = TILE_SIZE * 12

@@ -1,3 +1,5 @@
+from typing import override
+
 import pygame
 from pygame.sprite import Sprite
 
@@ -29,6 +31,7 @@ class Player(Sprite):
 		self.win_tick: int | None = None
 		self._near_platforms: list[Platform] = []
 
+	@override
 	def update(self, tick: int | None = None) -> None:
 		if self.dead or self.win:
 			return

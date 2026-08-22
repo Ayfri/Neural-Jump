@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import override
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
 
@@ -17,6 +18,7 @@ DEFAULT_THREADS: int = 4  # More threads than this only adds synchronisation ove
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 	"""Shows the default of every option except the on/off flags, where printing one only misleads."""
 
+	@override
 	def _get_help_string(self, action: argparse.Action) -> str | None:
 		if isinstance(action, argparse._StoreTrueAction | argparse._StoreFalseAction):
 			return action.help

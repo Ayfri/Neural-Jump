@@ -139,11 +139,11 @@ class Game:
 			return
 
 		# The camera follows whoever is furthest along, so a leading player never scrolls out of view
-		alive_players.sort(key=lambda player: player.rect.x, reverse=True)
+		alive_players.sort(key=lambda player: player.rect.x, reverse=True)  # pyrefly: ignore[implicit-any-lambda]
 		self.followed_player = alive_players[0]
 		self.level.follow_player(self.followed_player)
 
-	def draw_sprite(self, sprite: HasImageAndRect):
+	def draw_sprite(self, sprite: HasImageAndRect) -> None:
 		assert self.screen is not None
 		self.screen.blit(sprite.image, (sprite.rect.x - self.level.camera.x, sprite.rect.y - self.level.camera.y))
 
