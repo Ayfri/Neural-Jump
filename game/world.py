@@ -2,6 +2,7 @@ import os
 from typing import Final
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 
 from game.constants import AGENT_VISION_DISTANCE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
@@ -112,6 +113,14 @@ class World:
 		self._max_row = self.height + 2 * GRID_PADDING - 1
 		self._max_column = self.width + 2 * GRID_PADDING - 1
 
+		# Every 7x7x4 window of the map, flattened and baked once: an observation is then a single gather of
+		# contiguous rows instead of a broadcast fancy index rebuilt per tick.
+		windows = sliding_window_view(self.padded_grid, (GRID_SIDE, GRID_SIDE), axis=(0, 1))
+		self._window_stride = windows.shape[1]
+		self._windows = np.ascontiguousarray(windows.transpose(0, 1, 3, 4, 2)).reshape(-1, GRID_FEATURES)
+		self._max_window_row = windows.shape[0] - 1
+		self._max_window_column = self._window_stride - 1
+
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
 		self.x.fill(spawn_x)
@@ -156,15 +165,16 @@ class World:
 		player's own speed and ground state. Passing the rollout's slot writes the transitions in place.
 		"""
 		target = self._observation if out is None else out
-		center_x = self.x + PLAYER_W / 2
-		center_y = self.y + PLAYER_H / 2 - self.offset_y
-		tile_x = np.floor_divide(center_x, TILE_SIZE).astype(np.int64)
-		tile_y = np.floor_divide(center_y, TILE_SIZE).astype(np.int64)
+		tile_x = np.floor_divide(self.x + PLAYER_W / 2, TILE_SIZE).astype(np.int64)
+		tile_y = np.floor_divide(self.y + PLAYER_H / 2 - self.offset_y, TILE_SIZE).astype(np.int64)
 
-		rows = np.clip(tile_y + GRID_PADDING, AGENT_VISION_DISTANCE, self._max_row - AGENT_VISION_DISTANCE)[:, None, None] + self._offsets[None, :, None]
-		columns = np.clip(tile_x + GRID_PADDING, AGENT_VISION_DISTANCE, self._max_column - AGENT_VISION_DISTANCE)[:, None, None] + self._offsets[None, None, :]
+		# The window table is indexed by its top-left corner, so the centre clamp becomes a corner clamp
+		rows = np.clip(tile_y + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self._max_window_row)
+		columns = np.clip(tile_x + GRID_PADDING - AGENT_VISION_DISTANCE, 0, self._max_window_column)
+		rows *= self._window_stride
+		rows += columns
 
-		target[:, :GRID_FEATURES] = self.padded_grid[rows, columns].reshape(self.count, GRID_FEATURES)
+		np.take(self._windows, rows, axis=0, out=target[:, :GRID_FEATURES])
 		target[:, GRID_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
 		target[:, GRID_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
 		target[:, GRID_FEATURES + 2] = self.on_ground()
@@ -192,8 +202,9 @@ class World:
 
 		np.add(self.y, self.change_y, out=self.y, where=alive)
 		np.trunc(self.y, out=self.y, where=alive)
-		self._resolve_vertical(alive)
-		self._collect_rewards(alive, tick)
+		# x is final once the horizontal pass is done, so the last two passes share its tile columns
+		columns = self._resolve_vertical(alive)
+		self._collect_rewards(alive, tick, columns)
 
 	def _jump(self, mask: NDArray[np.bool_]) -> None:
 		if not mask.any():
@@ -223,7 +234,8 @@ class World:
 		x = np.where(going_left & hit_right & ~hit_left, (right + 1) * TILE_SIZE, x)
 		np.copyto(self.x, x, where=alive)
 
-	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> None:
+	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+		"""Resolves the vertical move and hands back the tile columns, which the reward pass reuses as is."""
 		left, right = self._tile_columns()
 		top, bottom = self._tile_rows(self.y)
 		two_rows = bottom > top
@@ -244,9 +256,10 @@ class World:
 		blocked = (going_down | going_up) & (hit_top | hit_bottom)
 		np.copyto(self.y, y, where=alive)
 		np.copyto(self.change_y, 0.0, where=alive & blocked)
+		return left, right
 
-	def _collect_rewards(self, alive: NDArray[np.bool_], tick: int) -> None:
-		left, right = self._tile_columns()
+	def _collect_rewards(self, alive: NDArray[np.bool_], tick: int, columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
+		left, right = columns
 		top, bottom = self._tile_rows(self.y)
 		values = self._gather(self.padded_reward, np.stack([top, bottom]), np.stack([left, right]))
 		best = values.reshape(4, -1).max(axis=0)
