@@ -15,6 +15,7 @@ uv sync
 uv run run-ai.py                              # headless training, as fast as the machine allows
 uv run run-ai.py --show-window --speed max    # watch it, as fast as the framerate survives
 uv run run-game.py                            # play the level yourself
+uv run run-game.py --spawn 3                  # start on the third checkpoint
 ```
 
 Python 3.13+, pygame-ce for the window, and `uv sync` pulls torch with CUDA 13 on Windows and Linux. CPU
@@ -88,6 +89,34 @@ best score of every generation so far.
 | `R` | Start the whole run over: random weights, generation 1, records cleared |
 
 They are listed in the legend at the bottom left, and the speed shows in the Training panel.
+
+## Playing it yourself
+
+`run-game.py` puts you on the same `World` the agents train on, drawn through the same renderer, so the
+physics under your feet and the panels around them are the ones they are scored on. A run ends on the flag or
+on a death, a banner says what it was worth, and the next attempt starts a second later.
+
+- `--map PATH`: level file to play (default: maps/level_1.txt)
+- `--tick-rate N`: simulation ticks per in-game second (default: 90)
+- `--fps N`: target framerate (default: 0, uses the display refresh rate)
+- `--spawn N`: spawn point to start on (default: 0, the start, the rest are the checkpoints)
+
+| Key | What it does |
+| --- | --- |
+| `Arrows`, `WASD`, `ZQSD` | Move |
+| `Space`, `Up`, `W` | Jump, aimed by the direction held on the same tick |
+| `P` | Pause and resume |
+| `Tab` | Hide the panels, the banner stays |
+| `R` | Retry from the current spawn point |
+| `G` | Start on the next spawn point, wrapping back to the beginning of the level |
+| `1` | Back to speed x1 |
+| `-` / `=` | Halve or double the simulation speed, down to x0.1 and up to x4, also on the numpad |
+| `Escape` | Quit, printing what the session scored |
+
+The Run panel tracks the session: time, best time, progress through the map, coins, attempts, wins and
+deaths. The Player panel is the debug view: pixel position, tile, both speed components, ground contact,
+spawn point and simulation speed. Slow motion is the useful one there, a jump arc lasts about 42 ticks and at
+x0.1 it can be read frame by frame.
 
 ## The network
 
@@ -233,9 +262,10 @@ keeping small, and why `--hidden-sizes` is the last lever on it.
 ## Layout
 
 `ai/` holds the learning code: `generation.py` is the training loop, rewards and weight files, `population.py`
-is the batched network. `game/` holds the engine: `world.py` is the batched numpy simulation used for
-training, `render.py` the camera-culled renderer, and the rest is the manual game. Levels are text files in
-`maps/`, weights land in `weights/`, physics constants live in `game/settings.py`.
+is the batched network. `game/` holds the engine: `world.py` is the batched numpy simulation, `render.py` the
+camera-culled renderer and the panels drawn over it, `play.py` the human-played session on top of both. Both
+entry points fill the same `Hud` and the renderer only lays it out. Levels are text files in `maps/`, weights
+land in `weights/`, physics constants live in `game/settings.py`.
 
 ## License
 
