@@ -9,7 +9,9 @@ from numpy.typing import NDArray
 from pygame import Rect, Surface
 from pygame.font import Font
 
-from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, SEMI_YELLOW, TILE_SIZE, WHITE
+from game.settings import (
+	CHECKPOINT_ALPHA, CHECKPOINT_COLOR, CHECKPOINT_GLOW, COIN_COLOR, COIN_SHINE, SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE, WHITE,
+)
 from game.tiles import TILES
 from game.world import PLAYER_H, PLAYER_W, World
 
@@ -20,7 +22,7 @@ type Blit = tuple[Surface, tuple[int, int]]
 FITNESS_RAMP: Final[tuple[Color, ...]] = ((198, 40, 62), (226, 118, 38), (226, 196, 46), (128, 200, 60), (36, 190, 168))
 FITNESS_BUCKETS: Final[int] = 12
 DEAD_COLOR: Final[Color] = (176, 178, 188)
-WON_COLOR: Final[Color] = (120, 90, 220)
+WON_COLOR: Final[Color] = (58, 120, 246)
 ELITE_RING: Final[Color] = (240, 190, 60)
 RANDOM_RING: Final[Color] = (168, 92, 232)
 FOCUS_RING: Final[Color] = (24, 24, 30)
@@ -73,6 +75,9 @@ class Hud:
 	checkpoint: tuple[int, int] = (1, 1)
 	best_ever: float = 0.0
 	best_time: float = 0.0  # Fastest win in seconds, 0 while the flag has never been touched
+	coins: int = 0  # Coins banked by the focused agent
+	best_coins: int = 0
+	coin_count: int = 0  # Coins the map holds in total
 	paused: bool = False
 	elite_count: int = 0
 	random_count: int = 0
@@ -151,6 +156,29 @@ def _ring_sprite(color: Color, gap: int, thickness: int) -> Surface:
 
 
 @lru_cache(maxsize=2)
+def _coin_sprite() -> Surface:
+	"""A coin, drawn narrower than its tile so a trail of them reads as a line of dots rather than a wall."""
+	surface = Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+	center = (TILE_SIZE // 2, TILE_SIZE // 2)
+	pygame.draw.circle(surface, _shade(COIN_COLOR, 0.6), center, 11)
+	pygame.draw.circle(surface, COIN_COLOR, center, 9)
+	pygame.draw.circle(surface, COIN_SHINE, (center[0] - 3, center[1] - 3), 3)
+	return surface
+
+
+@lru_cache(maxsize=2)
+def _checkpoint_sprite() -> Surface:
+	"""A checkpoint: a translucent violet cell with a bright frame, so it reads over both terrain and sky."""
+	surface = Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+	body = Rect(0, 0, TILE_SIZE, TILE_SIZE)
+	pygame.draw.rect(surface, (*CHECKPOINT_COLOR, CHECKPOINT_ALPHA), body, border_radius=4)
+	pygame.draw.rect(surface, (*CHECKPOINT_GLOW, 255), body, width=3, border_radius=4)
+	pygame.draw.polygon(surface, (*CHECKPOINT_GLOW, 235), [(14, 9), (28, 15), (14, 21)])
+	pygame.draw.rect(surface, (*CHECKPOINT_GLOW, 235), Rect(11, 9, 3, 22))
+	return surface
+
+
+@lru_cache(maxsize=2)
 def _jump_sprite() -> Surface:
 	surface = Surface((12, 9), pygame.SRCALPHA)
 	pygame.draw.polygon(surface, JUMP_MARKER, [(6, 0), (11, 8), (0, 8)])
@@ -182,8 +210,13 @@ class Renderer:
 		self.camera = Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
 		self.key_actions: dict[int, tuple[Callable[[], None], str]] = {}
 		self.show_hud = True
+		# World y and surface y differ by `_origin_y` on maps taller than the screen, where the map starts above it
+		self._origin_y = min(0, world.offset_y)
 		self.level_surface = self._bake_level(world)
 		self._ranks = np.zeros(world.count, dtype=np.int64)
+		# Coins are drawn per frame instead of baked: which ones are left depends on the agent being followed
+		positions = np.array(world.coin_positions, dtype=np.int64).reshape(-1, 2)
+		self._coin_x, self._coin_y = positions[:, 0], positions[:, 1]
 
 	@staticmethod
 	def desktop_fps() -> int:
@@ -197,21 +230,23 @@ class Renderer:
 	def measured_fps(self) -> float:
 		return self.clock.get_fps()
 
-	@staticmethod
-	def _bake_level(world: World) -> Surface:
-		surface = Surface((world.width * TILE_SIZE, world.height * TILE_SIZE + max(0, world.offset_y)))
+	def _bake_level(self, world: World) -> Surface:
+		bottom = max(SCREEN_HEIGHT, world.offset_y + world.height * TILE_SIZE)
+		surface = Surface((world.width * TILE_SIZE, bottom - self._origin_y))
 		surface.fill(WHITE)
 		for y in range(world.height):
 			for x in range(world.width):
-				color = TILES.get(str(world.chars[y, x]), {}).get('color')
-				if color is not None:
-					surface.fill(color, Rect(x * TILE_SIZE, y * TILE_SIZE + world.offset_y, TILE_SIZE, TILE_SIZE))
+				tile = TILES.get(str(world.chars[y, x]), {})
+				color = tile.get('color')
+				if color is not None and not tile.get('is_coin', False):
+					surface.fill(color, Rect(x * TILE_SIZE, self.to_surface(y * TILE_SIZE + world.offset_y), TILE_SIZE, TILE_SIZE))
 		for checkpoint_x, checkpoint_y in world.checkpoints:
-			checkpoint = Surface((TILE_SIZE, TILE_SIZE))
-			checkpoint.fill(SEMI_YELLOW)
-			checkpoint.set_alpha(128)
-			surface.blit(checkpoint, (checkpoint_x, checkpoint_y))
+			surface.blit(_checkpoint_sprite(), (checkpoint_x, self.to_surface(checkpoint_y)))
 		return surface
+
+	def to_surface(self, world_y: int) -> int:
+		"""World y to level surface y: the two only differ when the map reaches above the top of the screen."""
+		return world_y - self._origin_y
 
 	def add_key_action(self, key: int, action: Callable[[], None], description: str = '') -> None:
 		self.key_actions[key] = (action, description)
@@ -228,7 +263,9 @@ class Renderer:
 
 	def draw(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
 		self._move_camera(focus_index)
-		self.screen.blit(self.level_surface, (0, 0), self.camera)
+		view = Rect(self.camera.left, self.to_surface(self.camera.top), self.camera.width, self.camera.height)
+		self.screen.blit(self.level_surface, (0, 0), view)
+		self._draw_coins(focus_index)
 		self._draw_players(focus_index, fitness, hud)
 		if self.show_hud:
 			self._draw_hud(focus_index, fitness, hud)
@@ -240,7 +277,23 @@ class Renderer:
 		self.camera.centerx = int(self.world.x[focus_index]) + PLAYER_W // 2
 		self.camera.centery = int(self.world.y[focus_index]) + PLAYER_H // 2
 		self.camera.left = max(0, min(self.camera.left, self.level_surface.get_width() - SCREEN_WIDTH))
-		self.camera.top = max(0, min(self.camera.top, self.level_surface.get_height() - SCREEN_HEIGHT))
+		lowest = self._origin_y + self.level_surface.get_height() - SCREEN_HEIGHT
+		self.camera.top = max(self._origin_y, min(self.camera.top, lowest))
+
+	def _draw_coins(self, focus_index: int) -> None:
+		"""The coins the followed agent has not banked yet, culled to the camera."""
+		if not len(self._coin_x):
+			return
+		left, top = self.camera.left, self.camera.top
+		x = self._coin_x - left
+		y = self._coin_y - top
+		visible = (x > -TILE_SIZE) & (x < SCREEN_WIDTH) & (y > -TILE_SIZE) & (y < SCREEN_HEIGHT)
+		visible &= ~self.world.collected[focus_index]
+		if not visible.any():
+			return
+
+		coin = _coin_sprite()
+		self.screen.blits([(coin, position) for position in zip(x[visible].tolist(), y[visible].tolist())], doreturn=False)
 
 	def _fitness_buckets(self, fitness: NDArray[np.float64]) -> NDArray[np.int64]:
 		"""Buckets agents by their rank rather than their raw fitness, so the colors stay readable."""
@@ -306,6 +359,7 @@ class Renderer:
 			Gauge('Alive', f'{alive}/{world.count}', alive / max(1, world.count)),
 			('Best', f'{float(fitness.max()) if fitness.size else 0.0:.1f}'),
 			('Record', f'{hud.best_ever:.1f}' + (f'  {hud.best_time:.2f}s' if hud.best_time > 0 else '')),
+			Gauge('Coins', f'{hud.best_coins}/{hud.coin_count}', hud.best_coins / max(1, hud.coin_count), COIN_COLOR),
 			('Ticks/s', f'{hud.speed:,.0f}  x{hud.sim_speed:.0f}'),
 			Gauge('FPS', f'{fps:.0f}/{self.target_fps}', fps / max(1, self.target_fps)),
 		])
@@ -313,6 +367,7 @@ class Renderer:
 			('Agent', f'#{focus_index}' + (' elite' if focus_index < hud.elite_count else '')),
 			('Fitness', f'{float(fitness[focus_index]):.1f}'),
 			('Position', f'{int(world.x[focus_index])}, {int(world.y[focus_index])}'),
+			('Coins', f'{hud.coins}/{hud.coin_count}'),
 		])
 
 		width, right_width = 236, 236
@@ -402,7 +457,11 @@ class Renderer:
 
 	def _draw_legend(self) -> None:
 		"""Bottom-left: what the shapes and colors on the players mean, plus the key bindings."""
-		entries = [(ELITE_RING, 'Elite'), (RANDOM_RING, 'Random'), (FOCUS_RING, 'Focus'), (JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'), (WON_COLOR, 'Won')]
+		entries = [
+			(ELITE_RING, 'Elite'), (RANDOM_RING, 'Random'), (FOCUS_RING, 'Focus'),
+			(JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'), (WON_COLOR, 'Won'),
+			(COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'),
+		]
 		swatch_rows = (len(entries) + 2) // 3
 		hints = [(key, description) for key, (_, description) in self.key_actions.items() if description]
 		hint_rows = (len(hints) + HINT_COLUMNS - 1) // HINT_COLUMNS

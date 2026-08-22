@@ -35,6 +35,7 @@ class Level:
 		self.width = 0
 		self.tile_map: list[list[str]] = []
 		self.spawn_point = (0, 0)
+		self.offset_y = 0
 		self.checkpoints: list[tuple[int, int]] = []
 		self.platform_columns: list[list[Platform]] = []
 
@@ -64,6 +65,7 @@ class Level:
 		self.platform_columns = [[] for _ in range(self.width)]
 
 		offset_y = SCREEN_HEIGHT - (len(lines) * TILE_SIZE)
+		self.offset_y = offset_y
 
 		for y, line in enumerate(lines):
 			row: list[str] = []
@@ -86,6 +88,13 @@ class Level:
 
 			self.tile_map += [row]
 
+	def collect_coin(self, coin: Platform) -> None:
+		"""Takes a coin out of the level: `restart` reloads the map, so it comes back with the next run."""
+		self.platform_list.remove(coin)
+		column = coin.rect.x // TILE_SIZE
+		if 0 <= column < len(self.platform_columns) and coin in self.platform_columns[column]:
+			self.platform_columns[column].remove(coin)
+
 	def platforms_in_range(self, left: int, right: int) -> list[Platform]:
 		"""Returns the platforms whose column overlaps the [left, right] pixel range."""
 		first = max(0, left // TILE_SIZE)
@@ -100,9 +109,12 @@ class Level:
 		return self.spawn_point
 
 	def follow_player(self, player: 'Player') -> None:
-		"""Centers the camera on the player horizontally, keeping a fixed height."""
+		"""Centers the camera on the player, clamped to the map so it never scrolls past its edges."""
 		self.camera.centerx = player.rect.centerx
-		self.camera.centery = TILE_SIZE * 12
+		self.camera.centery = player.rect.centery
+		top = min(0, self.offset_y)
+		bottom = max(SCREEN_HEIGHT, self.offset_y + self.height * TILE_SIZE)
+		self.camera.top = max(top, min(self.camera.top, bottom - SCREEN_HEIGHT))
 
 	def restart(self) -> None:
 		if self.map is None:

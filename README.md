@@ -39,7 +39,7 @@ works too, it is just slower.
 *simulation* - the level and the episode played on it
 
 - `--map PATH`: level file to train on (default: maps/level_1.txt)
-- `--episode-seconds S`: in-game time budget per spawn point (default: 30)
+- `--episode-seconds S`: in-game time budget per spawn point (default: 60)
 - `--tick-rate N`: simulation ticks per in-game second (default: 90)
 - `--action-repeat N`: physics ticks a chosen action is held for (default: 2)
 - `--checkpoints`: use the level checkpoints as extra spawn points
@@ -93,15 +93,17 @@ They are listed in the legend at the bottom left, and the speed shows in the Tra
 
 A policy over a 7x7 tile view plus the player's own state:
 
-- **Input**: 56 features. One solid flag per tile, then the closest reward tile in view as `in view, dx, dy,
-  is the flag`, then horizontal speed, vertical speed and ground contact
+- **Input**: 59 features. One solid flag per tile, then the closest reward tile in view as `in view, dx, dy,
+  is the flag`, then the closest coin as `in view, dx, dy`, then horizontal speed, vertical speed and ground
+  contact
 - **Hidden**: 256, 128, 64 (LayerNorm on the first two, leaky ReLU)
 - **Output**: 3 logits (jump, left, right), played as an argmax
 
-Terrain gets a number per tile, rewards do not. The map holds 7 reward tiles out of 9,913, so a channel per
-tile for them would spend most of the observation saying "still nothing here", while one offset to the
-closest one points at the flag directly rather than leaving the network to read a position out of a one-hot
-grid.
+Terrain gets a number per tile, rewards and coins do not. The map holds 24 reward tiles and 215 coins out of
+22,800, so a channel per tile for them would spend most of the observation saying "still nothing here", while
+one offset to the closest one points at the flag directly rather than leaving the network to read a position
+out of a one-hot grid. The coin block is baked with the terrain, so it still points at a coin the agent has
+already banked.
 
 Every agent shares that shape, so the population lives in one `(agents, in, out)` tensor per layer and a
 forward pass for everyone is a single `baddbmm` per layer. Crossover, mutation and elitism are plain tensor
@@ -116,6 +118,8 @@ of two random elites, and a few slots are re-randomised for diversity.
 - **Backward**: -0.1, **stationary**: -0.05 after 5 ticks, **falling**: -0.02 past 5 pixels
 - **Death**: -20, **progress**: max distance / 20, plus up to 100 for how early the record was set, floored at -30
 - **Win**: distance / 10, +200 for the flag, plus up to 1200 on the square of the episode time left
+- **Coins**: +5 each, added to whatever the run scored, so the 215 coins of the level are worth 1075 to an
+  agent that could sweep them all, and a detour for one is always worth something
 
 Time is part of the fitness on both paths: an agent that touches the flag halfway through the episode scores
 300 of the 1200, one that touches it in the first tenth scores 970. An episode runs until every agent is dead
@@ -123,6 +127,37 @@ or has finished, so the winners of a generation are ranked against each other by
 
 Agents that stand still for 2 seconds, or end up behind where they were 6 seconds earlier, are killed so the
 generation ends sooner.
+
+## The level
+
+`maps/level_1.txt` is 760 tiles wide and 30 tall, read one character per tile:
+
+| Char | Tile |
+| --- | --- |
+| `#` | Solid terrain |
+| `.` | Air |
+| `P` | Spawn point |
+| `@` | Checkpoint, an extra spawn point under `--checkpoints`, drawn as a violet frame |
+| `o` | Coin, worth fitness and nothing else, drawn as a gold disc |
+| `F` | The flag: touching it wins the episode |
+| `R` | Treasure, worth 8000 to an agent that never reaches the flag |
+| `*` | Decoration, no collision |
+
+Geometry follows the jump: a jump rises 4.5 tiles and its arc covers 8, so steps stay within 3 tiles and gaps
+within 6. Every pit has a launch step before it and a coin road above it, which pays more than the flat
+crossing. Eleven zones run from tutorial steps to a comb of single pillars, a ceiling too low to jump under,
+a serpentine of blocks and ceilings, and a wall that has to be climbed. The fastest route through it is about
+44 seconds, against a 60 second episode.
+
+The map is 30 rows tall against a 22.5 row screen, so the camera follows agents off the top of it. Two zones
+are built around that height:
+
+- **The tower** (tiles 290-409) zigzags from the floor to the top row of the map, runs a high road of narrow
+  platforms across it, and comes back down. The ground under it is clear, so the fast line is to ignore it
+  and the paying line is to climb.
+- **The fork** (tiles 410-469) splits into a flat, empty low road and a gallery of 25 coins above it. The
+  gallery's staircase climbs to the left before it climbs to the right, which is the move an agent that only
+  ever holds right and jump never makes, so which of the two an agent takes is visible at a glance.
 
 ## Why the argmax
 
@@ -167,7 +202,7 @@ times the tick. Measured on a 4060 Ti.
 | 600 agents, CUDA | ~1,330 | ~800,000 |
 | 1000 agents, CUDA | ~1,000 | ~1,000,000 |
 
-At 90 ticks per in-game second, 100 agents playing a 30 second episode take about 1.1 seconds of wall clock.
+At 90 ticks per in-game second, 100 agents playing a 60 second episode take about 2.2 seconds of wall clock.
 
 **Physics is bound by numpy call overhead, not by data.** On 300-element arrays a numpy call costs far more
 than the arithmetic inside it, so the four collision passes are written to make as few calls as possible. The

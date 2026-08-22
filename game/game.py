@@ -10,7 +10,7 @@ from pygame.time import Clock
 
 from game.level import Level
 from game.player import Player
-from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, WHITE, SEMI_YELLOW
+from game.settings import CHECKPOINT_ALPHA, CHECKPOINT_COLOR, CHECKPOINT_GLOW, SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE, WHITE
 
 
 class HasImageAndRect(Protocol):
@@ -152,10 +152,11 @@ class Game:
 			return
 
 		assert self.screen is not None
+		checkpoint_surface = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+		body = Rect(0, 0, TILE_SIZE, TILE_SIZE)
+		pygame.draw.rect(checkpoint_surface, (*CHECKPOINT_COLOR, CHECKPOINT_ALPHA), body, border_radius=4)
+		pygame.draw.rect(checkpoint_surface, CHECKPOINT_GLOW, body, width=3, border_radius=4)
 		for checkpoint_x, checkpoint_y in self.level.checkpoints:
-			checkpoint_surface = pygame.Surface((40, 40))
-			checkpoint_surface.fill(SEMI_YELLOW)
-			checkpoint_surface.set_alpha(128)
 			self.screen.blit(checkpoint_surface, (checkpoint_x - self.level.camera.x, checkpoint_y - self.level.camera.y))
 
 	def draw(self) -> None:
@@ -166,6 +167,9 @@ class Game:
 		self.draw_checkpoints()
 		for active_sprite in self.active_sprite_list:
 			self.draw_sprite(active_sprite)
+
+		if self.player is not None:
+			self.draw_text(f"Coins: {self.player.coins}", 10, 10, font_size=22)
 
 		y_offset = SCREEN_HEIGHT - 100
 		self.draw_text("R - Restart", 10, y_offset, font_size=16, alpha=128)

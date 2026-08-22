@@ -26,6 +26,7 @@ class Player(Sprite):
 		self.change_x: float = 0.0
 		self.change_y: float = 0.0
 		self.dead = False
+		self.coins = 0
 		self.finished_reward: int | None = None
 		self.win = False
 		self.win_tick: int | None = None
@@ -49,6 +50,13 @@ class Player(Sprite):
 			if not isinstance(block, Platform):
 				continue
 
+			if block.tile_data.get('is_coin', False):
+				if not block.collected:
+					block.collected = True
+					self.coins += 1
+					self.level.collect_coin(block)
+				continue
+
 			if block.tile_data.get('reward', False):
 				self.finished_reward = block.tile_data['reward']
 				if block.tile_data['reward'] == 1:
@@ -69,6 +77,13 @@ class Player(Sprite):
 
 		for block in self.rect.collideobjectsall(self._near_platforms):
 			if not isinstance(block, Platform):
+				continue
+
+			if block.tile_data.get('is_coin', False):
+				if not block.collected:
+					block.collected = True
+					self.coins += 1
+					self.level.collect_coin(block)
 				continue
 
 			if block.tile_data.get('reward', False):
@@ -98,7 +113,7 @@ class Player(Sprite):
 
 	def check_death(self) -> bool:
 		# 2 rows of margin: dying exactly at the bottom row would clip the sprite off-screen before the death shows
-		if self.rect.top >= (self.level.height - 2) * TILE_SIZE:
+		if self.rect.top >= (self.level.height - 2) * TILE_SIZE + self.level.offset_y:
 			self.set_dead()
 			return True
 		return False
@@ -130,6 +145,7 @@ class Player(Sprite):
 
 	def revive(self) -> None:
 		self.dead = False
+		self.coins = 0
 		self.image.set_alpha(255)
 		self.change_x = 0.0
 		self.change_y = 0.0

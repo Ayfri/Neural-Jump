@@ -16,7 +16,8 @@ PLAYER_H: Final[int] = int(PLAYER_HEIGHT)
 GRID_SIDE: Final[int] = AGENT_VISION_DISTANCE * 2 + 1
 GRID_TILES: Final[int] = GRID_SIDE * GRID_SIDE  # One solid flag each, which is the whole terrain
 REWARD_FEATURES: Final[int] = 4  # in view, its offset in x and y, is it the flag, for the closest reward tile
-WINDOW_FEATURES: Final[int] = GRID_TILES + REWARD_FEATURES
+COIN_FEATURES: Final[int] = 3  # in view, its offset in x and y, for the closest uncollected coin
+WINDOW_FEATURES: Final[int] = GRID_TILES + REWARD_FEATURES + COIN_FEATURES
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
 OBSERVATION_SIZE: Final[int] = WINDOW_FEATURES + PLAYER_FEATURES
 # Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
@@ -51,30 +52,40 @@ def resolve_map_path(map_path: str) -> Path:
 	return search_maps_folder(path.parent) / path.name
 
 
-def closest_reward(windows: NDArray[np.float32]) -> NDArray[np.float32]:
+def closest_tile(windows: NDArray[np.float32], flag_feature: bool) -> NDArray[np.float32]:
 	"""
-	Summarises the reward tiles of a window: whether one is in view, where it is, and whether it is the flag.
+	Summarises the non-zero tiles of a window: whether one is in view, where it is, and optionally whether
+	it is the flag.
 
 	A map holds a handful of reward tiles in total, so a channel per tile spends most of the observation
-	saying "still nothing here". Four numbers carry what a player can act on instead, and point at the flag
+	saying "still nothing here". A few numbers carry what a player can act on instead, and point at the flag
 	directly rather than leaving the network to read a position out of a one-hot grid.
 	"""
 	rows, columns = np.divmod(np.arange(GRID_TILES), GRID_SIDE)
 	rows = rows - AGENT_VISION_DISTANCE
 	columns = columns - AGENT_VISION_DISTANCE
-	# Tiles walked nearest first, so the first hit of the scan is the closest reward
+	# Tiles walked nearest first, so the first hit of the scan is the closest one
 	order = np.argsort(rows ** 2 + columns ** 2, kind='stable')
 
 	found = windows[:, order] != 0
 	closest = order[found.argmax(axis=1)]
 	in_view = found.any(axis=1)
 
-	features = np.zeros((len(windows), REWARD_FEATURES), dtype=np.float32)
+	features = np.zeros((len(windows), 4 if flag_feature else 3), dtype=np.float32)
 	features[:, 0] = in_view
 	features[:, 1] = columns[closest] / AGENT_VISION_DISTANCE * in_view
 	features[:, 2] = rows[closest] / AGENT_VISION_DISTANCE * in_view
-	features[:, 3] = (windows[np.arange(len(windows)), closest] == 1) & in_view
+	if flag_feature:
+		features[:, 3] = (windows[np.arange(len(windows)), closest] == 1) & in_view
 	return features
+
+
+def near_grid(grid: NDArray[np.bool_]) -> NDArray[np.bool_]:
+	"""True where any of the 2x2 tiles starting at (row, column) is set, which is the box a player can touch."""
+	near = grid.copy()
+	near[:-1] |= grid[1:]
+	near[:, :-1] |= near[:, 1:].copy()
+	return near
 
 
 def tile_of(values: NDArray[np.float64]) -> NDArray[np.int64]:
@@ -104,6 +115,9 @@ class World:
 		self.win = np.zeros(count, dtype=np.bool_)
 		self.finished_reward = np.zeros(count, dtype=np.float32)
 		self.win_tick = np.full(count, -1, dtype=np.int32)
+		self.coins = np.zeros(count, dtype=np.int32)
+		self.collected = np.zeros((count, max(1, self.coin_count)), dtype=np.bool_)
+		self._agents = np.arange(count)
 
 		self._observation = np.zeros((count, OBSERVATION_SIZE), dtype=OBSERVATION_DTYPE)
 		self._offsets = np.arange(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1)
@@ -117,11 +131,14 @@ class World:
 		self.height = len(lines)
 		self.width = max(len(line) for line in lines)
 		self.offset_y = SCREEN_HEIGHT - self.height * TILE_SIZE
-		self.death_y = (self.height - DEATH_ROW_MARGIN) * TILE_SIZE
+		self.death_y = (self.height - DEATH_ROW_MARGIN) * TILE_SIZE + self.offset_y
 
 		self.chars = np.full((self.height, self.width), '.', dtype='<U1')
 		self.solid = np.zeros((self.height, self.width), dtype=np.bool_)
 		self.reward = np.zeros((self.height, self.width), dtype=np.float32)
+		# Coins are numbered as they are read, so an agent's collected set is one bool per coin
+		self.coin_ids = np.full((self.height, self.width), -1, dtype=np.int64)
+		self.coin_positions: list[tuple[int, int]] = []
 		self.spawn_point = (0, 0)
 		self.checkpoints: list[tuple[int, int]] = []
 
@@ -133,38 +150,45 @@ class World:
 				self.chars[y, x] = char
 				self.solid[y, x] = tile.get('is_solid', False)
 				self.reward[y, x] = tile.get('reward', 0)
-				if tile.get('is_player', False):
+				if tile.get('is_coin', False):
+					self.coin_ids[y, x] = len(self.coin_positions)
+					self.coin_positions.append((x * TILE_SIZE, y * TILE_SIZE + self.offset_y))
+				elif tile.get('is_player', False):
 					self.spawn_point = (x * TILE_SIZE, y * TILE_SIZE + self.offset_y)
 				elif tile.get('is_checkpoint', False):
 					self.checkpoints.append((x * TILE_SIZE, y * TILE_SIZE + self.offset_y))
 
+		self.coin_count = len(self.coin_positions)
+
 		# Padded copies: any tile index is clamped into the air border instead of being bounds-checked
 		self.padded_solid = np.pad(self.solid, GRID_PADDING)
 		self.padded_reward = np.pad(self.reward, GRID_PADDING)
+		self.padded_coins = np.pad(self.coin_ids, GRID_PADDING, constant_values=-1)
 		self._max_row = self.height + 2 * GRID_PADDING - 1
 		self._max_column = self.width + 2 * GRID_PADDING - 1
 		# Collision lookups index these flat views: `take` on one flat array beats a broadcast fancy index
 		self._padded_width = self.width + 2 * GRID_PADDING
 		self._flat_solid = self.padded_solid.ravel()
 		self._flat_reward = self.padded_reward.ravel()
-		# True where any of the 2x2 tiles from (row, column) carries a reward: one lookup then skips the whole pass
-		rewarding = self.padded_reward != 0
-		near_reward = rewarding.copy()
-		near_reward[:-1] |= rewarding[1:]
-		near_reward[:, :-1] |= near_reward[:, 1:].copy()
-		self._flat_near_reward = near_reward.ravel()
+		self._flat_coins = self.padded_coins.ravel()
+		# One lookup on the 2x2 box a player can touch then skips the whole reward or coin pass
+		self._flat_near_reward = near_grid(self.padded_reward != 0).ravel()
+		self._flat_near_coin = near_grid(self.padded_coins >= 0).ravel()
 
 		# Every window of the map, baked once: an observation is then a single gather of contiguous rows
 		# instead of a broadcast fancy index rebuilt per tick.
 		solid_windows = sliding_window_view(self.padded_solid, (GRID_SIDE, GRID_SIDE))
 		reward_windows = sliding_window_view(self.padded_reward, (GRID_SIDE, GRID_SIDE))
+		coin_windows = sliding_window_view(self.padded_coins >= 0, (GRID_SIDE, GRID_SIDE))
 		self._max_window_row = solid_windows.shape[0] - 1
 		self._window_stride = solid_windows.shape[1]
 		self._max_window_column = self._window_stride - 1
 
 		self._windows = np.empty((solid_windows.shape[0] * self._window_stride, WINDOW_FEATURES), dtype=OBSERVATION_DTYPE)
 		self._windows[:, :GRID_TILES] = solid_windows.reshape(-1, GRID_TILES)
-		self._windows[:, GRID_TILES:] = closest_reward(reward_windows.reshape(-1, GRID_TILES))
+		# Coins are baked like the terrain, so a window still points at one the agent has already taken
+		self._windows[:, GRID_TILES:GRID_TILES + REWARD_FEATURES] = closest_tile(reward_windows.reshape(-1, GRID_TILES), flag_feature=True)
+		self._windows[:, GRID_TILES + REWARD_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES), flag_feature=False)
 
 	def reset(self, spawn_x: int, spawn_y: int) -> None:
 		"""Places every player on the given spawn point and clears their state."""
@@ -176,6 +200,8 @@ class World:
 		self.win.fill(False)
 		self.finished_reward.fill(0.0)
 		self.win_tick.fill(-1)
+		self.coins.fill(0)
+		self.collected.fill(False)
 
 	def alive(self) -> NDArray[np.bool_]:
 		return ~(self.dead | self.win)
@@ -260,6 +286,7 @@ class World:
 		# x is final once the horizontal pass is done, so the last two passes share its tile columns
 		columns = self._resolve_vertical(alive)
 		self._collect_rewards(alive, tick, columns)
+		self._collect_coins(alive, columns)
 
 	def _jump(self, mask: NDArray[np.bool_]) -> None:
 		if not mask.any():
@@ -326,3 +353,24 @@ class World:
 		won = touched & (best == 1)
 		np.copyto(self.win_tick, tick, where=won)
 		self.win |= won
+
+	def _collect_coins(self, alive: NDArray[np.bool_], columns: tuple[NDArray[np.int64], NDArray[np.int64]]) -> None:
+		"""Banks every coin the player box overlaps, once each: `collected` is one bit per agent per coin."""
+		if not self.coin_count:
+			return
+
+		left, right = columns
+		rows = self._row_offsets(self._cells(self.y))
+		if not np.take(self._flat_near_coin, rows[0] + left).any():
+			return
+
+		agents = self._agents
+		for row in rows:
+			for column in (left, right):
+				ids = np.take(self._flat_coins, row + column)
+				# Clamped index: an agent standing on no coin reads slot 0 and is masked out anyway
+				fresh = alive & (ids >= 0) & ~self.collected[agents, np.maximum(ids, 0)]
+				if not fresh.any():
+					continue
+				self.collected[agents[fresh], ids[fresh]] = True
+				self.coins += fresh

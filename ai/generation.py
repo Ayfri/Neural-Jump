@@ -24,7 +24,7 @@ RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for divers
 
 # Simulation
 DEFAULT_TICK_RATE: Final[int] = 90
-DEFAULT_EPISODE_SECONDS: Final[float] = 30.0
+DEFAULT_EPISODE_SECONDS: Final[float] = 60.0  # The level's fastest route is about 44 seconds, the rest is room to detour for coins
 DEFAULT_ACTION_REPEAT: Final[int] = 2  # Physics ticks a chosen action is held for, measurably better than 1 or 4 here
 POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
 STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
@@ -49,6 +49,7 @@ STATIONARY_THRESHOLD: Final[int] = 5  # Ticks before penalty kicks in
 FALLING_PENALTY: Final[float] = -0.02
 FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
 
+COIN_REWARD: Final[float] = 5.0  # Paid per coin, so a full sweep is worth less than reaching the flag
 DEATH_PENALTY: Final[float] = -20.0
 WIN_BASE_BONUS: Final[float] = 200.0  # Paid for touching the flag at all, whatever the time taken
 WIN_SPEED_BONUS: Final[float] = 1200.0  # Paid on top, scaled by how much of the episode was still left
@@ -396,7 +397,8 @@ class Generation:
 		)
 
 		rewards = np.where(world.finished_reward != 0, world.finished_reward * DISTANCE_REWARD_DIVISOR, progress)
-		return np.where(world.win, win_reward, rewards)
+		# Coins are paid whatever the run ended as, so a detour that banks one is always worth something
+		return np.where(world.win, win_reward, rewards) + COIN_REWARD * world.coins
 
 	def check_agent_positions(self, tick: int) -> None:
 		"""Kills agents that are stuck in place or crawling backwards."""
@@ -427,6 +429,7 @@ class Generation:
 		]
 		return [
 			*rows,
+			('Coin', f'+{COIN_REWARD:g} x{self.world.coin_count}'),
 			('Act Repeat', f'{self.action_repeat}'),
 			('Speed', MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),
 		]
@@ -447,6 +450,9 @@ class Generation:
 			best_time=self.best_time_ever,
 			elite_count=self.elite_count if self.generation > 1 else 0,
 			random_count=min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0,
+			coins=int(self.world.coins[best]),
+			best_coins=int(self.world.coins.max()) if self.population_size else 0,
+			coin_count=self.world.coin_count,
 			paused=self.paused,
 			speed=self.live_speed,
 			sim_speed=self.live_speed / self.tick_rate,

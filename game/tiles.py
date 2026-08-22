@@ -1,6 +1,6 @@
 from typing import TypedDict
 
-from game.settings import AQUA, BLACK, GREEN, RED
+from game.settings import AQUA, BLACK, COIN_COLOR, GREEN, RED
 
 
 class Tile(TypedDict, total=False):
@@ -9,6 +9,7 @@ class Tile(TypedDict, total=False):
 	is_solid: bool
 	is_player: bool
 	is_checkpoint: bool
+	is_coin: bool
 	reward: int
 
 
@@ -33,6 +34,10 @@ TILES: dict[str, Tile] = {
 	'@': {
 		'is_checkpoint': True,
 		'is_air': True,
+	},
+	'o': {
+		'color': COIN_COLOR,
+		'is_coin': True,
 	},
 	'F': {
 		'color': AQUA,
