@@ -18,6 +18,9 @@ GRID_CHANNELS: Final[int] = 4  # is_solid, is_flag, has_reward, is_empty per til
 GRID_FEATURES: Final[int] = GRID_TILES * GRID_CHANNELS
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
 OBSERVATION_SIZE: Final[int] = GRID_FEATURES + PLAYER_FEATURES
+# Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
+# halving both the rollout buffer and the host-to-device copy done every tick.
+OBSERVATION_DTYPE: Final[np.dtype[np.float16]] = np.dtype(np.float16)
 MAX_FALL_SPEED: Final[float] = 20.0  # Normalisation divisor for the vertical speed feature
 ON_GROUND_SPEED: Final[float] = 2.0  # Vertical speed under which the player counts as grounded
 DEATH_ROW_MARGIN: Final[int] = 2  # Rows above the bottom of the map that kill the player
@@ -65,10 +68,7 @@ class World:
 		self.finished_reward = np.zeros(count, dtype=np.float32)
 		self.win_tick = np.full(count, -1, dtype=np.int32)
 
-		self._observation = np.zeros((count, OBSERVATION_SIZE), dtype=np.float32)
-		# One strided view per tile channel, so a gathered (count, 7, 7) block is written without any copy
-		self._channel_views = [self._observation[:, channel:GRID_FEATURES:GRID_CHANNELS] for channel in range(GRID_CHANNELS)]
-		self._player_view = self._observation[:, GRID_FEATURES:]
+		self._observation = np.zeros((count, OBSERVATION_SIZE), dtype=OBSERVATION_DTYPE)
 		self._offsets = np.arange(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1)
 
 	def _load_map(self, map_path: str) -> None:
@@ -102,13 +102,13 @@ class World:
 		# Padded copies: any tile index is clamped into the air border instead of being bounds-checked
 		self.padded_solid = np.pad(self.solid, GRID_PADDING)
 		self.padded_reward = np.pad(self.reward, GRID_PADDING)
-		# One float grid per observation channel, gathered as-is every tick
-		self.padded_channels = [
-			self.padded_solid.astype(np.float32),
-			(self.padded_reward == 1).astype(np.float32),
-			(self.padded_reward > 0).astype(np.float32),
-			(~self.padded_solid & (self.padded_reward == 0)).astype(np.float32),
-		]
+		# Channel-last grid, so the whole 7x7x4 window of every player comes out of one contiguous gather
+		self.padded_grid = np.stack([
+			self.padded_solid,
+			self.padded_reward == 1,
+			self.padded_reward > 0,
+			~self.padded_solid & (self.padded_reward == 0),
+		], axis=-1).astype(OBSERVATION_DTYPE)
 		self._max_row = self.height + 2 * GRID_PADDING - 1
 		self._max_column = self.width + 2 * GRID_PADDING - 1
 
@@ -145,11 +145,17 @@ class World:
 		column_index = np.clip(columns + GRID_PADDING, 0, self._max_column)
 		return padded_grid[row_index[:, None, :], column_index[None, :, :]]
 
-	def observe(self) -> NDArray[np.float32]:
+	def on_ground(self) -> NDArray[np.bool_]:
+		"""Players whose vertical speed is small enough to count as standing on something."""
+		return np.abs(self.change_y) <= ON_GROUND_SPEED
+
+	def observe(self, out: NDArray[np.float16] | None = None) -> NDArray[np.float16]:
 		"""
-		Returns the (count, 199) observation: the 7x7 tile window around each player encoded as four
-		channels per tile (solid, flag, reward, empty), followed by the player's own speed and ground state.
+		Fills `out` (or the world's own buffer) with the (count, 199) observation: the 7x7 tile window
+		around each player encoded as four channels per tile (solid, flag, reward, empty), followed by the
+		player's own speed and ground state. Passing the rollout's slot writes the transitions in place.
 		"""
+		target = self._observation if out is None else out
 		center_x = self.x + PLAYER_W / 2
 		center_y = self.y + PLAYER_H / 2 - self.offset_y
 		tile_x = np.floor_divide(center_x, TILE_SIZE).astype(np.int64)
@@ -158,32 +164,34 @@ class World:
 		rows = np.clip(tile_y + GRID_PADDING, AGENT_VISION_DISTANCE, self._max_row - AGENT_VISION_DISTANCE)[:, None, None] + self._offsets[None, :, None]
 		columns = np.clip(tile_x + GRID_PADDING, AGENT_VISION_DISTANCE, self._max_column - AGENT_VISION_DISTANCE)[:, None, None] + self._offsets[None, None, :]
 
-		for channel, grid in enumerate(self.padded_channels):
-			self._channel_views[channel][:] = grid[rows, columns].reshape(self.count, GRID_TILES)
-
-		self._player_view[:, 0] = self.change_x / PLAYER_SPEED
-		self._player_view[:, 1] = self.change_y / MAX_FALL_SPEED
-		self._player_view[:, 2] = np.abs(self.change_y) <= ON_GROUND_SPEED
-		return self._observation
+		target[:, :GRID_FEATURES] = self.padded_grid[rows, columns].reshape(self.count, GRID_FEATURES)
+		target[:, GRID_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
+		target[:, GRID_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
+		target[:, GRID_FEATURES + 2] = self.on_ground()
+		return target
 
 	def step(self, actions: NDArray[np.int64], tick: int) -> None:
 		"""Applies one action per player then advances the physics by one tick."""
 		alive = self.alive()
 
-		self.change_x = np.where(alive & (actions == MOVE_LEFT), -PLAYER_SPEED, self.change_x)
-		self.change_x = np.where(alive & (actions == MOVE_RIGHT), PLAYER_SPEED, self.change_x)
+		np.copyto(self.change_x, -PLAYER_SPEED, where=alive & (actions == MOVE_LEFT))
+		np.copyto(self.change_x, PLAYER_SPEED, where=alive & (actions == MOVE_RIGHT))
 		self._jump(alive & (actions == MOVE_JUMP))
 
-		gravity = np.where(self.change_y == 0.0, 1.0, self.change_y + PLAYER_GRAVITY)
-		self.change_y = np.where(alive, gravity, self.change_y)
+		# Falling players accelerate, resting ones get the initial nudge that unsticks them from the floor
+		falling = alive & (self.change_y != 0.0)
+		np.copyto(self.change_y, 1.0, where=alive & ~falling)
+		np.add(self.change_y, PLAYER_GRAVITY, out=self.change_y, where=falling)
 
-		self.x = np.where(alive, np.trunc(self.x + self.change_x), self.x)
+		np.add(self.x, self.change_x, out=self.x, where=alive)
+		np.trunc(self.x, out=self.x, where=alive)
 		self._resolve_horizontal(alive)
 
 		self.dead |= alive & (self.y >= self.death_y)
 		alive = self.alive()
 
-		self.y = np.where(alive, np.trunc(self.y + self.change_y), self.y)
+		np.add(self.y, self.change_y, out=self.y, where=alive)
+		np.trunc(self.y, out=self.y, where=alive)
 		self._resolve_vertical(alive)
 		self._collect_rewards(alive, tick)
 
@@ -194,7 +202,7 @@ class World:
 		_, bottom = self._tile_rows(self.y + 2.0)
 		block = self._gather(self.padded_solid, np.stack([bottom, bottom]), np.stack([left, right]))
 		grounded = block[0, 0] | block[0, 1]
-		self.change_y = np.where(mask & grounded, PLAYER_JUMP_STRENGTH, self.change_y)
+		np.copyto(self.change_y, PLAYER_JUMP_STRENGTH, where=mask & grounded)
 
 	def _resolve_horizontal(self, alive: NDArray[np.bool_]) -> None:
 		left, right = self._tile_columns()
@@ -213,7 +221,7 @@ class World:
 		x = np.where(going_right & hit_left & ~hit_right, left * TILE_SIZE - PLAYER_W, x)
 		x = np.where(going_left & hit_left, (left + 1) * TILE_SIZE, x)
 		x = np.where(going_left & hit_right & ~hit_left, (right + 1) * TILE_SIZE, x)
-		self.x = np.where(alive, x, self.x)
+		np.copyto(self.x, x, where=alive)
 
 	def _resolve_vertical(self, alive: NDArray[np.bool_]) -> None:
 		left, right = self._tile_columns()
@@ -234,8 +242,8 @@ class World:
 		y = np.where(going_up & hit_bottom & ~hit_top, (bottom + 1) * TILE_SIZE + self.offset_y, y)
 
 		blocked = (going_down | going_up) & (hit_top | hit_bottom)
-		self.y = np.where(alive, y, self.y)
-		self.change_y = np.where(alive & blocked, 0.0, self.change_y)
+		np.copyto(self.y, y, where=alive)
+		np.copyto(self.change_y, 0.0, where=alive & blocked)
 
 	def _collect_rewards(self, alive: NDArray[np.bool_], tick: int) -> None:
 		left, right = self._tile_columns()
@@ -244,7 +252,7 @@ class World:
 		best = values.reshape(4, -1).max(axis=0)
 
 		touched = alive & (best != 0)
-		self.finished_reward = np.where(touched, best, self.finished_reward)
+		np.copyto(self.finished_reward, best, where=touched)
 		won = touched & (best == 1)
-		self.win_tick = np.where(won, tick, self.win_tick)
+		np.copyto(self.win_tick, tick, where=won)
 		self.win |= won

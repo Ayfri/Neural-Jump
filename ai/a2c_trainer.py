@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from numpy.typing import NDArray
 
 from ai.population import Population
-from game.world import OBSERVATION_SIZE
+from game.world import OBSERVATION_DTYPE, OBSERVATION_SIZE
 
 DEFAULT_LEARNING_RATE: Final[float] = 0.003
 DEFAULT_GAMMA: Final[float] = 0.95
@@ -24,24 +24,28 @@ class RolloutBuffer:
 	Stores a whole generation of transitions for every agent at once.
 
 	The rollout itself runs without autograd; the trainer replays the stored observations in chunks to
-	build the graph only when it updates. Observations are kept as float16 to halve the memory a long
-	episode needs (the features are flags and small normalised speeds, so the precision is enough).
+	build the graph only when it updates. Observations share the world's half precision layout, so
+	`next_slot` hands the world the exact row it should write into and the tick costs no extra copy.
 	"""
 
 	def __init__(self, capacity: int, size: int) -> None:
 		self.capacity = capacity
 		self.size = size
-		self.observations = np.zeros((capacity, size, OBSERVATION_SIZE), dtype=np.float16)
+		self.observations = np.zeros((capacity, size, OBSERVATION_SIZE), dtype=OBSERVATION_DTYPE)
 		self.actions = np.zeros((capacity, size), dtype=np.int64)
 		self.rewards = np.zeros((capacity, size), dtype=np.float32)
 		self.alive = np.zeros((capacity, size), dtype=np.bool_)
 		self.length = 0
 
-	def add(self, observations: NDArray[np.float32], actions: NDArray[np.int64], rewards: NDArray[np.float64], alive: NDArray[np.bool_]) -> None:
+	def next_slot(self) -> NDArray[np.float16] | None:
+		"""The observation row this tick should be written into, or None once the buffer is full."""
+		return None if self.length >= self.capacity else self.observations[self.length]
+
+	def commit(self, actions: NDArray[np.int64], rewards: NDArray[np.float64], alive: NDArray[np.bool_]) -> None:
+		"""Closes the transition whose observations were written into the row `next_slot` handed out."""
 		if self.length >= self.capacity:
 			return
 		index = self.length
-		self.observations[index] = observations
 		self.actions[index] = actions
 		self.rewards[index] = rewards
 		self.alive[index] = alive

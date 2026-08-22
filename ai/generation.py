@@ -17,6 +17,12 @@ DEFAULT_MUTATION_RATE: Final[float] = 0.8
 DEFAULT_MUTATION_STRENGTH: Final[float] = 0.015
 DEFAULT_TICK_RATE: Final[int] = 90
 DEFAULT_EPISODE_SECONDS: Final[float] = 20.0
+MAX_SPEED: Final[str] = 'max'  # `speed='max'` tunes itself to the fastest rate the target framerate survives
+MAX_TICKS_PER_FRAME: Final[float] = 4096.0
+SPEED_HOLD_RATIO: Final[float] = 0.95  # Share of the target framerate above which the simulation asks for more work
+SPEED_DROP_RATIO: Final[float] = 0.88  # Share under which it backs off
+SPEED_ADAPT_FRAMES: Final[int] = 12  # Frames between two adjustments, so the framerate average settles first
+SPEED_SAMPLE_SECONDS: Final[float] = 0.25
 RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
 POSITION_CHECK_INTERVAL: Final[float] = 2.0  # Seconds between position checks
 STUCK_CHECK_WINDOW: Final[float] = 6.0  # Seconds to check if agent is stuck
@@ -58,7 +64,8 @@ class Generation:
 		device: str = 'auto',
 		tick_rate: int = DEFAULT_TICK_RATE,
 		episode_seconds: float = DEFAULT_EPISODE_SECONDS,
-		render_every: int = 1,
+		speed: float | str = 1.0,
+		fps: int = 0,
 		map_path: str = 'maps/level_1.txt',
 	) -> None:
 		self.population_size = population_size
@@ -70,12 +77,16 @@ class Generation:
 		self.use_a2c_learning = use_a2c_learning
 		self.tick_rate = tick_rate
 		self.episode_seconds = episode_seconds
-		self.render_every = max(1, render_every)
+		self.auto_speed = speed == MAX_SPEED
+		self.speed = 1.0 if self.auto_speed else float(speed)
 		self.generation = 1
 		self.best_fitness_ever = 0.0
 		self.should_skip_checkpoint = False
 		self.manual_stop = False
 		self.last_speed = 0.0
+		self.live_speed = 0.0
+		self.total_ticks = 0
+		self.fitness_history: list[float] = []
 
 		self.world = World(map_path, population_size)
 		self.population = Population(population_size, hidden_sizes, pick_device(device))
@@ -85,6 +96,8 @@ class Generation:
 		self.ticks_stationary = np.zeros(population_size, dtype=np.int32)
 		self.position_history: list[NDArray[np.float64]] = []
 		self.last_position_check = 0.0
+		self._previous_x = np.zeros(population_size, dtype=np.float64)
+		self._previous_y = np.zeros(population_size, dtype=np.float64)
 
 		self.a2c_trainer: A2CTrainer | None = None
 		self.rollout: RolloutBuffer | None = None
@@ -94,14 +107,20 @@ class Generation:
 			print(self.a2c_trainer.get_training_summary())
 
 		self.renderer = None
+		self.ticks_per_frame = 1.0
+		self._tick_budget = 0.0
+		self._speed_time = 0.0
+		self._speed_ticks = 0
+		self._frames_since_adapt = 0
 		if show_window:
 			import pygame
 
 			from game.render import Renderer
 
-			self.renderer = Renderer(self.world)
+			self.renderer = Renderer(self.world, fps)
 			self.renderer.add_key_action(pygame.K_g, self.skip_checkpoint, 'Skip Checkpoint')
 			self.renderer.add_key_action(pygame.K_s, self.stop_generation, 'Stop Generation')
+			self.ticks_per_frame = 8.0 if self.auto_speed else self.tick_rate * self.speed / self.renderer.target_fps
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
@@ -130,6 +149,8 @@ class Generation:
 		self.rewards.fill(0.0)
 		max_ticks = int(self.episode_seconds * self.tick_rate)
 		started = time.perf_counter()
+		self._speed_time = started
+		self._speed_ticks = self.total_ticks
 		ticks_done = 0
 
 		for checkpoint_index, (spawn_x, spawn_y) in enumerate(points):
@@ -138,28 +159,24 @@ class Generation:
 			self.ticks_stationary.fill(0)
 			self.position_history.clear()
 			self.last_position_check = 0.0
+			tick = 0
 
-			for tick in range(max_ticks):
-				if self.should_skip_checkpoint or self.manual_stop or self.world.win.any() or not self.world.alive().any():
-					break
-
-				alive = self.world.alive()
-				observations = self.world.observe()
-				actions = self.population.act(observations)
-				previous_x = self.world.x.copy()
-				previous_y = self.world.y.copy()
-				self.world.step(actions, tick)
-
-				step_rewards = self.continuous_rewards(alive, previous_x, previous_y)
-				self.rewards += step_rewards
-				if self.rollout is not None:
-					self.rollout.add(observations, actions, step_rewards, alive)
-
-				self.check_agent_positions(tick)
-				ticks_done += 1
-
-				if self.renderer is not None and tick % self.render_every == 0:
+			while tick < max_ticks and not self.episode_over():
+				# One frame's worth of simulation at a time, so the render rate and the sim rate stay independent
+				steps = max_ticks - tick
+				if self.renderer is not None:
 					self.render(checkpoint_index, len(points), tick)
+					self._tick_budget += self.ticks_per_frame
+					steps = min(int(self._tick_budget), steps)
+					self._tick_budget -= steps
+					self._adapt_ticks_per_frame()
+
+				for _ in range(steps):
+					self.simulate_tick(tick)
+					tick += 1
+					ticks_done += 1
+					if self.episode_over():
+						break
 
 			self.rewards += self.final_rewards()
 			self.should_skip_checkpoint = False
@@ -167,6 +184,59 @@ class Generation:
 		self.best_fitness_ever = max(self.best_fitness_ever, float(self.rewards.max()))
 		elapsed = time.perf_counter() - started
 		self.last_speed = ticks_done / elapsed if elapsed else 0.0
+
+	def episode_over(self) -> bool:
+		return self.should_skip_checkpoint or self.manual_stop or bool(self.world.win.any()) or not self.world.alive().any()
+
+	def simulate_tick(self, tick: int) -> None:
+		"""One simulation tick: observe, act, step, reward, record."""
+		alive = self.world.alive()
+		# The world writes straight into the rollout's row, so a recorded tick costs no extra copy
+		observations = self.world.observe(self.rollout.next_slot() if self.rollout is not None else None)
+		actions = self.population.act(observations)
+
+		np.copyto(self._previous_x, self.world.x)
+		np.copyto(self._previous_y, self.world.y)
+		self.world.step(actions, tick)
+
+		step_rewards = self.continuous_rewards(alive, self._previous_x, self._previous_y)
+		self.rewards += step_rewards
+		if self.rollout is not None:
+			self.rollout.commit(actions, step_rewards, alive)
+
+		self.check_agent_positions(tick)
+		self.total_ticks += 1
+
+	def _adapt_ticks_per_frame(self) -> None:
+		"""
+		In `--speed max`, walks the tick budget up while the framerate holds and backs off when it slips.
+
+		The controller watches the measured framerate rather than the time a frame spends working: with
+		vsync on, waiting for the next refresh is indistinguishable from working, so only the framerate
+		itself says whether there is headroom left.
+		"""
+		if not self.auto_speed or self.renderer is None:
+			return
+		self._frames_since_adapt += 1
+		if self._frames_since_adapt < SPEED_ADAPT_FRAMES:
+			return
+
+		self._frames_since_adapt = 0
+		ratio = self.renderer.measured_fps() / max(1, self.renderer.target_fps)
+		if ratio >= SPEED_HOLD_RATIO:
+			self.ticks_per_frame = min(MAX_TICKS_PER_FRAME, self.ticks_per_frame * 1.3)
+		elif ratio < SPEED_DROP_RATIO:
+			self.ticks_per_frame = max(1.0, self.ticks_per_frame * 0.7)
+
+	def _sample_live_speed(self) -> None:
+		"""Rolling ticks-per-real-second, so the HUD number moves with the simulation instead of the generation."""
+		now = time.perf_counter()
+		elapsed = now - self._speed_time
+		if elapsed < SPEED_SAMPLE_SECONDS:
+			return
+		instant = (self.total_ticks - self._speed_ticks) / elapsed
+		self.live_speed = instant if self.live_speed == 0.0 else self.live_speed * 0.6 + instant * 0.4
+		self._speed_time, self._speed_ticks = now, self.total_ticks
 
 	def continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64]) -> NDArray[np.float64]:
 		"""Per-tick micro rewards, computed for the whole population at once."""
@@ -215,25 +285,49 @@ class Generation:
 		if len(self.position_history) >= 4:
 			self.world.kill(alive & (self.world.x < self.position_history[0]))
 
+	def training_rows(self) -> list[tuple[str, str]]:
+		"""The knobs that shape the run, laid out for the HUD's training panel."""
+		rows = [
+			('Population', f'{self.population_size}'),
+			('Mutation Rate', f'{self.mutation_rate:.3f}'),
+			('Mutation Str', f'{self.mutation_strength:.4f}'),
+			('Elites', f'{self.elite_count}'),
+			('Network', 'x'.join(str(size) for size in self.population.hidden_sizes)),
+			('Device', str(self.population.device)),
+		]
+		if self.a2c_trainer is None:
+			return [*rows, ('Learning', 'Genetic')]
+		return [
+			*rows,
+			('Learning', 'A2C + Genetic'),
+			('Learning Rate', f'{self.a2c_trainer.learning_rate:g}'),
+			('Entropy', f'{self.a2c_trainer.entropy_coef:.4f}'),
+		]
+
 	def render(self, checkpoint_index: int, checkpoint_count: int, tick: int) -> None:
 		assert self.renderer is not None
+		from game.render import Hud
+
 		self.renderer.poll_events()
+		self._sample_live_speed()
 		best = int(np.argmax(np.where(self.world.alive(), self.rewards, -np.inf)))
-		living = int(self.world.alive().sum())
-		self.renderer.draw(
-			best,
-			[
-				f'Generation: {self.generation} | Agent {best + 1}/{self.population_size}',
-				f'Time: {tick / self.tick_rate:.2f}s | Checkpoint {checkpoint_index + 1}/{checkpoint_count}',
-				f'Living agents: {living}/{self.population_size}',
-				f'Best fitness ever: {self.best_fitness_ever:.2f} | Current: {self.rewards.max():.2f}',
-				f'X: {int(self.world.x[best])} Y: {int(self.world.y[best])}',
-			],
-			self.tick_rate,
-		)
+		self.renderer.draw(best, self.rewards, Hud(
+			generation=self.generation,
+			tick=tick,
+			tick_rate=self.tick_rate,
+			checkpoint=(checkpoint_index + 1, checkpoint_count),
+			best_ever=self.best_fitness_ever,
+			elite_count=self.elite_count if self.generation > 1 else 0,
+			random_count=min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0,
+			speed=self.live_speed,
+			sim_speed=self.live_speed / self.tick_rate,
+			training=self.training_rows(),
+			history=self.fitness_history,
+		))
 
 	def evolve_generation(self) -> None:
 		"""Runs the A2C update, selects the elites, breeds the next generation and saves the best weights."""
+		self.fitness_history.append(float(self.rewards.max()))
 		if self.a2c_trainer is not None and self.rollout is not None:
 			print('Performing A2C learning step...')
 			stats = self.a2c_trainer.train_step(self.rollout)

@@ -139,15 +139,16 @@ class Population:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
 			self._graph = None
 
-	def act(self, observations: NDArray[np.float32], deterministic: bool = False) -> NDArray[np.int64]:
+	def act(self, observations: NDArray[np.float16], deterministic: bool = False) -> NDArray[np.int64]:
 		"""Picks one action per agent, sampled from the policy unless `deterministic` is set."""
+		# Half precision observations halve the transfer; the widening happens on the device
+		batch = torch.from_numpy(observations).to(self.device, non_blocking=True).unsqueeze(1)
 		if self._graph is not None and not deterministic:
-			self._graph_input.copy_(torch.from_numpy(observations).to(self.device, non_blocking=True).unsqueeze(1))
+			self._graph_input.copy_(batch)
 			self._graph.replay()
 			return self._graph_output.cpu().numpy()
 
-		x = torch.from_numpy(observations).to(self.device).unsqueeze(1)
-		return self._sample(x, deterministic).cpu().numpy()
+		return self._sample(batch.float(), deterministic).cpu().numpy()
 
 	def evolve(self, fitness: NDArray[np.float32], elite_count: int, random_count: int, mutation_rate: float, mutation_strength: float) -> NDArray[np.int64]:
 		"""

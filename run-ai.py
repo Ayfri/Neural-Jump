@@ -5,10 +5,20 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
 
 import torch
 
-from ai.generation import DEFAULT_ELITE_COUNT, DEFAULT_EPISODE_SECONDS, DEFAULT_TICK_RATE, Generation
+from ai.generation import DEFAULT_ELITE_COUNT, DEFAULT_EPISODE_SECONDS, DEFAULT_TICK_RATE, MAX_SPEED, Generation
 from ai.population import DEFAULT_HIDDEN_SIZES
 
 DEFAULT_THREADS = 4  # More threads than this only adds synchronisation overhead on batches this small
+
+
+def speed_value(text: str) -> float | str:
+	"""Parses --speed: a multiplier of real time, or 'max' to run as fast as the framerate allows."""
+	if text.lower() == MAX_SPEED:
+		return MAX_SPEED
+	value = float(text)
+	if value <= 0:
+		raise argparse.ArgumentTypeError('speed must be positive or "max"')
+	return value
 
 
 def main() -> None:
@@ -23,7 +33,8 @@ def main() -> None:
 	argparser.add_argument("--tick-rate", type=int, default=DEFAULT_TICK_RATE, help="Simulation ticks per in-game second (also caps FPS when rendering)")
 	argparser.add_argument("--episode-seconds", type=float, default=DEFAULT_EPISODE_SECONDS)
 	argparser.add_argument("--generations", type=int, default=0, help="Stop after N generations, 0 runs forever")
-	argparser.add_argument("--render-every", type=int, default=1, help="Draw one frame every N ticks (only with --show-window)")
+	argparser.add_argument("--speed", type=speed_value, default=1.0, help="Simulation speed multiplier, or 'max' to run as fast as the target framerate survives (only with --show-window)")
+	argparser.add_argument("--fps", type=int, default=0, help="Target framerate, 0 uses the display refresh rate (only with --show-window)")
 	argparser.add_argument("--map", default='maps/level_1.txt')
 	argparser.add_argument("--load-latest-generation-weights", action="store_true")
 	argparser.add_argument("--show-window", action="store_true")
@@ -48,7 +59,8 @@ def main() -> None:
 		device=args.device,
 		tick_rate=args.tick_rate,
 		episode_seconds=args.episode_seconds,
-		render_every=args.render_every,
+		speed=args.speed,
+		fps=args.fps,
 		map_path=args.map,
 	)
 

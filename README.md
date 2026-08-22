@@ -79,7 +79,7 @@ Run the AI training script to watch agents learn to play the game:
 uv run run-ai.py
 ```
 
-Training is headless by default and runs as fast as the machine allows. `--show-window` caps it to `--tick-rate` so the run stays watchable.
+Training is headless by default and runs as fast as the machine allows. `--show-window` paces it with `--speed` so the run stays watchable, and draws a HUD that reads the population's state straight off the screen.
 
 **Command-line options:**
 
@@ -91,10 +91,11 @@ Training is headless by default and runs as fast as the machine allows. `--show-
 - `--no-use-a2c`: Disable A2C and evolve with the genetic algorithm only
 - `--device auto|cpu|cuda`: Where the population runs (default: auto)
 - `--threads N`: Torch CPU threads (default: 4)
-- `--tick-rate N`: Simulation ticks per in-game second, also the FPS cap while rendering (default: 90)
+- `--tick-rate N`: Simulation ticks per in-game second (default: 90)
 - `--episode-seconds S`: In-game time budget per spawn point (default: 20)
 - `--generations N`: Stop after N generations (default: 0, runs forever)
-- `--render-every N`: Draw one frame every N ticks, only with `--show-window` (default: 1)
+- `--speed S`: Simulation speed multiplier while rendering, or `max` to run as fast as the target framerate survives (default: 1)
+- `--fps N`: Target framerate, only with `--show-window` (default: 0, uses the display refresh rate)
 - `--map PATH`: Level file to train on (default: maps/level_1.txt)
 - `--load-latest-generation-weights`: Load weights from the latest saved generation
 - `--show-window`: Display the game window during training
@@ -110,8 +111,28 @@ uv run run-ai.py --population-size 500
 uv run run-ai.py --population-size 1000 --hidden-sizes 64 32 16
 
 # Watch a run at 4x speed
-uv run run-ai.py --show-window --render-every 4
+uv run run-ai.py --show-window --speed 4
+
+# Watch it go as fast as the display can keep up with
+uv run run-ai.py --show-window --speed max
 ```
+
+### Reading The Window
+
+The renderer encodes each agent's state in its sprite, so a glance at the screen is enough to tell the
+population apart:
+
+- **Fill color**: the agent's fitness rank in the population, from red (worst) to teal (best)
+- **Chevron**: the direction it is moving, a square when it is standing still
+- **Blue arrow above the head**: the agent is rising, so it jumped
+- **Gold outline**: an elite carried over untouched from the previous generation
+- **Violet outline**: a re-randomised agent, kept for diversity
+- **Dark outline**: the agent the camera follows, the best one still alive
+- **Grey**: dead, **violet fill**: reached the flag
+
+The panels cover the run (generation, time, living agents, best fitness, throughput and framerate), the
+followed agent, the hyper-parameters the run uses, and the fitness distribution of the population next to
+the best score of every generation so far.
 
 ### Performance
 
@@ -125,6 +146,9 @@ agents: going from 100 to 1000 agents multiplies the throughput per second, not 
 | 1000 agents, A2C + genetic, CUDA | ~155 | ~155,000 |
 
 At 90 ticks per in-game second, 100 agents playing a 20 second episode take about 3 seconds of wall clock.
+
+Observations are half precision end to end: the world writes them straight into the rollout buffer's row,
+so recording a tick costs no extra copy and the host-to-device transfer moves half the bytes.
 
 On CUDA the sampling pass is captured as a CUDA graph: a tick is a few dozen tiny kernels, so it is bound
 by launch latency, and replaying one captured graph is about 3x faster than launching them one by one. The
