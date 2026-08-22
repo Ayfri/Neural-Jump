@@ -14,7 +14,7 @@ from game.world import World
 DEFAULT_POPULATION_SIZE: Final[int] = 300
 DEFAULT_ELITE_COUNT: Final[int] = 4
 DEFAULT_MUTATION_RATE: Final[float] = 0.8
-DEFAULT_MUTATION_STRENGTH: Final[float] = 0.03  # The elites are preserved, so this is the only exploration the population has
+DEFAULT_MUTATION_STRENGTH: Final[float] = 0.008  # Swept: the level is reached on every seed here, and less often either side
 RANDOM_AGENTS_COUNT: Final[int] = 5  # Number of random agents to add for diversity
 
 # Simulation
