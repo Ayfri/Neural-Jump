@@ -8,11 +8,12 @@ import torch.nn.functional as F
 from numpy.typing import NDArray
 from torch import Tensor
 
-from game.world import OBSERVATION_SIZE
+from game.world import OBSERVATION_DTYPE, OBSERVATION_SIZE
 
 ACTION_COUNT: Final[int] = 3
 DEFAULT_HIDDEN_SIZES: Final[tuple[int, int, int]] = (256, 128, 64)
 LAYER_NORM_EPS: Final[float] = 1e-5
+HOST_DTYPE: Final[torch.dtype] = torch.from_numpy(np.empty(0, dtype=OBSERVATION_DTYPE)).dtype  # The world's observation dtype, torch side
 
 
 def pick_dtype(device: torch.device) -> torch.dtype:
@@ -75,6 +76,15 @@ class Population:
 
 		self.randomize(torch.arange(size, device=self.device))
 
+		# Page-locked staging buffers: the world writes its observations straight into `observations`, and the
+		# actions come back into `actions`, so a tick copies twice over PCIe instead of through pageable memory
+		pinned = self.device.type == 'cuda'
+		self._host_observations = torch.empty(size, 1, OBSERVATION_SIZE, dtype=HOST_DTYPE, pin_memory=pinned)
+		self.observations: NDArray[np.float16] = self._host_observations.numpy().reshape(size, OBSERVATION_SIZE)
+		self._host_actions = torch.empty(size, dtype=torch.int64, pin_memory=pinned)
+		self.actions: NDArray[np.int64] = self._host_actions.numpy()
+
+		self._pending: Tensor | None = None  # Result of a pass run eagerly, where no graph could be captured
 		self._graphs: dict[bool, tuple[torch.cuda.CUDAGraph, Tensor]] = {}
 		self._capture_graphs()
 
@@ -146,18 +156,40 @@ class Population:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
 			self._graphs.clear()
 
-	def act(self, observations: NDArray[np.float16], deterministic: bool = False) -> NDArray[np.int64]:
-		"""Picks one action per agent, the policy's argmax unless `deterministic` is cleared."""
-		# Half precision observations halve the transfer; the widening happens on the device
-		batch = torch.from_numpy(observations).to(self.device, self.dtype, non_blocking=True).unsqueeze(1)
-		captured = self._graphs.get(deterministic)
-		if captured is not None:
-			graph, output = captured
-			self._graph_input.copy_(batch)
-			graph.replay()
-			return output.cpu().numpy()
+	def act(self, deterministic: bool = False) -> NDArray[np.int64]:
+		"""Picks one action per agent from the observations staged in `self.observations`, the argmax unless cleared."""
+		self.submit(deterministic)
+		return self.collect()
 
-		return self._sample(batch, deterministic).cpu().numpy()
+	def submit(self, deterministic: bool = False) -> None:
+		"""
+		Starts the pass over the staged observations and returns before it lands.
+
+		Waiting for the device is most of what a decision costs, so the caller starts the pass one tick
+		early and spends that tick on physics instead. Nothing reads the staging buffers until `collect`.
+		"""
+		captured = self._graphs.get(deterministic)
+		if captured is None:
+			# Half precision observations halve the transfer; the widening happens on the device
+			batch = self._host_observations.to(self.device, self.dtype, non_blocking=True)
+			self._pending = self._sample(batch, deterministic)
+			return
+
+		graph, output = captured
+		self._graph_input.copy_(self._host_observations, non_blocking=True)
+		graph.replay()
+		self._host_actions.copy_(output, non_blocking=True)
+		self._pending = None
+
+	def collect(self) -> NDArray[np.int64]:
+		"""Waits for the pass started by `submit` and returns its actions."""
+		if self._pending is not None:
+			actions = self._pending.cpu().numpy()
+			self._pending = None
+			return actions
+
+		torch.cuda.synchronize()
+		return self.actions
 
 	def snapshot(self, indices: Tensor) -> list[Tensor]:
 		"""Copies the given agents out of the population, in `parameters()` order."""

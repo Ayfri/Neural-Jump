@@ -165,6 +165,7 @@ class Generation:
 
 		for checkpoint_index, (spawn_x, spawn_y) in enumerate(points):
 			self.world.reset(spawn_x, spawn_y)
+			self.decide()
 			self.max_x_reached[:] = self.world.x
 			self.ticks_stationary.fill(0)
 			self.position_history.clear()
@@ -208,16 +209,25 @@ class Generation:
 		"""
 		alive = self.world.alive()
 		if tick % self.action_repeat == 0:
-			self._actions = self.population.act(self.world.observe(), self.deterministic_actions)
+			self._actions = self.population.collect()
 
 		np.copyto(self._previous_x, self.world.x)
 		np.copyto(self._previous_y, self.world.y)
 		self.world.step(self._actions, tick)
 
+		# The next window is decided from right here, so the device works through the rest of the tick
+		if (tick + 1) % self.action_repeat == 0:
+			self.decide()
+
 		self.rewards += self.continuous_rewards(alive, self._previous_x, self._previous_y)
 
 		self.check_agent_positions(tick)
 		self.total_ticks += 1
+
+	def decide(self) -> None:
+		"""Stages the current observations and starts the pass whose actions the next window plays."""
+		self.world.observe(self.population.observations)
+		self.population.submit(self.deterministic_actions)
 
 	def _adapt_ticks_per_frame(self) -> None:
 		"""
@@ -252,23 +262,25 @@ class Generation:
 
 	def continuous_rewards(self, alive: NDArray[np.bool_], previous_x: NDArray[np.float64], previous_y: NDArray[np.float64]) -> NDArray[np.float64]:
 		"""Per-tick micro rewards, computed for the whole population at once."""
+		# Every term is a masked add rather than a mask multiplied by its value, which halves the numpy calls
 		x_delta = self.world.x - previous_x
 		rewards = np.zeros(self.population_size, dtype=np.float64)
 
 		forward = x_delta > 0
-		rewards += forward * FORWARD_MOVEMENT_REWARD
-		new_max = forward & (self.world.x > self.max_x_reached)
-		rewards += new_max * NEW_MAX_POSITION_BONUS
+		np.add(rewards, FORWARD_MOVEMENT_REWARD, out=rewards, where=forward)
+		np.add(rewards, NEW_MAX_POSITION_BONUS, out=rewards, where=forward & (self.world.x > self.max_x_reached))
 		np.maximum(self.max_x_reached, self.world.x, out=self.max_x_reached, where=forward)
 
-		rewards += (x_delta < 0) * BACKWARD_MOVEMENT_PENALTY
+		np.add(rewards, BACKWARD_MOVEMENT_PENALTY, out=rewards, where=x_delta < 0)
 
 		still = x_delta == 0
-		self.ticks_stationary = np.where(still, self.ticks_stationary + 1, 0)
-		rewards += (still & (self.ticks_stationary > STATIONARY_THRESHOLD)) * STATIONARY_PENALTY
+		np.add(self.ticks_stationary, 1, out=self.ticks_stationary, where=still)
+		np.copyto(self.ticks_stationary, 0, where=~still)
+		np.add(rewards, STATIONARY_PENALTY, out=rewards, where=still & (self.ticks_stationary > STATIONARY_THRESHOLD))
 
-		rewards += ((self.world.y - previous_y) > FALLING_THRESHOLD) * FALLING_PENALTY
-		return rewards * alive
+		np.add(rewards, FALLING_PENALTY, out=rewards, where=(self.world.y - previous_y) > FALLING_THRESHOLD)
+		rewards *= alive
+		return rewards
 
 	def final_rewards(self) -> NDArray[np.float64]:
 		"""End of episode reward: win bonus, reward tile value, or distance travelled minus the death penalty."""
