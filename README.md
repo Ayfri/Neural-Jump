@@ -75,6 +75,22 @@ Every agent's state is in its sprite, so one glance reads the whole population:
 The panels cover the run, the followed agent, the hyper-parameters, and the fitness distribution next to the
 best score of every generation so far.
 
+## Keys
+
+| Key | What it does |
+| --- | --- |
+| `Space` | Pause and resume, the window stays live |
+| `Tab` | Hide the panels, leaving the level and the agents |
+| `1` | Back to speed x1 |
+| `M` | Speed `max`, which tunes itself to the framerate |
+| `-` / `=` | Halve or double the speed, also on the numpad. From `max` it starts at the multiplier it had reached |
+| `A` | Switch the policy between argmax and sampled |
+| `G` | Skip to the next spawn point |
+| `S` | End the generation now and breed from what it scored |
+| `R` | Start the whole run over: random weights, generation 1, records cleared |
+
+They are listed in the legend at the bottom left, and the speed shows in the Training panel.
+
 ## The network
 
 A policy over a 7x7 tile view plus the player's own state:

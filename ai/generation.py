@@ -1,5 +1,6 @@
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -35,6 +36,9 @@ SPEED_HOLD_RATIO: Final[float] = 0.95  # Share of the target framerate above whi
 SPEED_DROP_RATIO: Final[float] = 0.88  # Share under which it backs off
 SPEED_ADAPT_FRAMES: Final[int] = 12  # Frames between two adjustments, so the framerate average settles first
 SPEED_SAMPLE_SECONDS: Final[float] = 0.25
+SPEED_STEP: Final[float] = 2.0  # Factor the slower and faster keys apply
+MIN_SPEED: Final[float] = 0.1
+MAX_SPEED_MULTIPLIER: Final[float] = 1024.0
 
 # Rewards
 FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
@@ -112,6 +116,8 @@ class Generation:
 		self.best_time_ever = 0.0  # Fastest run to the flag in seconds, 0 while nobody has reached it
 		self.should_skip_checkpoint = False
 		self.manual_stop = False
+		self.paused = False
+		self.restart_requested = False
 		self.last_speed = 0.0
 		self.live_speed = 0.0
 		self.total_ticks = 0
@@ -142,9 +148,24 @@ class Generation:
 			from game.render import Renderer
 
 			self.renderer = Renderer(self.world, fps)
-			self.renderer.add_key_action(pygame.K_g, self.skip_checkpoint, 'Skip Checkpoint')
-			self.renderer.add_key_action(pygame.K_s, self.stop_generation, 'Stop Generation')
-			self.ticks_per_frame = 8.0 if self.auto_speed else self.tick_rate * self.speed / self.renderer.target_fps
+			bindings: list[tuple[int, Callable[[], None], str]] = [
+				(pygame.K_SPACE, self.toggle_pause, 'Pause'),
+				(pygame.K_TAB, self.renderer.toggle_hud, 'HUD'),
+				(pygame.K_1, lambda: self.set_speed(1.0), 'Speed x1'),
+				(pygame.K_m, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
+				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), 'Slower'),
+				(pygame.K_EQUALS, lambda: self.scale_speed(SPEED_STEP), 'Faster'),
+				(pygame.K_a, self.toggle_sampling, 'Actions'),
+				(pygame.K_g, self.skip_checkpoint, 'Skip ckpt'),
+				(pygame.K_s, self.stop_generation, 'Stop gen'),
+				(pygame.K_r, self.restart_run, 'Restart'),
+				# Same two on the numpad, described nowhere so the legend keeps one line per action
+				(pygame.K_KP_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), ''),
+				(pygame.K_KP_PLUS, lambda: self.scale_speed(SPEED_STEP), ''),
+			]
+			for key, action, description in bindings:
+				self.renderer.add_key_action(key, action, description)
+			self._apply_speed()
 
 		if load_latest_generation_weights:
 			self.load_latest_generation_weights()
@@ -152,6 +173,57 @@ class Generation:
 	@property
 	def max_ticks(self) -> int:
 		return int(self.episode_seconds * self.tick_rate)
+
+	def toggle_pause(self) -> None:
+		self.paused = not self.paused
+
+	def toggle_sampling(self) -> None:
+		self.deterministic_actions = not self.deterministic_actions
+
+	def set_speed(self, speed: float | str) -> None:
+		"""Switches between a fixed multiplier and `max`, the mode that tunes itself to the framerate."""
+		self.auto_speed = speed == MAX_SPEED
+		if not self.auto_speed:
+			self.speed = min(MAX_SPEED_MULTIPLIER, max(MIN_SPEED, float(speed)))
+		self._apply_speed()
+
+	def scale_speed(self, factor: float) -> None:
+		"""Multiplies the speed, leaving `max` at whatever multiplier it had reached rather than at 1."""
+		self.set_speed(self.current_speed * factor)
+
+	@property
+	def current_speed(self) -> float:
+		"""The multiplier actually being played, which in `max` is whatever the controller has walked up to."""
+		if not self.auto_speed or self.renderer is None:
+			return self.speed
+		return self.ticks_per_frame * self.renderer.target_fps / self.tick_rate
+
+	def _apply_speed(self) -> None:
+		"""Rebuilds the per frame tick budget, dropping whatever the previous speed had left in it."""
+		if self.renderer is None:
+			return
+		self.ticks_per_frame = 8.0 if self.auto_speed else self.tick_rate * self.speed / self.renderer.target_fps
+		self._tick_budget = 0.0
+		self._frames_since_adapt = 0
+
+	def restart_run(self) -> None:
+		"""Asks for a fresh run: the current generation is dropped rather than bred from, so nothing is saved."""
+		self.restart_requested = True
+
+	def _restart(self) -> None:
+		"""Throws the run away: random weights again, generation back to 1, every record cleared."""
+		self.population.randomize(torch.arange(self.population_size, device=self.population.device))
+		self.generation = 1
+		self.best_fitness_ever = 0.0
+		self.best_time_ever = 0.0
+		self.fitness_history.clear()
+		self.rewards.fill(0.0)
+		self.total_ticks = 0
+		self.live_speed = 0.0
+		self.restart_requested = False
+		self.manual_stop = False
+		self.should_skip_checkpoint = False
+		print('Restarted from scratch, generation 1')
 
 	def skip_checkpoint(self) -> None:
 		self.should_skip_checkpoint = True
@@ -190,6 +262,10 @@ class Generation:
 				steps = max_ticks - tick
 				if self.renderer is not None:
 					self.render(checkpoint_index, len(points), tick)
+					if self.paused:
+						# Nothing accumulates while paused, so unpausing does not fire a burst of catch up ticks
+						self._tick_budget = 0.0
+						continue
 					self._tick_budget += self.ticks_per_frame
 					steps = min(int(self._tick_budget), steps)
 					self._tick_budget -= steps
@@ -219,7 +295,7 @@ class Generation:
 		self.best_time_ever = best if self.best_time_ever == 0.0 else min(self.best_time_ever, best)
 
 	def episode_over(self) -> bool:
-		return self.should_skip_checkpoint or self.manual_stop or not self.world.alive().any()
+		return self.should_skip_checkpoint or self.manual_stop or self.restart_requested or not self.world.alive().any()
 
 	def simulate_tick(self, tick: int) -> None:
 		"""
@@ -259,7 +335,7 @@ class Generation:
 		vsync on, waiting for the next refresh is indistinguishable from working, so only the framerate
 		itself says whether there is headroom left.
 		"""
-		if not self.auto_speed or self.renderer is None:
+		if not self.auto_speed or self.renderer is None or self.paused:
 			return
 		self._frames_since_adapt += 1
 		if self._frames_since_adapt < SPEED_ADAPT_FRAMES:
@@ -361,6 +437,7 @@ class Generation:
 			*rows,
 			('Actions', 'argmax' if self.deterministic_actions else 'sampled'),
 			('Act Repeat', f'{self.action_repeat}'),
+			('Speed', MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),
 		]
 
 	def render(self, checkpoint_index: int, checkpoint_count: int, tick: int) -> None:
@@ -379,6 +456,7 @@ class Generation:
 			best_time=self.best_time_ever,
 			elite_count=self.elite_count if self.generation > 1 else 0,
 			random_count=min(RANDOM_AGENTS_COUNT, max(0, self.population_size - self.elite_count)) if self.generation > 1 else 0,
+			paused=self.paused,
 			speed=self.live_speed,
 			sim_speed=self.live_speed / self.tick_rate,
 			training=self.training_rows(),
@@ -387,6 +465,10 @@ class Generation:
 
 	def evolve_generation(self) -> None:
 		"""Selects the elites, breeds the next generation and saves the best weights."""
+		if self.restart_requested:
+			self._restart()
+			return
+
 		self.fitness_history.append(float(self.rewards.max()))
 		elites = self.population.evolve(
 			self.rewards.astype(np.float32),

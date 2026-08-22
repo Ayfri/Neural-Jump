@@ -42,6 +42,7 @@ TITLE_SIZE: Final[int] = 14
 BODY_SIZE: Final[int] = 15
 SMALL_SIZE: Final[int] = 13
 LABEL_COLUMN: Final[int] = 116
+HINT_COLUMNS: Final[int] = 2  # Key bindings are laid out side by side, one column would own the panel
 HISTOGRAM_BINS: Final[int] = 18
 HISTORY_LENGTH: Final[int] = 80
 SPARKLINE_GUTTER: Final[int] = 34  # Room kept on the right of the curve for its scale labels
@@ -72,6 +73,7 @@ class Hud:
 	checkpoint: tuple[int, int] = (1, 1)
 	best_ever: float = 0.0
 	best_time: float = 0.0  # Fastest win in seconds, 0 while the flag has never been touched
+	paused: bool = False
 	elite_count: int = 0
 	random_count: int = 0
 	speed: float = 0.0  # Simulation ticks per real second
@@ -179,6 +181,7 @@ class Renderer:
 		self.clock = pygame.time.Clock()
 		self.camera = Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
 		self.key_actions: dict[int, tuple[Callable[[], None], str]] = {}
+		self.show_hud = True
 		self.level_surface = self._bake_level(world)
 		self._ranks = np.zeros(world.count, dtype=np.int64)
 
@@ -213,6 +216,9 @@ class Renderer:
 	def add_key_action(self, key: int, action: Callable[[], None], description: str = '') -> None:
 		self.key_actions[key] = (action, description)
 
+	def toggle_hud(self) -> None:
+		self.show_hud = not self.show_hud
+
 	def poll_events(self) -> None:
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
@@ -224,7 +230,8 @@ class Renderer:
 		self._move_camera(focus_index)
 		self.screen.blit(self.level_surface, (0, 0), self.camera)
 		self._draw_players(focus_index, fitness, hud)
-		self._draw_hud(focus_index, fitness, hud)
+		if self.show_hud:
+			self._draw_hud(focus_index, fitness, hud)
 		pygame.display.flip()
 		# Under vsync the flip already paces the loop; capping on top of it would make us miss every other frame
 		self.clock.tick(0 if self.vsync else self.target_fps)
@@ -293,7 +300,9 @@ class Renderer:
 
 		run = Panel('Run', [
 			('Generation', f'{hud.generation}'),
-			('Time', f'{hud.tick / max(1, hud.tick_rate):.1f}s' + (f'  ckpt {checkpoint}/{checkpoints}' if checkpoints > 1 else '')),
+			('Time', f'{hud.tick / max(1, hud.tick_rate):.1f}s'
+				+ (f'  ckpt {checkpoint}/{checkpoints}' if checkpoints > 1 else '')
+				+ ('  PAUSED' if hud.paused else '')),
 			Gauge('Alive', f'{alive}/{world.count}', alive / max(1, world.count)),
 			('Best', f'{float(fitness.max()) if fitness.size else 0.0:.1f}'),
 			('Record', f'{hud.best_ever:.1f}' + (f'  {hud.best_time:.2f}s' if hud.best_time > 0 else '')),
@@ -395,9 +404,10 @@ class Renderer:
 		"""Bottom-left: what the shapes and colors on the players mean, plus the key bindings."""
 		entries = [(ELITE_RING, 'Elite'), (RANDOM_RING, 'Random'), (FOCUS_RING, 'Focus'), (JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'), (WON_COLOR, 'Won')]
 		swatch_rows = (len(entries) + 2) // 3
-		hints = sum(1 for _, description in self.key_actions.values() if description)
+		hints = [(key, description) for key, (_, description) in self.key_actions.items() if description]
+		hint_rows = (len(hints) + HINT_COLUMNS - 1) // HINT_COLUMNS
 		width = 250
-		height = PADDING * 2 + ROW_HEIGHT * (2 + swatch_rows + hints) + 12
+		height = PADDING * 2 + ROW_HEIGHT * (2 + swatch_rows + hint_rows) + 12
 		x, y = MARGIN, SCREEN_HEIGHT - MARGIN - height
 		self.screen.blit(_panel_background(width, height), (x, y))
 		self.screen.blit(_text(TITLE_SIZE, 'Legend', TITLE_COLOR), (x + PADDING, y + PADDING))
@@ -420,10 +430,12 @@ class Renderer:
 			self.screen.blit(_text(SMALL_SIZE, label, LABEL_COLOR), (column + 13, row_y))
 
 		row_y += ROW_HEIGHT
-		for key, (_, description) in self.key_actions.items():
-			if description:
-				self.screen.blit(_text(SMALL_SIZE, f'{pygame.key.name(key).upper():<4} {description}', LABEL_COLOR), (x + PADDING, row_y))
+		for index, (key, description) in enumerate(hints):
+			if index and index % HINT_COLUMNS == 0:
 				row_y += ROW_HEIGHT
+			column = x + PADDING + (index % HINT_COLUMNS) * (width - 2 * PADDING) // HINT_COLUMNS
+			name = pygame.key.name(key).upper()
+			self.screen.blit(_text(SMALL_SIZE, f'{name:<5} {description}', LABEL_COLOR), (column, row_y))
 
 	@staticmethod
 	def quit() -> None:
