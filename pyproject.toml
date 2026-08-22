@@ -10,6 +10,8 @@ dependencies = [
     "numpy==2.5.2",
     "pygame-ce==2.5.8",
     "torch==2.13.0",
+    # torch.compile's backend, which torch ships on linux and not on windows
+    "triton-windows==3.7.1.post27 ; sys_platform == 'win32'",
 ]
 
 [tool.setuptools.packages.find]
