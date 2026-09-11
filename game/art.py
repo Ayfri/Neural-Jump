@@ -16,7 +16,7 @@ import pygame
 from numpy.typing import NDArray
 from pygame import Rect, Surface
 
-from game.settings import TILE_SIZE
+from game.settings import ENEMY_HEIGHT, ENEMY_WIDTH, TILE_SIZE
 from game.tiles import TileKind
 
 type Color = tuple[int, int, int]
@@ -67,6 +67,10 @@ FLAG_SHINE: Final[Color] = (198, 252, 252)
 CHECKPOINT_COLOR: Final[Color] = (150, 60, 230)
 CHECKPOINT_GLOW: Final[Color] = (206, 150, 255)
 CHECKPOINT_HAZE: Final[tuple[int, int, int, int]] = (*CHECKPOINT_COLOR, 96)
+
+ENEMY_COLOR: Final[Color] = (214, 72, 52)
+ENEMY_DARK: Final[Color] = (92, 26, 24)
+ENEMY_SKIN: Final[Color] = (244, 206, 156)
 
 EYE_WHITE: Final[Color] = (238, 244, 255)
 EYE_DARK: Final[Color] = (22, 22, 34)
@@ -141,6 +145,22 @@ COIN_ART: Final[tuple[str, ...]] = (
 	'DCCCCCCD',
 	'.DCCCCD.',
 	'..DDDD..',
+)
+
+# A walking mushroom facing left, which is the way it starts out: both pupils sit against the front of their whites
+ENEMY_ART: Final[tuple[str, ...]] = (
+	'....DDDD....',
+	'..DDBBBBDD..',
+	'.DBBBBBBBBD.',
+	'DBWWBBWWBBBD',
+	'DBKWBBKWBBBD',
+	'DBKWBBKWBBBD',
+	'DBBBBBBBBBBD',
+	'.DBBMMMMBBD.',
+	'..DDDDDDDD..',
+	'...SSSSSS...',
+	'.DDDD..DDDD.',
+	'.DDD....DDD.',
 )
 
 CHECKPOINT_ART: Final[tuple[str, ...]] = (
@@ -258,6 +278,14 @@ def checkpoint_sprite() -> Surface:
 	surface.fill(CHECKPOINT_HAZE)
 	surface.blit(_paint(CHECKPOINT_ART, {'P': CHECKPOINT_GLOW, 'F': CHECKPOINT_COLOR}, (TILE_SIZE, TILE_SIZE)), (0, 0))
 	return surface.convert_alpha()
+
+
+@lru_cache(maxsize=4)
+def enemy_sprite(heading: int) -> Surface:
+	"""An enemy looking the way it walks: the art faces left and is flipped for the other way."""
+	palette: dict[str, Paint] = {'D': ENEMY_DARK, 'B': ENEMY_COLOR, 'W': EYE_WHITE, 'K': EYE_DARK, 'M': ENEMY_DARK, 'S': ENEMY_SKIN}
+	sprite = _paint(ENEMY_ART, palette, (int(ENEMY_WIDTH), int(ENEMY_HEIGHT)))
+	return pygame.transform.flip(sprite, True, False) if heading > 0 else sprite
 
 
 @lru_cache(maxsize=2)
@@ -470,7 +498,7 @@ def bake_level(kinds: NDArray[np.uint8], size: tuple[int, int], top: int) -> Sur
 
 	# One layout per tile from a fixed seed: scattered enough that no pattern shows, identical on every run
 	variants = np.random.default_rng(0xA11CE).integers(0, VARIANTS, kinds.shape, dtype=np.uint8)
-	skipped = (TileKind.AIR, TileKind.COIN, TileKind.SPAWN, TileKind.CHECKPOINT)
+	skipped = (TileKind.AIR, TileKind.COIN, TileKind.SPAWN, TileKind.CHECKPOINT, TileKind.ENEMY)
 	painted = np.argwhere(~np.isin(kinds, [int(kind) for kind in skipped]))
 	blits: list[tuple[Surface, tuple[int, int]]] = []
 	for row, column in painted.tolist():

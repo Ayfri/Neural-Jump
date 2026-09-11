@@ -11,10 +11,11 @@ from pygame._sdl2.video import Window
 from pygame.font import Font
 
 from game.art import (
-	CHECKPOINT_COLOR, COIN_COLOR, Background, bake_level, body_sprite, checkpoint_sprite, coin_sprite, jump_sprite, ring_sprite,
+	CHECKPOINT_COLOR, COIN_COLOR, ENEMY_COLOR, Background, bake_level, body_sprite, checkpoint_sprite, coin_sprite,
+	enemy_sprite, jump_sprite, ring_sprite,
 )
 from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
-from game.world import PLAYER_H, PLAYER_W, World
+from game.world import ENEMY_H, ENEMY_W, PLAYER_H, PLAYER_W, World
 
 type Color = tuple[int, int, int]
 type Blit = tuple[Surface, tuple[int, int]]
@@ -56,6 +57,8 @@ LEGEND_WIDTH: Final[int] = 250
 HISTOGRAM_BINS: Final[int] = 18
 HISTORY_LENGTH: Final[int] = 80
 SPARKLINE_GUTTER: Final[int] = 34  # Room kept on the right of the curve for its scale labels
+MENU_WIDTH: Final[int] = 420
+MENU_ROWS: Final[int] = 16  # Items shown at once, the list scrolls to keep the selected one in the middle
 DEFAULT_FPS: Final[int] = 60
 
 
@@ -91,6 +94,14 @@ class Fitness:
 
 
 @dataclass(slots=True)
+class Menu:
+	"""A centred list with one row selected, drawn over everything else, panels hidden or not."""
+	title: str
+	items: Sequence[str]
+	selected: int = 0
+
+
+@dataclass(slots=True)
 class Hud:
 	"""
 	Everything drawn over the level.
@@ -103,6 +114,7 @@ class Hud:
 	legend: Legend | None = None
 	fitness: Fitness | None = None
 	banner: str = ''  # Centred message, drawn even with the panels hidden
+	menu: Menu | None = None
 	elite_count: int = 0
 	random_count: int = 0
 	solo: bool = False  # One human body instead of a ranked population
@@ -111,11 +123,11 @@ class Hud:
 TRAINING_LEGEND: Final[tuple[tuple[Color, str], ...]] = (
 	(ELITE_RING, 'Elite'), (RANDOM_RING, 'Random'), (FOCUS_RING, 'Focus'),
 	(JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'), (WON_COLOR, 'Won'),
-	(COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'),
+	(COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'), (ENEMY_COLOR, 'Enemy'),
 )
 PLAY_LEGEND: Final[tuple[tuple[Color, str], ...]] = (
 	(HUMAN_COLOR, 'You'), (JUMP_MARKER, 'Rising'), (DEAD_COLOR, 'Dead'),
-	(WON_COLOR, 'Won'), (COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'),
+	(WON_COLOR, 'Won'), (COIN_COLOR, 'Coin'), (CHECKPOINT_COLOR, 'Ckpt'), (ENEMY_COLOR, 'Enemy'),
 )
 
 
@@ -180,7 +192,6 @@ class Renderer:
 	def __init__(self, world: World, target_fps: int = 0, caption: str = 'Neural-Jump') -> None:
 		pygame.init()
 		pygame.font.init()
-		self.world = world
 		# Vsync only helps while the target matches the display; above it, it would cap the framerate itself
 		desktop = self.desktop_fps()
 		self.target_fps = target_fps or desktop
@@ -198,6 +209,11 @@ class Renderer:
 		self.key_actions: dict[int, tuple[Callable[[], None], str]] = {}
 		self.show_hud = True
 		self.camera_lock = False  # Camera only ever advances toward the furthest x reached, never snaps back
+		self.set_world(world)
+
+	def set_world(self, world: World) -> None:
+		"""Points the renderer at a world and bakes its level, which is everything a map change costs here."""
+		self.world = world
 		self._camera_lock_x = float('-inf')
 		self._camera_lock_y = 0
 		# World y and surface y differ by `_origin_y` on maps taller than the screen, where the map starts above it
@@ -259,11 +275,14 @@ class Renderer:
 		self.screen.blit(self.level_surface, (0, 0), view)
 		self._draw_checkpoints()
 		self._draw_coins(focus_index)
+		self._draw_enemies(focus_index)
 		self._draw_players(focus_index, fitness, hud)
 		if self.show_hud:
 			self._draw_hud(hud)
 		if hud.banner:
 			self._draw_banner(hud.banner)
+		if hud.menu is not None:
+			self._draw_menu(hud.menu)
 		pygame.display.flip()
 		# Under vsync the flip already paces the loop; capping on top of it would make us miss every other frame
 		self.clock.tick(0 if self.vsync else self.target_fps)
@@ -311,6 +330,22 @@ class Renderer:
 		coin = coin_sprite()
 		x = self._coin_x[start:stop] - left
 		self.screen.fblits([(coin, spot) for spot in zip(x[visible].tolist(), y[visible].tolist())])
+
+	def _draw_enemies(self, focus_index: int) -> None:
+		"""The enemies as the followed agent sees them: each agent wakes and stomps its own, so no two share a frame."""
+		world = self.world
+		if not world.enemy_count:
+			return
+		x, y, live, heading = world.enemy_lookup(world.enemy_step[focus_index])
+		screen_x = x.astype(np.int64) - self.camera.left
+		screen_y = y.astype(np.int64) - self.camera.top
+		live &= ~world.stomped[focus_index]
+		live &= (screen_x > -ENEMY_W) & (screen_x < SCREEN_WIDTH) & (screen_y > -ENEMY_H) & (screen_y < SCREEN_HEIGHT)
+		if live.any():
+			self.screen.fblits([
+				(enemy_sprite(int(side)), spot)
+				for side, spot in zip(heading[live].tolist(), zip(screen_x[live].tolist(), screen_y[live].tolist()))
+			])
 
 	def _fitness_buckets(self, fitness: NDArray[np.float64]) -> NDArray[np.int64]:
 		"""Buckets agents by their rank rather than their raw fitness, so the colors stay readable."""
@@ -393,6 +428,24 @@ class Renderer:
 		x, y = (SCREEN_WIDTH - width) // 2, MARGIN * 5
 		self.screen.blit(_panel_background(width, height), (x, y))
 		self.screen.blit(label, (x + 2 * PADDING, y + PADDING))
+
+	def _draw_menu(self, menu: Menu) -> None:
+		"""The list in the middle of the screen, scrolled so the selected row stays in view."""
+		first = min(max(0, menu.selected - MENU_ROWS // 2), max(0, len(menu.items) - MENU_ROWS))
+		shown = menu.items[first:first + MENU_ROWS]
+		height = PADDING * 3 + ROW_HEIGHT * (len(shown) + 2) + 4
+		x, y = (SCREEN_WIDTH - MENU_WIDTH) // 2, (SCREEN_HEIGHT - height) // 2
+		self.screen.blit(_panel_background(MENU_WIDTH, height), (x, y))
+		self.screen.blit(_text(TITLE_SIZE, f'{menu.title}  {menu.selected + 1}/{len(menu.items)}', TITLE_COLOR), (x + PADDING, y + PADDING))
+
+		row_y = y + PADDING + ROW_HEIGHT + 4
+		for index, item in enumerate(shown, first):
+			chosen = index == menu.selected
+			if chosen:
+				pygame.draw.rect(self.screen, GRID_COLOR, Rect(x + 4, row_y - 1, MENU_WIDTH - 8, ROW_HEIGHT), border_radius=3)
+			self.screen.blit(_text(BODY_SIZE, ('> ' if chosen else '  ') + item, ACCENT_COLOR if chosen else VALUE_COLOR), (x + PADDING, row_y))
+			row_y += ROW_HEIGHT
+		self.screen.blit(_text(SMALL_SIZE, 'UP/DOWN pick   ENTER load   M/ESC close', LABEL_COLOR), (x + PADDING, row_y + PADDING))
 
 	@staticmethod
 	def _panel_height(panel: Panel) -> int:
