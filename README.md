@@ -122,13 +122,28 @@ since it is a fixed two seconds against however long the rollout in front of it 
 | `Space` | Pause and resume, the window stays live |
 | `Tab` | Hide the panels, leaving the level and the agents |
 | `1` | Back to speed x1 |
-| `M` | Speed `max`, which tunes itself to the framerate |
+| `F` | Speed `max`, which tunes itself to the framerate |
+| `M` | Open the map list: `Up` / `Down` to pick, `Enter` to load it under the run, `M` to close |
 | `-` / `=` | Halve or double the speed, also on the numpad. From `max` it starts at the multiplier it had reached |
 | `G` | Skip to the next spawn point, or under PPO move the curriculum on a rung by hand |
 | `S` | End the generation now and breed from what it scored, or under PPO update on the rollout so far |
 | `R` | Start the whole run over: random weights, generation 1, records cleared |
 
 They are listed in the legend at the bottom left, and the speed shows in the Training panel.
+
+## Switching maps mid-run
+
+`M` opens the map list over a held simulation. Picking a level drops whatever rollout or generation is in
+flight, since it was played on the old map, and the swap happens between two of them rather than inside one.
+
+What is rebuilt is everything the map is baked into: both worlds, the runner holding the compiled window and its
+captured graph, and the curriculum ladder read off the new floor. That is a compile and a capture, so the window
+sits still for a few seconds. Every record and tracker starts over too, because a score on one level says
+nothing about another.
+
+What carries over is the policy and its optimiser, which is the reason to switch at all: the observation is the
+same 62 features whatever the map, so a network that has learned to run and jump on one level starts the next
+one already knowing how.
 
 ## Playing it yourself
 
@@ -160,8 +175,8 @@ spawn point and simulation speed. Slow motion is the useful one there, a jump ar
 x0.1 it can be read frame by frame.
 
 The map list holds every `.txt` under `maps/`, read again each time it opens, so a level imported while the game
-runs shows up. Loading one starts its records over. The list is in `run-game.py` only: a training run compiles
-its simulation and builds its curriculum against one map, so switching means starting a new run with `--map`.
+runs shows up, and loading one starts the session's records over. `run-ai.py` has the same list under the same
+key, where a swap costs rather more: see [Switching maps mid-run](#switching-maps-mid-run).
 
 ## The network
 
