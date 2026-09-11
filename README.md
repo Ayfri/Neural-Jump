@@ -151,6 +151,7 @@ on a death, a banner says what it was worth, and the next attempt starts a secon
 | `G` | Start on the next spawn point, wrapping back to the beginning of the level |
 | `1` | Back to speed x1 |
 | `-` / `=` | Halve or double the simulation speed, down to x0.1 and up to x4, also on the numpad |
+| `M` | Open the map list over a frozen run: `Up` / `Down` to pick, `Enter` to load, `M` or `Escape` to close |
 | `Escape` | Quit, printing what the session scored |
 
 The Run panel tracks the session: time, best time, progress through the map, coins, attempts, wins and
@@ -158,12 +159,18 @@ deaths. The Player panel is the debug view: pixel position, tile, both speed com
 spawn point and simulation speed. Slow motion is the useful one there, a jump arc lasts about 42 ticks and at
 x0.1 it can be read frame by frame.
 
+The map list holds every `.txt` under `maps/`, read again each time it opens, so a level imported while the game
+runs shows up. Loading one starts its records over. The list is in `run-game.py` only: a training run compiles
+its simulation and builds its curriculum against one map, so switching means starting a new run with `--map`.
+
 ## The network
 
 A policy over a 7x7 tile view plus the player's own state:
 
-- **Input**: 58 features. One solid flag per tile, then the closest flag tile in view as `in view, dx, dy`,
-  then the closest coin the same way, then horizontal speed, vertical speed and ground contact
+- **Input**: 62 features. One solid flag per tile, then the closest flag tile in view as `in view, dx, dy`,
+  then the closest coin the same way, then the closest enemy as `in view, dx, dy, heading`, then horizontal
+  speed, vertical speed and ground contact. A map without enemies leaves those four at zero, and a weight file
+  saved against another input size is refused, the run starting from random weights instead
 - **Hidden**: 256, 128, 64 (LayerNorm on the first two, leaky ReLU)
 - **Output**: 3 logits (jump, left, right), played as an argmax
 
@@ -287,6 +294,7 @@ because it restarted.
 | `@` | Checkpoint, an extra spawn point under `--checkpoints`, drawn as a violet banner |
 | `o` | Coin, worth fitness and nothing else, drawn as a gold coin |
 | `F` | The flag: touching it wins the episode |
+| `E` | An enemy's starting cell, air once it walks off |
 | `*` | Decoration, no collision |
 
 Geometry follows the jump: a jump rises 4.5 tiles and its arc covers 8, so steps stay within 3 tiles and gaps
@@ -304,6 +312,36 @@ are built around that height:
 - **The fork** (tiles 410-469) splits into a flat, empty low road and a gallery of 25 coins above it. The
   gallery's staircase climbs to the left before it climbs to the right, which is the move an agent that only
   ever holds right and jump never makes, so which of the two an agent takes is visible at a glance.
+
+## Enemies
+
+`maps/level_1.txt` has none, the Super Mario Bros levels below have plenty. An enemy walks toward the start of
+the level at 2 pixels a tick, a quarter of the player's speed, turns around on a wall and falls off ledges. It
+wakes only once a player comes within 10 tiles, the way an SMB enemy starts moving as it scrolls onto the
+screen, so every agent meets it in the same state whenever it gets there. Landing on one from above, feet over
+its middle on the tick before, stomps it and bounces the player back up; any other contact kills.
+
+An enemy never reacts to a player, so where it stands only depends on how long it has walked. Every path is
+baked once at load: walked tick by tick until the enemy dies or repeats a state, then its loop is tiled over
+8192 ticks. Stopping on the repeat is what makes that cheap, since an enemy pacing between two pipes never dies:
+walking all 8192 ticks of every path costs about 2 seconds a map, tiling the loops 10 to 160 ms. An agent's whole enemy state is then a step counter and a stomped bit per enemy, two `(agents,
+enemies)` arrays like the coins, and both simulation paths read the same tables. Each agent wakes and stomps its
+own copy of every enemy, and the window draws the copies of the agent it follows. On a map without enemies the
+pass is skipped outright.
+
+## Super Mario Bros levels
+
+`uv run import-smb.py` downloads the 15 Super Mario Bros levels of the
+[Video Game Level Corpus](https://github.com/TheVGLC/TheVGLC) into `maps/smb/`, and `uv run import-smb.py 1-1 4-2`
+only those. The corpus stores a level as one character per tile, so importing one is a translation: ground,
+bricks, question blocks, pipes and cannons become `#`, enemies `E`, coins `o`. It marks neither Mario nor the
+flag, so the spawn goes on the floor at column 3 and a flag gate fills the air over the last column with a floor.
+Its floor is one row thick where SMB's is two, and a player dies two rows above the bottom of a map, so the
+bottom row is doubled. Every enemy kind is the same walker and cannons never fire. The levels are Nintendo's,
+which is why they are downloaded on demand and ignored by git.
+
+Train or play one with `--map maps/smb/1-1.txt`. They are 15 rows tall and 149 to 373 tiles wide, a fifth of
+`maps/level_1.txt`, so the default 60 second episode leaves plenty of room.
 
 ## Why evolution plays the argmax
 
@@ -469,7 +507,8 @@ batched network, `device_runner.py` plays whole action windows on the device, `r
 out. `game/` holds the engine: `world.py` is the batched numpy simulation and `world_cuda.py` the same
 physics as tensors, `render.py` the camera-culled renderer and the panels drawn over it, `art.py` every
 sprite it draws with, `play.py` the human-played session on top of both. Both entry points fill the same `Hud` and the renderer only lays it out.
-Levels are text files in `maps/`, `tiles.py` maps their characters to a `TileKind`, weights land in `weights/`,
+Levels are text files in `maps/`, `import-smb.py` fetches the Super Mario Bros ones into `maps/smb/`, `tiles.py`
+maps their characters to a `TileKind`, weights land in `weights/`,
 screen and physics constants live in `game/settings.py`.
 
 ## License
