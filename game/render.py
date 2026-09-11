@@ -7,6 +7,7 @@ import numpy as np
 import pygame
 from numpy.typing import NDArray
 from pygame import Rect, Surface
+from pygame._sdl2.video import Window
 from pygame.font import Font
 
 from game.art import (
@@ -184,14 +185,21 @@ class Renderer:
 		desktop = self.desktop_fps()
 		self.target_fps = target_fps or desktop
 		self.vsync = self.target_fps >= desktop
-		self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), vsync=int(self.vsync))
+		# SCALED stretches the fixed 1600x900 surface every layout is built against onto whatever the OS window becomes
+		self.screen = pygame.display.set_mode(
+			(SCREEN_WIDTH, SCREEN_HEIGHT), flags=pygame.RESIZABLE | pygame.SCALED, vsync=int(self.vsync),
+		)
 		if self.vsync:
 			self.target_fps = desktop
 		pygame.display.set_caption(caption)
+		Window.from_display_module().maximize()
 		self.clock = pygame.time.Clock()
 		self.camera = Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
 		self.key_actions: dict[int, tuple[Callable[[], None], str]] = {}
 		self.show_hud = True
+		self.camera_lock = False  # Camera only ever advances toward the furthest x reached, never snaps back
+		self._camera_lock_x = float('-inf')
+		self._camera_lock_y = 0
 		# World y and surface y differ by `_origin_y` on maps taller than the screen, where the map starts above it
 		self._origin_y = min(0, world.offset_y)
 		bottom = max(SCREEN_HEIGHT, world.offset_y + world.height * TILE_SIZE)
@@ -234,6 +242,9 @@ class Renderer:
 	def toggle_hud(self) -> None:
 		self.show_hud = not self.show_hud
 
+	def toggle_camera_lock(self) -> None:
+		self.camera_lock = not self.camera_lock
+
 	def poll_events(self) -> None:
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
@@ -258,8 +269,15 @@ class Renderer:
 		self.clock.tick(0 if self.vsync else self.target_fps)
 
 	def _move_camera(self, focus_index: int) -> None:
-		self.camera.centerx = int(self.world.x[focus_index]) + PLAYER_W // 2
-		self.camera.centery = int(self.world.y[focus_index]) + PLAYER_H // 2
+		x = int(self.world.x[focus_index]) + PLAYER_W // 2
+		y = int(self.world.y[focus_index]) + PLAYER_H // 2
+		if self.camera_lock:
+			# Only a new best past the current lock moves the camera; a generation restarting near spawn does not
+			if x >= self._camera_lock_x:
+				self._camera_lock_x, self._camera_lock_y = x, y
+			x, y = self._camera_lock_x, self._camera_lock_y
+		self.camera.centerx = x
+		self.camera.centery = y
 		self.camera.left = max(0, min(self.camera.left, self.level_surface.get_width() - SCREEN_WIDTH))
 		lowest = self._origin_y + self.level_surface.get_height() - SCREEN_HEIGHT
 		self.camera.top = max(self._origin_y, min(self.camera.top, lowest))

@@ -197,10 +197,11 @@ class Generation:
 
 			from game.render import Renderer
 
-			self.renderer = Renderer(self.world, fps)
+			renderer = self.renderer = Renderer(self.world, fps)
 			bindings: list[tuple[int, Callable[[], None], str]] = [
 				(pygame.K_SPACE, self.toggle_pause, 'Pause'),
-				(pygame.K_TAB, self.renderer.toggle_hud, 'HUD'),
+				(pygame.K_TAB, renderer.toggle_hud, 'HUD'),
+				(pygame.K_c, renderer.toggle_camera_lock, 'Camera lock'),
 				(pygame.K_1, lambda: self.set_speed(1.0), 'Speed x1'),
 				(pygame.K_m, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
 				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), 'Slower'),
@@ -213,7 +214,7 @@ class Generation:
 				(pygame.K_KP_PLUS, lambda: self.scale_speed(SPEED_STEP), ''),
 			]
 			for key, action, description in bindings:
-				self.renderer.add_key_action(key, action, description)
+				renderer.add_key_action(key, action, description)
 			self._apply_speed()
 
 		if load_latest_generation_weights:
