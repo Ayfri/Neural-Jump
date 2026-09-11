@@ -806,7 +806,8 @@ class Generation:
 				return
 			print(f'Mutation parameters: rate={self.mutation_rate:.4f}, strength={self.mutation_strength:.4f}')
 			self.evolve_generation()
-		except (FileNotFoundError, ValueError, KeyError) as error:
+		# A file saved against another observation size fails the shape check as a RuntimeError
+		except (FileNotFoundError, ValueError, KeyError, RuntimeError) as error:
 			print(f'No usable weights found, starting with random weights: {error}')
 
 	def quit(self) -> None:

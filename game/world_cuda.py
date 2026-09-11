@@ -5,10 +5,10 @@ import torch
 from torch import Tensor
 
 from game.constants import AGENT_VISION_DISTANCE, MOVE_JUMP
-from game.settings import PLAYER_GRAVITY, PLAYER_JUMP_STRENGTH, PLAYER_SPEED, TILE_SIZE
+from game.settings import ENEMY_WAKE_DISTANCE, PLAYER_GRAVITY, PLAYER_JUMP_STRENGTH, PLAYER_SPEED, STOMP_BOUNCE, TILE_SIZE
 from game.world import (
-	GRID_ORIGIN, GRID_PADDING, MAX_FALL_SPEED, MOVE_SPEEDS, ON_GROUND_SPEED, PLAYER_H, PLAYER_W,
-	WINDOW_FEATURES, World,
+	ENEMY_H, ENEMY_PATH_TICKS, ENEMY_REACH, ENEMY_SCALE, ENEMY_W, GRID_ORIGIN, GRID_PADDING, MAX_FALL_SPEED, MOVE_SPEEDS,
+	ON_GROUND_SPEED, PLAYER_H, PLAYER_START, PLAYER_W, WINDOW_FEATURES, World,
 )
 
 # Positions are truncated to whole pixels every tick, so the only precision that matters is the speed a
@@ -40,6 +40,13 @@ class CudaWorld:
 		self.coin_ids = constant(world.flat_coins, torch.int64)
 		self.windows = constant(world.windows, torch.float16)
 		self.move_speeds = constant(MOVE_SPEEDS, POSITION_DTYPE)
+		self.enemy_count = world.enemy_count
+		self.enemy_path_x = constant(world.enemy_path_x, POSITION_DTYPE)
+		self.enemy_path_y = constant(world.enemy_path_y, POSITION_DTYPE)
+		self.enemy_path_live = constant(world.enemy_path_live, torch.bool)
+		self.enemy_path_heading = constant(world.enemy_path_heading, POSITION_DTYPE)
+		self.enemy_spawn_x = constant(world.enemy_spawn_x, POSITION_DTYPE)
+		self.enemy_columns = torch.arange(self.enemy_count, device=device)
 
 		def zeros(dtype: torch.dtype) -> Tensor:
 			return torch.zeros(self.count, device=device, dtype=dtype)
@@ -50,6 +57,8 @@ class CudaWorld:
 		self.win_tick = torch.full((self.count,), -1, device=device, dtype=torch.int64)
 		self.coins = zeros(torch.int32)
 		self.collected = torch.zeros(self.count, max(1, world.coin_count), device=device, dtype=torch.bool)
+		self.enemy_step = torch.full((self.count, self.enemy_count), -1, device=device, dtype=torch.int64)
+		self.stomped = torch.zeros(self.count, self.enemy_count, device=device, dtype=torch.bool)
 		# One tick counter per player rather than one for the batch, so an episode can end and restart per agent
 		self.tick = torch.zeros(self.count, device=device, dtype=torch.int64)
 
@@ -64,6 +73,8 @@ class CudaWorld:
 		self.win_tick.fill_(-1)
 		self.coins.zero_()
 		self.collected.zero_()
+		self.enemy_step.fill_(-1)
+		self.stomped.zero_()
 		self.tick.zero_()
 
 	def reset_where(self, mask: Tensor, spawn_x: Tensor, spawn_y: Tensor) -> None:
@@ -84,6 +95,8 @@ class CudaWorld:
 		torch.where(mask, torch.full_like(self.win_tick, -1), self.win_tick, out=self.win_tick)
 		self.coins *= keep
 		self.collected &= keep.unsqueeze(1)
+		torch.where(mask.unsqueeze(1), torch.full_like(self.enemy_step, -1), self.enemy_step, out=self.enemy_step)
+		self.stomped &= keep.unsqueeze(1)
 		self.tick *= keep
 
 	def sync(self) -> World:
@@ -98,7 +111,14 @@ class CudaWorld:
 		np.copyto(world.win_tick, self.win_tick.cpu().numpy().astype(np.int32))
 		np.copyto(world.coins, self.coins.cpu().numpy())
 		np.copyto(world.collected, self.collected.cpu().numpy())
+		np.copyto(world.enemy_step, self.enemy_step.cpu().numpy())
+		np.copyto(world.stomped, self.stomped.cpu().numpy())
 		return world
+
+	def enemy_lookup(self, steps: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+		"""Position, whether it is still on the map, and heading of each enemy at its step, a sleeping one at its spawn."""
+		index = steps.clamp_min(0) * self.enemy_count + self.enemy_columns
+		return self.enemy_path_x[index], self.enemy_path_y[index], self.enemy_path_live[index], self.enemy_path_heading[index]
 
 	def alive(self) -> Tensor:
 		return ~(self.dead | self.win)
@@ -151,6 +171,8 @@ class CudaWorld:
 		self.dead |= alive & (self.y >= self.death_y)
 		alive = self.alive()
 
+		descending = self.change_y > 0
+		previous_bottom = self.y + PLAYER_H
 		torch.where(alive, (self.y + self.change_y).trunc_(), self.y, out=self.y)
 		self._resolve_vertical(alive)
 
@@ -158,7 +180,28 @@ class CudaWorld:
 		block = self._touch_block(self.y)
 		self._touch_goal(alive, block)
 		self._collect_coins(alive, block)
+		self._touch_enemies(descending, previous_bottom)
 		self.tick += 1
+
+	def _touch_enemies(self, descending: Tensor, previous_bottom: Tensor) -> None:
+		"""Walks the awake enemies, wakes the near ones and settles every contact, exactly as `World` does."""
+		if not self.enemy_count:
+			return
+		living = self.alive().unsqueeze(1)
+		awake = self.enemy_step >= 0
+		steps = torch.where(living & awake, (self.enemy_step + 1).clamp_max(ENEMY_PATH_TICKS - 1), self.enemy_step)
+		wake = living & ~awake & (self.x.unsqueeze(1) + ENEMY_WAKE_DISTANCE >= self.enemy_spawn_x)
+		torch.where(wake, torch.zeros_like(steps), steps, out=self.enemy_step)
+
+		x, y, live, _ = self.enemy_lookup(self.enemy_step)
+		player_x, player_y = self.x.unsqueeze(1), self.y.unsqueeze(1)
+		hit = live & ~self.stomped & living
+		hit &= (player_x < x + ENEMY_W) & (x < player_x + PLAYER_W) & (player_y < y + ENEMY_H) & (y < player_y + PLAYER_H)
+		stomp = hit & descending.unsqueeze(1) & (previous_bottom.unsqueeze(1) <= y + ENEMY_H / 2)
+		self.stomped |= stomp
+		self.dead |= (hit & ~stomp).any(dim=1)
+		bounced = stomp.any(dim=1) & ~self.dead
+		torch.where(bounced, torch.full_like(self.change_y, STOMP_BOUNCE), self.change_y, out=self.change_y)
 
 	def _resolve_horizontal(self, alive: Tensor) -> None:
 		top_row, bottom_row, left, right = self._touch_block(self.y)
@@ -228,7 +271,24 @@ class CudaWorld:
 
 		flat = out.view(self.count, -1)
 		torch.index_select(self.windows, 0, rows, out=flat[:, :WINDOW_FEATURES])
-		flat[:, WINDOW_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
-		flat[:, WINDOW_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
-		flat[:, WINDOW_FEATURES + 2] = self.on_ground()
+		self._enemy_features(flat[:, WINDOW_FEATURES:PLAYER_START])
+		flat[:, PLAYER_START] = self.change_x * (1.0 / PLAYER_SPEED)
+		flat[:, PLAYER_START + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
+		flat[:, PLAYER_START + 2] = self.on_ground()
 		return out
+
+	def _enemy_features(self, out: Tensor) -> None:
+		"""The closest enemy inside the vision window, as `in view, dx, dy, heading`, all zero when there is none."""
+		if not self.enemy_count:
+			out.zero_()
+			return
+		x, y, live, heading = self.enemy_lookup(self.enemy_step)
+		dx = x + (ENEMY_W / 2 - PLAYER_W / 2) - self.x.unsqueeze(1)
+		dy = y + (ENEMY_H / 2 - PLAYER_H / 2) - self.y.unsqueeze(1)
+		visible = live & ~self.stomped & (dx.abs() <= ENEMY_REACH) & (dy.abs() <= ENEMY_REACH)
+		nearest = torch.where(visible, dx * dx + dy * dy, torch.inf).argmin(dim=1, keepdim=True)
+		seen = visible.gather(1, nearest).squeeze(1)
+		out[:, 0] = seen
+		out[:, 1] = dx.gather(1, nearest).squeeze(1) * ENEMY_SCALE * seen
+		out[:, 2] = dy.gather(1, nearest).squeeze(1) * ENEMY_SCALE * seen
+		out[:, 3] = heading.gather(1, nearest).squeeze(1) * seen

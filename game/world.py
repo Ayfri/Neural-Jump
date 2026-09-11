@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Final
 
@@ -7,18 +8,26 @@ from numpy.typing import NDArray
 
 from game.constants import AGENT_VISION_DISTANCE, MOVE_IDLE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
 from game.settings import (
-	PLAYER_GRAVITY, PLAYER_HEIGHT, PLAYER_JUMP_STRENGTH, PLAYER_SPEED, PLAYER_WIDTH, SCREEN_HEIGHT, TILE_SIZE,
+	ENEMY_HEIGHT, ENEMY_SPEED, ENEMY_WAKE_DISTANCE, ENEMY_WIDTH, PLAYER_GRAVITY, PLAYER_HEIGHT, PLAYER_JUMP_STRENGTH,
+	PLAYER_SPEED, PLAYER_WIDTH, SCREEN_HEIGHT, STOMP_BOUNCE, TILE_SIZE,
 )
 from game.tiles import TILE_CHARS, TILE_REWARDS, TileKind
 
 PLAYER_W: Final[int] = int(PLAYER_WIDTH)
 PLAYER_H: Final[int] = int(PLAYER_HEIGHT)
+ENEMY_W: Final[int] = int(ENEMY_WIDTH)
+ENEMY_H: Final[int] = int(ENEMY_HEIGHT)
 GRID_SIDE: Final[int] = AGENT_VISION_DISTANCE * 2 + 1
 GRID_TILES: Final[int] = GRID_SIDE * GRID_SIDE  # One solid flag each, which is the whole terrain
 NEAREST_FEATURES: Final[int] = 3  # in view, its offset in x and y, for the closest tile of one kind
 WINDOW_FEATURES: Final[int] = GRID_TILES + 2 * NEAREST_FEATURES  # The closest goal tile, then the closest coin
+ENEMY_FEATURES: Final[int] = 4  # in view, its offset in x and y, its heading, for the closest enemy
+PLAYER_START: Final[int] = WINDOW_FEATURES + ENEMY_FEATURES  # Where the player's own features begin
 PLAYER_FEATURES: Final[int] = 3  # change_x normalised, change_y normalised, on ground
-OBSERVATION_SIZE: Final[int] = WINDOW_FEATURES + PLAYER_FEATURES
+OBSERVATION_SIZE: Final[int] = PLAYER_START + PLAYER_FEATURES
+ENEMY_REACH: Final[float] = (AGENT_VISION_DISTANCE + 0.5) * TILE_SIZE  # Centre offset under which an enemy is inside the vision window
+ENEMY_SCALE: Final[float] = 1.0 / (AGENT_VISION_DISTANCE * TILE_SIZE)  # Normalises an enemy offset like a tile offset
+ENEMY_PATH_TICKS: Final[int] = 8192  # Ticks of every enemy path baked at load, past which an enemy stays where it got to
 # Observations are flags and small normalised ratios, so half precision keeps every bit that matters while
 # halving the host-to-device copy done every tick.
 OBSERVATION_DTYPE: Final[np.dtype[np.float16]] = np.dtype(np.float16)
@@ -50,6 +59,12 @@ def resolve_map_path(map_path: str) -> Path:
 	"""Resolves a map path like 'maps/level_1.txt' to an absolute path."""
 	path = Path(map_path)
 	return search_maps_folder(path.parent) / path.name
+
+
+def list_maps() -> list[str]:
+	"""Every level under the maps folder, as the relative paths `--map` takes, in name order."""
+	folder = search_maps_folder('maps')
+	return sorted(path.relative_to(folder.parent).as_posix() for path in folder.rglob('*.txt'))
 
 
 def closest_tile(windows: NDArray[np.float32 | np.bool_]) -> NDArray[np.float32]:
@@ -113,7 +128,10 @@ class World:
 		self.win_tick = np.full(count, -1, dtype=np.int32)
 		self.coins = np.zeros(count, dtype=np.int32)
 		self.collected = np.zeros((count, max(1, self.coin_count)), dtype=np.bool_)
+		self.enemy_step = np.full((count, self.enemy_count), -1, dtype=np.int64)  # Ticks each enemy has walked for this agent, -1 asleep
+		self.stomped = np.zeros((count, self.enemy_count), dtype=np.bool_)
 		self._agents = np.arange(count)
+		self._enemy_columns = np.arange(self.enemy_count)
 
 		self._observation = np.zeros((count, OBSERVATION_SIZE), dtype=OBSERVATION_DTYPE)
 		self._offsets = np.arange(-AGENT_VISION_DISTANCE, AGENT_VISION_DISTANCE + 1)
@@ -192,6 +210,79 @@ class World:
 		self.windows[:, GRID_TILES:GRID_TILES + NEAREST_FEATURES] = closest_tile(goal_windows.reshape(-1, GRID_TILES))
 		# Coins are baked like the terrain, so a window still points at one the agent has already taken
 		self.windows[:, GRID_TILES + NEAREST_FEATURES:] = closest_tile(coin_windows.reshape(-1, GRID_TILES))
+		self._bake_enemy_paths(np.argwhere(self.kinds == TileKind.ENEMY))
+
+	def _bake_enemy_paths(self, cells: NDArray[np.int64]) -> None:
+		"""
+		Where every enemy stands on each tick after it wakes up, baked once for the whole map.
+
+		An enemy never reacts to a player: it walks at a fixed speed, turns around on a wall and falls off a
+		ledge. Its path only depends on how long it has walked, so a player's whole enemy state is one step
+		counter per enemy, and both simulation paths read the same tables. Stomped is the only other bit.
+		"""
+		self.enemy_count = count = len(cells)
+		self.enemy_spawn_x = (cells[:, 1] * TILE_SIZE + (TILE_SIZE - ENEMY_W) // 2).astype(np.float64)
+		spawn_y = cells[:, 0] * TILE_SIZE + self.offset_y + TILE_SIZE - ENEMY_H
+		paths = np.empty((ENEMY_PATH_TICKS, count, 4))
+		ticks = np.arange(ENEMY_PATH_TICKS)
+		for enemy in range(count):
+			path, loop = self._walk_enemy(float(self.enemy_spawn_x[enemy]), float(spawn_y[enemy]))
+			# Past its last walked tick a path replays its loop, which is its last row alone once it is dead
+			paths[:, enemy] = np.asarray(path)[np.where(ticks < len(path), ticks, loop + (ticks - loop) % (len(path) - loop))]
+		# Flat, so the (agents, enemies) lookup of a tick is one `take` on step * count + enemy
+		self.enemy_path_x, self.enemy_path_y = paths[..., 0].ravel(), paths[..., 1].ravel()
+		self.enemy_path_live, self.enemy_path_heading = paths[..., 2].ravel() != 0, paths[..., 3].ravel()
+
+	def _walk_enemy(self, x: float, y: float) -> tuple[list[tuple[float, float, float, float]], int]:
+		"""
+		One enemy's path as `(x, y, live, heading)` rows, and the row it loops back to.
+
+		The walk stops on the first state it has already been in, since everything after it replays the loop from
+		there, or on its death. An enemy pacing between two pipes repeats within a few hundred ticks, so a map
+		bakes without stepping every tick of the table. Each tick is a player's, in the same order: gravity, the
+		horizontal move and its snap, the death row, then the fall and its snap.
+		"""
+		solid, width, top = self.flat_solid, self.padded_width, self.offset_y - GRID_ORIGIN
+
+		def row_of(py: float) -> int:
+			return min(max(math.floor((py - top) / TILE_SIZE), 0), self.max_row)
+
+		def column_of(px: float) -> int:
+			return min(max(math.floor((px + GRID_ORIGIN) / TILE_SIZE), 0), self.max_column)
+
+		change_x, change_y, live = -float(ENEMY_SPEED), 0.0, True  # Heading for the player, the way every enemy in SMB starts
+		path: list[tuple[float, float, float, float]] = []
+		seen: dict[tuple[float, float, float, float], int] = {}
+		while len(path) < ENEMY_PATH_TICKS:
+			state = (x, y, change_x, change_y)
+			if live and state in seen:
+				return path, seen[state]
+			seen[state] = len(path)
+			path.append((x, y, float(live), math.copysign(1.0, change_x)))
+			if not live:
+				break
+			change_y = change_y + PLAYER_GRAVITY if change_y != 0.0 else 1.0
+
+			x = float(math.trunc(x + change_x))
+			column = column_of(x + (ENEMY_W - 1 if change_x > 0 else 0))
+			if solid[row_of(y) * width + column] or solid[row_of(y + ENEMY_H - 1) * width + column]:
+				x = float(column * TILE_SIZE - ENEMY_W - GRID_ORIGIN if change_x > 0 else (column + 1) * TILE_SIZE - GRID_ORIGIN)
+				change_x = -change_x
+
+			if y >= self.death_y:
+				live = False
+				continue
+			y = float(math.trunc(y + change_y))
+			row = row_of(y + (ENEMY_H - 1 if change_y > 0 else 0))
+			if solid[row * width + column_of(x)] or solid[row * width + column_of(x + ENEMY_W - 1)]:
+				y = float((row * TILE_SIZE - ENEMY_H if change_y > 0 else (row + 1) * TILE_SIZE) + top)
+				change_y = 0.0
+		return path, len(path) - 1
+
+	def enemy_lookup(self, steps: NDArray[np.int64]) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_], NDArray[np.float64]]:
+		"""Position, whether it is still on the map, and heading of each enemy at its step, a sleeping one at its spawn."""
+		index = np.maximum(steps, 0) * self.enemy_count + self._enemy_columns
+		return self.enemy_path_x.take(index), self.enemy_path_y.take(index), self.enemy_path_live.take(index), self.enemy_path_heading.take(index)
 
 	def ground_spawns(self, spacing: int) -> list[tuple[int, int]]:
 		"""
@@ -227,6 +318,8 @@ class World:
 		self.win_tick.fill(-1)
 		self.coins.fill(0)
 		self.collected.fill(False)
+		self.enemy_step.fill(-1)
+		self.stomped.fill(False)
 
 	def alive(self) -> NDArray[np.bool_]:
 		return ~(self.dead | self.win)
@@ -271,9 +364,9 @@ class World:
 
 	def observe(self, out: NDArray[np.float16] | None = None) -> NDArray[np.float16]:
 		"""
-		Fills `out` (or the world's own buffer) with the (count, 58) observation: the solid flag of every
-		tile in the 7x7 window around the player, where the closest goal tile and coin in it sit, and the
-		player's own speed and ground state.
+		Fills `out` (or the world's own buffer) with the (count, 62) observation: the solid flag of every
+		tile in the 7x7 window around the player, where the closest goal tile, coin and enemy in it sit, and
+		the player's own speed and ground state.
 		"""
 		target = self._observation if out is None else out
 		tile_x = tile_of(self.x + PLAYER_W / 2)
@@ -286,10 +379,28 @@ class World:
 		rows += columns
 
 		self.windows.take(rows, axis=0, out=target[:, :WINDOW_FEATURES])
-		target[:, WINDOW_FEATURES] = self.change_x * (1.0 / PLAYER_SPEED)
-		target[:, WINDOW_FEATURES + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
-		target[:, WINDOW_FEATURES + 2] = self.on_ground()
+		self._enemy_features(target[:, WINDOW_FEATURES:PLAYER_START])
+		target[:, PLAYER_START] = self.change_x * (1.0 / PLAYER_SPEED)
+		target[:, PLAYER_START + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)
+		target[:, PLAYER_START + 2] = self.on_ground()
 		return target
+
+	def _enemy_features(self, out: NDArray[np.float16]) -> None:
+		"""The closest enemy inside the vision window, as `in view, dx, dy, heading`, all zero when there is none."""
+		if not self.enemy_count:
+			out.fill(0)
+			return
+		x, y, live, heading = self.enemy_lookup(self.enemy_step)
+		dx = x + (ENEMY_W / 2 - PLAYER_W / 2) - self.x[:, None]
+		dy = y + (ENEMY_H / 2 - PLAYER_H / 2) - self.y[:, None]
+		visible = live & ~self.stomped & (np.abs(dx) <= ENEMY_REACH) & (np.abs(dy) <= ENEMY_REACH)
+		nearest = np.where(visible, dx * dx + dy * dy, np.inf).argmin(axis=1)
+		agents = self._agents
+		seen = visible[agents, nearest]
+		out[:, 0] = seen
+		out[:, 1] = dx[agents, nearest] * ENEMY_SCALE * seen
+		out[:, 2] = dy[agents, nearest] * ENEMY_SCALE * seen
+		out[:, 3] = heading[agents, nearest] * seen
 
 	def step(self, actions: NDArray[np.int64], tick: int) -> None:
 		"""Applies one action per player then advances the physics by one tick."""
@@ -311,6 +422,9 @@ class World:
 		self.dead |= alive & (self.y >= self.death_y)
 		alive = self.alive()
 
+		# A stomp is told apart from a side hit by where the player's feet were before this tick's fall
+		descending = self.change_y > 0
+		previous_bottom = self.y + PLAYER_H
 		np.add(self.y, self.change_y, out=self.y, where=alive)
 		np.trunc(self.y, out=self.y, where=alive)
 		self._resolve_vertical(alive)
@@ -318,6 +432,7 @@ class World:
 		block = self._touch_block(self.y)
 		self._touch_goal(alive, tick, block)
 		self._collect_coins(alive, block)
+		self._touch_enemies(descending, previous_bottom)
 
 	def grounded(self) -> NDArray[np.bool_]:
 		"""Players with solid ground right under their feet, which is the only state a jump fires from."""
@@ -413,3 +528,31 @@ class World:
 				continue
 			self.collected[agents[fresh], slots[fresh]] = True
 			self.coins += fresh
+
+	def _touch_enemies(self, descending: NDArray[np.bool_], previous_bottom: NDArray[np.float64]) -> None:
+		"""
+		Walks every awake enemy one step, wakes the ones a player came close to, then settles every contact.
+
+		Landing on an enemy from above, feet over its middle on the tick before, stomps it for that agent
+		alone and bounces the player off; any other contact kills the player.
+		"""
+		if not self.enemy_count:
+			return
+		alive = self.alive()
+		living = alive[:, None]
+		steps = self.enemy_step
+		awake = steps >= 0
+		np.add(steps, 1, out=steps, where=living & awake)
+		np.minimum(steps, ENEMY_PATH_TICKS - 1, out=steps)
+		np.copyto(steps, 0, where=living & ~awake & (self.x[:, None] + ENEMY_WAKE_DISTANCE >= self.enemy_spawn_x))
+
+		x, y, live, _ = self.enemy_lookup(steps)
+		player_x, player_y = self.x[:, None], self.y[:, None]
+		hit = live & ~self.stomped & living
+		hit &= (player_x < x + ENEMY_W) & (x < player_x + PLAYER_W) & (player_y < y + ENEMY_H) & (y < player_y + PLAYER_H)
+		if not hit.any():
+			return
+		stomp = hit & descending[:, None] & (previous_bottom[:, None] <= y + ENEMY_H / 2)
+		self.stomped |= stomp
+		self.dead |= (hit & ~stomp).any(axis=1)
+		np.copyto(self.change_y, STOMP_BOUNCE, where=stomp.any(axis=1) & ~self.dead)

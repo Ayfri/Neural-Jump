@@ -16,6 +16,7 @@ class TileKind(IntEnum):
 	CHECKPOINT = 4
 	COIN = 5
 	FLAG = 6
+	ENEMY = 7  # Where an enemy starts walking from, the cell itself is air
 
 
 TILE_CHARS: Final[dict[str, TileKind]] = {
@@ -26,6 +27,7 @@ TILE_CHARS: Final[dict[str, TileKind]] = {
 	'@': TileKind.CHECKPOINT,
 	'o': TileKind.COIN,
 	'F': TileKind.FLAG,
+	'E': TileKind.ENEMY,
 }
 
 # Fitness every paying tile is worth, so what a level hands out is read in one place. The flag is worth far
