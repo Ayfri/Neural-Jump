@@ -271,12 +271,12 @@ def coin_sprite() -> Surface:
 	return surface.convert_alpha()
 
 
-@lru_cache(maxsize=2)
-def checkpoint_sprite() -> Surface:
+@lru_cache(maxsize=8)
+def checkpoint_sprite(size: int = TILE_SIZE) -> Surface:
 	"""A checkpoint: a violet haze filling the cell with a banner planted in it, so it reads over sky and rock."""
-	surface = Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+	surface = Surface((size, size), pygame.SRCALPHA)
 	surface.fill(CHECKPOINT_HAZE)
-	surface.blit(_paint(CHECKPOINT_ART, {'P': CHECKPOINT_GLOW, 'F': CHECKPOINT_COLOR}, (TILE_SIZE, TILE_SIZE)), (0, 0))
+	surface.blit(_paint(CHECKPOINT_ART, {'P': CHECKPOINT_GLOW, 'F': CHECKPOINT_COLOR}, (size, size)), (0, 0))
 	return surface.convert_alpha()
 
 

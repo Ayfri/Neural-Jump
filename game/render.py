@@ -61,9 +61,9 @@ MENU_WIDTH: Final[int] = 420
 MENU_ROWS: Final[int] = 16  # Items shown at once, the list scrolls to keep the selected one in the middle
 DEFAULT_FPS: Final[int] = 60
 
-# Zoom range: under x1 the world is drawn on a surface larger than the screen, and scaling a 3200x1800 one down
-# every frame is already the most a frame can afford, which is what sets the lower bound
-MIN_ZOOM: Final[float] = 0.5
+# Zoom range: under x1 the world is drawn on a surface larger than the screen, and only the band the level
+# actually spans is drawn on and scaled, which is what keeps the far end of the range affordable
+MIN_ZOOM: Final[float] = 0.2
 MAX_ZOOM: Final[float] = 4.0
 ZOOM_STEP: Final[float] = 1.25
 
@@ -169,15 +169,21 @@ def _panel_background(width: int, height: int) -> Surface:
 
 
 @lru_cache(maxsize=FITNESS_BUCKETS * 24)  # Every (bucket, heading, state) sprite, so a full population never evicts one
-def _player_sprite(bucket: int, direction: int, state: int, faded: bool) -> Surface:
+def _player_sprite(bucket: int, direction: int, state: int) -> Surface:
 	"""
-	One player sprite: the fill encodes its fitness rank, or its state once it is dead, won or human.
+	One opaque player sprite: the fill encodes its fitness rank, or its state once it is dead, won or human.
 
-	`state` is 0 alive, 1 dead, 2 won, 3 the human player, and `faded` dims it. The whole set is tiny and
-	fully cached, so a frame only ever blits pre-rendered surfaces instead of painting a body per player.
+	`state` is 0 alive, 1 dead, 2 won, 3 the human player. The whole set is tiny and fully cached, so a frame
+	only ever blits pre-rendered surfaces instead of painting a body per player.
 	"""
 	fill = (DEAD_COLOR, WON_COLOR, HUMAN_COLOR)[state - 1] if state else _bucket_color(bucket)
-	return body_sprite(fill, (PLAYER_W, PLAYER_H), direction, state == 1, DEAD_ALPHA if faded else 255)
+	return body_sprite(fill, (PLAYER_W, PLAYER_H), direction, state == 1)
+
+
+@lru_cache(maxsize=64)  # One per heading and zoom, which is a handful
+def _ghost_sprite(direction: int, size: tuple[int, int]) -> Surface:
+	"""A dead agent, faded out. Sized by the zoom, because it is drawn on the screen rather than in the band."""
+	return body_sprite(DEAD_COLOR, size, direction, True, DEAD_ALPHA)
 
 
 def _player_ring(color: Color, gap: int, thickness: int) -> Surface:
@@ -221,8 +227,15 @@ class Renderer:
 		self._free_x = 0.0
 		self._free_y = 0.0
 		self._dragging = False
-		self._view: Surface | None = None  # Camera-sized, holding one zoomed frame of the world
-		self._scaled: Surface | None = None  # That frame at screen size, keyed so the backdrop shows through its sky
+		self._view: Surface | None = None  # Holds one zoomed frame of the world, sized to the band below
+		self._scaled: Surface | None = None  # That band at screen scale, keyed so the backdrop shows through its sky
+		# The part of the camera the level surface covers, which is all the world is ever drawn on. At x1 and
+		# above it is the camera itself, since the camera is clamped inside the level there
+		self._clip = Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
+		self._draw_x = 0  # World coordinates of that band's top left corner, which every sprite is placed against
+		self._draw_y = 0
+		self._band_x = 0  # And where it sits in the camera, for the translucent sprites drawn on the screen
+		self._band_y = 0
 		self.set_world(world)
 		for key, action, description in (
 			(pygame.K_v, self.toggle_freecam, 'Freecam'),
@@ -338,21 +351,30 @@ class Renderer:
 
 	def draw(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
 		self._move_camera(focus_index)
-		self.surface = self._view_surface()
 		view = Rect(self.camera.left, self.to_surface(self.camera.top), self.camera.width, self.camera.height)
+		# Zoomed out past the map, the camera covers rows and columns the level does not have: nothing is ever
+		# drawn on those, so the world is drawn on the band the level spans and the backdrop keeps the rest. At
+		# x0.2 that is a quarter of the camera, and it is the difference between a 21 ms frame and a 9 ms one
+		self._clip = view.clip(self.level_surface.get_rect())
+		self._draw_x, self._draw_y = self._clip.left, self._clip.top + self._origin_y
+		# Where that band sits in the camera, which is what turns a position in it into one on the screen
+		self._band_x, self._band_y = self._clip.left - view.left, self._clip.top - view.top
+		self.surface = self._view_surface()
 		# The backdrop is drawn at screen size whatever the zoom: it is a parallax lie already, and keeping it out
 		# of the scaled surface keeps a x1 frame exactly the handful of blits it has always been
 		self.background.draw(self.screen, view.left, max(0, view.top))
 		if self.surface is not self.screen:
 			self.surface.fill(COLORKEY)
-		# Clipped, because a view zoomed out past the map covers rows and columns the level surface does not have
-		level = view.clip(self.level_surface.get_rect())
-		self.surface.blit(self.level_surface, (level.left - view.left, level.top - view.top), level)
-		self._draw_checkpoints()
+		self.surface.blit(self.level_surface, (0, 0), self._clip)
 		self._draw_coins(focus_index)
 		self._draw_enemies(focus_index)
-		self._draw_players(focus_index, fitness, hud)
-		self._scale_view()
+		ghosts = self._draw_players(focus_index, fitness, hud)
+		self._scale_view(view)
+		# The two translucent things go on the screen once the band is down, because what alpha blends with has to
+		# be the real frame: over the key colour the band's sky is, a haze comes out magenta and a ghost bright pink
+		self._draw_checkpoints()
+		if ghosts:
+			self.screen.fblits(ghosts)
 		if self.show_hud:
 			self._draw_hud(hud)
 		if hud.banner:
@@ -364,25 +386,29 @@ class Renderer:
 		self.clock.tick(0 if self.vsync else self.target_fps)
 
 	def _view_surface(self) -> Surface:
-		"""What the world is drawn on: the screen itself at x1, and a camera-sized scratch under any other zoom."""
+		"""
+		What the world is drawn on: the screen itself at x1, and a band-sized scratch under any other zoom.
+
+		The band's size only depends on the zoom and the map, never on where the camera sits: the camera either
+		covers an axis of the level whole or is clamped inside it, so panning never reallocates the surface.
+		"""
 		if self.zoom == 1.0:
 			return self.screen
-		size = (self.camera.width, self.camera.height)
-		if self._view is None or self._view.get_size() != size:
-			self._view = Surface(size).convert()
-		if self._scaled is None:
-			self._scaled = Surface((SCREEN_WIDTH, SCREEN_HEIGHT)).convert()
-			self._scaled.set_colorkey(COLORKEY)
+		if self._view is None or self._view.get_size() != self._clip.size:
+			self._view = Surface(self._clip.size).convert()
 		return self._view
 
-	def _scale_view(self) -> None:
+	def _scale_view(self, view: Rect) -> None:
 		"""Puts a zoomed frame on the screen: one nearest-neighbour scale, then a keyed blit over the backdrop."""
-		scaled = self._scaled
-		if self.surface is self.screen or scaled is None:
+		if self.surface is self.screen:
 			return
+		size = (round(self._clip.width * self.zoom), round(self._clip.height * self.zoom))
+		if self._scaled is None or self._scaled.get_size() != size:
+			self._scaled = Surface(size).convert()
+			self._scaled.set_colorkey(COLORKEY)
 		# Nearest neighbour, so the key colour the level's air is left as survives the resize exactly
-		pygame.transform.scale(self.surface, (SCREEN_WIDTH, SCREEN_HEIGHT), scaled)
-		self.screen.blit(scaled, (0, 0))
+		pygame.transform.scale(self.surface, size, self._scaled)
+		self.screen.blit(self._scaled, (round((self._clip.left - view.left) * self.zoom), round((self._clip.top - view.top) * self.zoom)))
 
 	def _move_camera(self, focus_index: int) -> None:
 		self.camera.size = (round(SCREEN_WIDTH / self.zoom), round(SCREEN_HEIGHT / self.zoom))
@@ -408,27 +434,28 @@ class Renderer:
 			self._free_x, self._free_y = float(self.camera.centerx), float(self.camera.centery)
 
 	def _draw_checkpoints(self) -> None:
-		"""The checkpoints inside the camera: a map holds a handful, so a plain culling loop is enough."""
+		"""The checkpoints inside the camera, on the screen: a map holds a handful, so a plain culling loop is enough."""
 		left, top = self.camera.left, self.to_surface(self.camera.top)
-		sprite = checkpoint_sprite()
+		size = max(1, round(TILE_SIZE * self.zoom))
+		sprite = checkpoint_sprite(size)
 		spots = [
-			(x - left, y - top) for x, y in self._checkpoints
+			(round((x - left) * self.zoom), round((y - top) * self.zoom)) for x, y in self._checkpoints
 			if -TILE_SIZE < x - left < self.camera.width and -TILE_SIZE < y - top < self.camera.height
 		]
 		if spots:
-			self.surface.fblits([(sprite, spot) for spot in spots])
+			self.screen.fblits([(sprite, spot) for spot in spots])
 
 	def _draw_coins(self, focus_index: int) -> None:
 		"""The coins the followed agent has not banked yet, culled to the camera."""
-		left, top = self.camera.left, self.camera.top
+		left, top = self._draw_x, self._draw_y
 		# Two binary searches cut the map down to the coins in the camera's column, whatever the map holds
 		start = int(np.searchsorted(self._coin_x, left - TILE_SIZE, side='right'))
-		stop = int(np.searchsorted(self._coin_x, left + self.camera.width))
+		stop = int(np.searchsorted(self._coin_x, left + self._clip.width))
 		if start >= stop:
 			return
 
 		y = self._coin_y[start:stop] - top
-		visible = (y > -TILE_SIZE) & (y < self.camera.height)
+		visible = (y > -TILE_SIZE) & (y < self._clip.height)
 		visible &= ~self.world.collected[focus_index, self._coin_ids[start:stop]]
 		if not visible.any():
 			return
@@ -443,10 +470,10 @@ class Renderer:
 		if not world.enemy_count:
 			return
 		x, y, live, heading = world.enemy_lookup(world.enemy_step[focus_index])
-		screen_x = x.astype(np.int64) - self.camera.left
-		screen_y = y.astype(np.int64) - self.camera.top
+		screen_x = x.astype(np.int64) - self._draw_x
+		screen_y = y.astype(np.int64) - self._draw_y
 		live &= ~world.stomped[focus_index]
-		live &= (screen_x > -ENEMY_W) & (screen_x < self.camera.width) & (screen_y > -ENEMY_H) & (screen_y < self.camera.height)
+		live &= (screen_x > -ENEMY_W) & (screen_x < self._clip.width) & (screen_y > -ENEMY_H) & (screen_y < self._clip.height)
 		if live.any():
 			self.surface.fblits([
 				(enemy_sprite(int(side)), spot)
@@ -461,14 +488,19 @@ class Renderer:
 		self._ranks[np.argsort(fitness, kind='stable')] = np.arange(count)
 		return self._ranks * (FITNESS_BUCKETS - 1) // (count - 1)
 
-	def _draw_players(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
+	def _draw_players(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> list[Blit]:
+		"""
+		Draws the population into the band and hands back the ghosts, which belong on the screen instead.
+
+		A ghost is the one player sprite that is translucent, so it cannot be blended against the key colour the
+		band's sky is left as. Everything else is opaque or fully transparent per pixel, which a key handles.
+		"""
 		world = self.world
-		left, top = self.camera.left, self.camera.top
-		screen_x = world.x.astype(np.int64) - left
-		screen_y = world.y.astype(np.int64) - top
-		visible = (screen_x > -PLAYER_W) & (screen_x < self.camera.width) & (screen_y > -PLAYER_H) & (screen_y < self.camera.height)
+		screen_x = world.x.astype(np.int64) - self._draw_x
+		screen_y = world.y.astype(np.int64) - self._draw_y
+		visible = (screen_x > -PLAYER_W) & (screen_x < self._clip.width) & (screen_y > -PLAYER_H) & (screen_y < self._clip.height)
 		if not visible.any():
-			return
+			return []
 
 		# Read as python lists: pulling 300 values out of an array one index at a time costs more than the loop
 		buckets = self._fitness_buckets(fitness).tolist()
@@ -483,6 +515,8 @@ class Renderer:
 		ghost = not hud.solo  # A human run has a single body, which would be unreadable faded out
 		bodies: list[Blit] = []
 		markers: list[Blit] = []
+		ghosts: list[Blit] = []
+		ghost_size = (max(1, round(PLAYER_W * self.zoom)), max(1, round(PLAYER_H * self.zoom)))
 		jump = jump_sprite(JUMP_MARKER)
 		elite_ring = _player_ring(ELITE_RING, 2, 2)
 		random_ring = _player_ring(RANDOM_RING, 2, 2)
@@ -492,23 +526,28 @@ class Renderer:
 		for index in np.flatnonzero(visible).tolist():
 			x, y = screen_x[index], screen_y[index]
 			state = states[index]
-			faded = ghost and state == 1
-			bodies.append((_player_sprite(buckets[index], directions[index], fills[index], faded), (x, y)))
-			# A ghost carries no rank marker: those are only worth reading on an agent still in the run
-			if not faded:
-				if state == 0 and rising[index]:
-					markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
-				if index < hud.elite_count:
-					markers.append((elite_ring, (x - 4, y - 4)))
-				elif index >= random_start:
-					markers.append((random_ring, (x - 4, y - 4)))
 			if index == focus_index and not hud.solo:
 				markers.append((focus_ring, (x - 7, y - 7)))
+			# A ghost carries no rank marker either: those are only worth reading on an agent still in the run
+			if ghost and state == 1:
+				spot = (round((x + self._band_x) * self.zoom), round((y + self._band_y) * self.zoom))
+				ghosts.append((_ghost_sprite(directions[index], ghost_size), spot))
+				continue
+
+			bodies.append((_player_sprite(buckets[index], directions[index], fills[index]), (x, y)))
+			if state == 0 and rising[index]:
+				markers.append((jump, (x + PLAYER_W // 2 - 6, y - 11)))
+			if index < hud.elite_count:
+				markers.append((elite_ring, (x - 4, y - 4)))
+			elif index >= random_start:
+				markers.append((random_ring, (x - 4, y - 4)))
 
 		# fblits takes only (surface, dest) pairs, which is all these are, and draws them about 1.7x faster than blits
-		self.surface.fblits(bodies)
+		if bodies:
+			self.surface.fblits(bodies)
 		if markers:
 			self.surface.fblits(markers)
+		return ghosts
 
 	def _draw_hud(self, hud: Hud) -> None:
 		"""Stacks the panels down both top corners, then places the two fixed-corner ones under them."""
