@@ -11,8 +11,8 @@ from pygame._sdl2.video import Window
 from pygame.font import Font
 
 from game.art import (
-	CHECKPOINT_COLOR, COIN_COLOR, ENEMY_COLOR, Background, bake_level, body_sprite, checkpoint_sprite, coin_sprite,
-	enemy_sprite, jump_sprite, ring_sprite,
+	CHECKPOINT_COLOR, COIN_COLOR, COLORKEY, ENEMY_COLOR, Background, bake_level, body_sprite, checkpoint_sprite,
+	coin_sprite, enemy_sprite, jump_sprite, ring_sprite,
 )
 from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
 from game.world import ENEMY_H, ENEMY_W, PLAYER_H, PLAYER_W, World
@@ -60,6 +60,12 @@ SPARKLINE_GUTTER: Final[int] = 34  # Room kept on the right of the curve for its
 MENU_WIDTH: Final[int] = 420
 MENU_ROWS: Final[int] = 16  # Items shown at once, the list scrolls to keep the selected one in the middle
 DEFAULT_FPS: Final[int] = 60
+
+# Zoom range: under x1 the world is drawn on a surface larger than the screen, and scaling a 3200x1800 one down
+# every frame is already the most a frame can afford, which is what sets the lower bound
+MIN_ZOOM: Final[float] = 0.5
+MAX_ZOOM: Final[float] = 4.0
+ZOOM_STEP: Final[float] = 1.25
 
 
 @dataclass(slots=True)
@@ -209,7 +215,23 @@ class Renderer:
 		self.key_actions: dict[int, tuple[Callable[[], None], str]] = {}
 		self.show_hud = True
 		self.camera_lock = False  # Camera only ever advances toward the furthest x reached, never snaps back
+		self.surface = self.screen  # What the world is drawn on: the screen itself at x1, a camera-sized scratch otherwise
+		self.zoom = 1.0
+		self.freecam = False  # Camera driven by hand instead of by the followed agent
+		self._free_x = 0.0
+		self._free_y = 0.0
+		self._dragging = False
+		self._view: Surface | None = None  # Camera-sized, holding one zoomed frame of the world
+		self._scaled: Surface | None = None  # That frame at screen size, keyed so the backdrop shows through its sky
 		self.set_world(world)
+		for key, action, description in (
+			(pygame.K_v, self.toggle_freecam, 'Freecam'),
+			(pygame.K_PAGEUP, lambda: self.set_zoom(self.zoom * ZOOM_STEP), 'Zoom'),
+			(pygame.K_PAGEDOWN, lambda: self.set_zoom(self.zoom / ZOOM_STEP), ''),
+			(pygame.K_0, self.reset_view, 'Reset view'),
+			(pygame.K_KP_0, self.reset_view, ''),
+		):
+			self.add_key_action(key, action, description)
 
 	def set_world(self, world: World) -> None:
 		"""Points the renderer at a world and bakes its level, which is everything a map change costs here."""
@@ -261,22 +283,76 @@ class Renderer:
 	def toggle_camera_lock(self) -> None:
 		self.camera_lock = not self.camera_lock
 
+	def toggle_freecam(self) -> None:
+		"""Takes the camera off the followed agent, or hands it back, seeded where it already looks so nothing jumps."""
+		self.freecam = not self.freecam
+		self._free_x, self._free_y = float(self.camera.centerx), float(self.camera.centery)
+
+	def reset_view(self) -> None:
+		"""Back to x1 on the followed agent, which is the one key out of any corner of the level the freecam reached."""
+		self.freecam = False
+		self.zoom = 1.0
+
+	def set_zoom(self, zoom: float, anchor: tuple[int, int] | None = None) -> None:
+		"""
+		Zooms the view, clamped to the range a per-frame scale can afford.
+
+		`anchor` is a screen point the world pixel under it stays put at, which is what a wheel zoom over the
+		cursor should do. The camera is centred on its target, so holding that pixel is a shift of the centre by
+		what the point's distance from the middle of the screen is worth at either zoom. It only means anything
+		while the camera is free: otherwise the next frame puts it back on its agent.
+		"""
+		zoom = min(MAX_ZOOM, max(MIN_ZOOM, zoom))
+		if zoom == self.zoom:
+			return
+		if anchor is not None and self.freecam:
+			self._free_x += (anchor[0] - SCREEN_WIDTH / 2) * (1 / self.zoom - 1 / zoom)
+			self._free_y += (anchor[1] - SCREEN_HEIGHT / 2) * (1 / self.zoom - 1 / zoom)
+		self.zoom = zoom
+
+	def pan(self, dx: int, dy: int) -> None:
+		"""Drags the view by a mouse move, taking the camera off its agent: the world follows the cursor 1:1."""
+		if not self.freecam:
+			self.toggle_freecam()
+		self._free_x -= dx / self.zoom
+		self._free_y -= dy / self.zoom
+
+	def view_label(self) -> str:
+		"""How the camera is set, for the panel the caller owns: its zoom, and whether it is off the followed agent."""
+		return ('free ' if self.freecam else '') + f'x{self.zoom:.2f}'
+
 	def poll_events(self) -> None:
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				raise SystemExit
 			if event.type == pygame.KEYDOWN and event.key in self.key_actions:
 				self.key_actions[event.key][0]()
+			elif event.type == pygame.MOUSEWHEEL:
+				self.set_zoom(self.zoom * ZOOM_STEP ** event.y, pygame.mouse.get_pos())
+			elif event.type == pygame.MOUSEBUTTONDOWN and event.button <= 3:
+				self._dragging = True
+			elif event.type == pygame.MOUSEBUTTONUP and event.button <= 3:
+				self._dragging = False
+			elif event.type == pygame.MOUSEMOTION and self._dragging:
+				self.pan(*event.rel)
 
 	def draw(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
 		self._move_camera(focus_index)
+		self.surface = self._view_surface()
 		view = Rect(self.camera.left, self.to_surface(self.camera.top), self.camera.width, self.camera.height)
-		self.background.draw(self.screen, view.left, view.top)
-		self.screen.blit(self.level_surface, (0, 0), view)
+		# The backdrop is drawn at screen size whatever the zoom: it is a parallax lie already, and keeping it out
+		# of the scaled surface keeps a x1 frame exactly the handful of blits it has always been
+		self.background.draw(self.screen, view.left, max(0, view.top))
+		if self.surface is not self.screen:
+			self.surface.fill(COLORKEY)
+		# Clipped, because a view zoomed out past the map covers rows and columns the level surface does not have
+		level = view.clip(self.level_surface.get_rect())
+		self.surface.blit(self.level_surface, (level.left - view.left, level.top - view.top), level)
 		self._draw_checkpoints()
 		self._draw_coins(focus_index)
 		self._draw_enemies(focus_index)
 		self._draw_players(focus_index, fitness, hud)
+		self._scale_view()
 		if self.show_hud:
 			self._draw_hud(hud)
 		if hud.banner:
@@ -287,19 +363,49 @@ class Renderer:
 		# Under vsync the flip already paces the loop; capping on top of it would make us miss every other frame
 		self.clock.tick(0 if self.vsync else self.target_fps)
 
+	def _view_surface(self) -> Surface:
+		"""What the world is drawn on: the screen itself at x1, and a camera-sized scratch under any other zoom."""
+		if self.zoom == 1.0:
+			return self.screen
+		size = (self.camera.width, self.camera.height)
+		if self._view is None or self._view.get_size() != size:
+			self._view = Surface(size).convert()
+		if self._scaled is None:
+			self._scaled = Surface((SCREEN_WIDTH, SCREEN_HEIGHT)).convert()
+			self._scaled.set_colorkey(COLORKEY)
+		return self._view
+
+	def _scale_view(self) -> None:
+		"""Puts a zoomed frame on the screen: one nearest-neighbour scale, then a keyed blit over the backdrop."""
+		scaled = self._scaled
+		if self.surface is self.screen or scaled is None:
+			return
+		# Nearest neighbour, so the key colour the level's air is left as survives the resize exactly
+		pygame.transform.scale(self.surface, (SCREEN_WIDTH, SCREEN_HEIGHT), scaled)
+		self.screen.blit(scaled, (0, 0))
+
 	def _move_camera(self, focus_index: int) -> None:
-		x = int(self.world.x[focus_index]) + PLAYER_W // 2
-		y = int(self.world.y[focus_index]) + PLAYER_H // 2
-		if self.camera_lock:
-			# Only a new best past the current lock moves the camera; a generation restarting near spawn does not
-			if x >= self._camera_lock_x:
-				self._camera_lock_x, self._camera_lock_y = x, y
-			x, y = self._camera_lock_x, self._camera_lock_y
+		self.camera.size = (round(SCREEN_WIDTH / self.zoom), round(SCREEN_HEIGHT / self.zoom))
+		if self.freecam:
+			x, y = int(self._free_x), int(self._free_y)
+		else:
+			x = int(self.world.x[focus_index]) + PLAYER_W // 2
+			y = int(self.world.y[focus_index]) + PLAYER_H // 2
+			if self.camera_lock:
+				# Only a new best past the current lock moves the camera; a generation restarting near spawn does not
+				if x >= self._camera_lock_x:
+					self._camera_lock_x, self._camera_lock_y = x, y
+				x, y = self._camera_lock_x, self._camera_lock_y
 		self.camera.centerx = x
 		self.camera.centery = y
-		self.camera.left = max(0, min(self.camera.left, self.level_surface.get_width() - SCREEN_WIDTH))
-		lowest = self._origin_y + self.level_surface.get_height() - SCREEN_HEIGHT
-		self.camera.top = max(self._origin_y, min(self.camera.top, lowest))
+		# A map smaller than the view has no room to scroll in, so it is centred in it instead of clamped against it
+		span = self.level_surface.get_width() - self.camera.width
+		self.camera.left = max(0, min(self.camera.left, span)) if span > 0 else span // 2
+		lowest = self._origin_y + self.level_surface.get_height() - self.camera.height
+		self.camera.top = max(self._origin_y, min(self.camera.top, lowest)) if lowest > self._origin_y else (self._origin_y + lowest) // 2
+		# Written back, so panning into the edge of the level does not build up an overshoot to undo on the way out
+		if self.freecam:
+			self._free_x, self._free_y = float(self.camera.centerx), float(self.camera.centery)
 
 	def _draw_checkpoints(self) -> None:
 		"""The checkpoints inside the camera: a map holds a handful, so a plain culling loop is enough."""
@@ -307,29 +413,29 @@ class Renderer:
 		sprite = checkpoint_sprite()
 		spots = [
 			(x - left, y - top) for x, y in self._checkpoints
-			if -TILE_SIZE < x - left < SCREEN_WIDTH and -TILE_SIZE < y - top < SCREEN_HEIGHT
+			if -TILE_SIZE < x - left < self.camera.width and -TILE_SIZE < y - top < self.camera.height
 		]
 		if spots:
-			self.screen.fblits([(sprite, spot) for spot in spots])
+			self.surface.fblits([(sprite, spot) for spot in spots])
 
 	def _draw_coins(self, focus_index: int) -> None:
 		"""The coins the followed agent has not banked yet, culled to the camera."""
 		left, top = self.camera.left, self.camera.top
 		# Two binary searches cut the map down to the coins in the camera's column, whatever the map holds
 		start = int(np.searchsorted(self._coin_x, left - TILE_SIZE, side='right'))
-		stop = int(np.searchsorted(self._coin_x, left + SCREEN_WIDTH))
+		stop = int(np.searchsorted(self._coin_x, left + self.camera.width))
 		if start >= stop:
 			return
 
 		y = self._coin_y[start:stop] - top
-		visible = (y > -TILE_SIZE) & (y < SCREEN_HEIGHT)
+		visible = (y > -TILE_SIZE) & (y < self.camera.height)
 		visible &= ~self.world.collected[focus_index, self._coin_ids[start:stop]]
 		if not visible.any():
 			return
 
 		coin = coin_sprite()
 		x = self._coin_x[start:stop] - left
-		self.screen.fblits([(coin, spot) for spot in zip(x[visible].tolist(), y[visible].tolist())])
+		self.surface.fblits([(coin, spot) for spot in zip(x[visible].tolist(), y[visible].tolist())])
 
 	def _draw_enemies(self, focus_index: int) -> None:
 		"""The enemies as the followed agent sees them: each agent wakes and stomps its own, so no two share a frame."""
@@ -340,9 +446,9 @@ class Renderer:
 		screen_x = x.astype(np.int64) - self.camera.left
 		screen_y = y.astype(np.int64) - self.camera.top
 		live &= ~world.stomped[focus_index]
-		live &= (screen_x > -ENEMY_W) & (screen_x < SCREEN_WIDTH) & (screen_y > -ENEMY_H) & (screen_y < SCREEN_HEIGHT)
+		live &= (screen_x > -ENEMY_W) & (screen_x < self.camera.width) & (screen_y > -ENEMY_H) & (screen_y < self.camera.height)
 		if live.any():
-			self.screen.fblits([
+			self.surface.fblits([
 				(enemy_sprite(int(side)), spot)
 				for side, spot in zip(heading[live].tolist(), zip(screen_x[live].tolist(), screen_y[live].tolist()))
 			])
@@ -360,7 +466,7 @@ class Renderer:
 		left, top = self.camera.left, self.camera.top
 		screen_x = world.x.astype(np.int64) - left
 		screen_y = world.y.astype(np.int64) - top
-		visible = (screen_x > -PLAYER_W) & (screen_x < SCREEN_WIDTH) & (screen_y > -PLAYER_H) & (screen_y < SCREEN_HEIGHT)
+		visible = (screen_x > -PLAYER_W) & (screen_x < self.camera.width) & (screen_y > -PLAYER_H) & (screen_y < self.camera.height)
 		if not visible.any():
 			return
 
@@ -400,9 +506,9 @@ class Renderer:
 				markers.append((focus_ring, (x - 7, y - 7)))
 
 		# fblits takes only (surface, dest) pairs, which is all these are, and draws them about 1.7x faster than blits
-		self.screen.fblits(bodies)
+		self.surface.fblits(bodies)
 		if markers:
-			self.screen.fblits(markers)
+			self.surface.fblits(markers)
 
 	def _draw_hud(self, hud: Hud) -> None:
 		"""Stacks the panels down both top corners, then places the two fixed-corner ones under them."""

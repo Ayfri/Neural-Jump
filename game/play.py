@@ -232,6 +232,7 @@ class PlaySession:
 			('Ground', 'yes' if bool(world.grounded()[0]) else 'no'),
 			('Spawn', f'{self.spawn_index + 1}/{len(self.spawn_points)}'),
 			('Sim speed', f'x{self.speed:g}'),
+			('View', self.renderer.view_label()),
 			('Best coins', f'{self.best_coins}/{world.coin_count}'),
 		])
 		hints = [('WASD', 'Move'), ('SPACE', 'Jump'), *self.renderer.key_hints()]

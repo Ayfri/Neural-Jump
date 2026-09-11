@@ -766,6 +766,7 @@ class Generation:
 			('Fitness', f'{float(self.rewards[best]):.1f}'),
 			('Position', f'{int(world.x[best])}, {int(world.y[best])}'),
 			('Coins', f'{int(world.coins[best])}/{world.coin_count}'),
+			('View', self.renderer.view_label()),
 		])
 
 		self.renderer.draw(best, self.rewards, Hud(
