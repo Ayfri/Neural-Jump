@@ -20,6 +20,9 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
+# Super Mario Bros levels, Nintendo's, fetched by import-smb.py rather than committed
+maps/smb/
+
 # ML/NN
 weights/
 logs/
