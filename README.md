@@ -128,8 +128,24 @@ since it is a fixed two seconds against however long the rollout in front of it 
 | `G` | Skip to the next spawn point, or under PPO move the curriculum on a rung by hand |
 | `S` | End the generation now and breed from what it scored, or under PPO update on the rollout so far |
 | `R` | Start the whole run over: random weights, generation 1, records cleared |
+| `V` | Free the camera from the followed agent, or give it back |
+| `Page Up` / `Page Down` | Zoom, x0.5 out to x4 in |
+| `0` | Back to x1 on the followed agent, also on the numpad |
+| Drag, wheel | Pan the camera, and zoom around the cursor |
 
 They are listed in the legend at the bottom left, and the speed shows in the Training panel.
+
+## Moving the camera
+
+The camera follows the best agent still alive, and `V` takes it off it. A free camera is dragged with any mouse
+button and zoomed with the wheel, which holds the world pixel under the cursor in place; dragging frees the
+camera on its own, so a drag is all it takes. `0` puts it back on its agent at x1. The Focus panel says which of
+the two it is and what the zoom is, and the same keys work in `run-game.py`, where the camera follows you.
+
+Zoom out reads the whole spread of a population, which is what a rollout looks like in one glance, and zoom in
+reads a single jump arc against the tile it lands on. Out is the one that costs: the world is drawn on a
+camera-sized surface and scaled to the window every frame, so x0.5 scales 3200x1800 down to the screen, which is
+what the range stops at. At x1 nothing is scaled and the frame is exactly what it has always been.
 
 ## Switching maps mid-run
 
@@ -167,6 +183,8 @@ on a death, a banner says what it was worth, and the next attempt starts a secon
 | `1` | Back to speed x1 |
 | `-` / `=` | Halve or double the simulation speed, down to x0.1 and up to x4, also on the numpad |
 | `M` | Open the map list over a frozen run: `Up` / `Down` to pick, `Enter` to load, `M` or `Escape` to close |
+| `V`, drag, wheel | Free the camera, pan it, zoom it: see [Moving the camera](#moving-the-camera) |
+| `0` | Back to x1 on yourself |
 | `Escape` | Quit, printing what the session scored |
 
 The Run panel tracks the session: time, best time, progress through the map, coins, attempts, wins and
@@ -509,6 +527,12 @@ rect and the per-blit flags that `blits` carries, which none of these need, and 
 so two binary searches cut the map down to the column in view. Coins and checkpoints are the two things drawn per
 frame rather than baked, the coins because which are left depends on the agent being followed, the checkpoints
 because their haze is translucent and a key colour cannot carry that.
+
+Zoom is the one thing that surface cannot be the screen for: the world goes on a camera-sized scratch instead,
+which is then scaled to the window in one nearest-neighbour pass. Nearest is what keeps it cheap and also what
+keeps it correct, since the key colour the air is left as has to survive the resize exactly. The backdrop stays
+at screen size behind it, both because it is a parallax lie already and because it keeps a x1 frame, where the
+scratch is the screen itself, exactly the handful of blits it was.
 
 **Nothing is painted twice.** Every sprite is a character grid blown up with nearest-neighbour scaling, cached
 under the values that shaped it, and there are few enough of those to cache the lot: sixteen terrain blocks
