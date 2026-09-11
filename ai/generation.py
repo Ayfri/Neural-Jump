@@ -24,11 +24,11 @@ from ai.rewards import (
 )
 from game.art import COIN_COLOR
 from game.settings import TILE_SIZE
-from game.world import World
+from game.world import World, list_maps
 from game.world_cuda import CudaWorld
 
 if TYPE_CHECKING:
-	from game.render import Renderer, Row
+	from game.render import Menu, Renderer, Row
 
 # Evolution
 DEFAULT_POPULATION_SIZE: Final[int] = 300
@@ -113,7 +113,7 @@ class Generation:
 		self.mutation_rate = mutation_rate
 		self.mutation_strength = mutation_strength
 
-		self.map_path = map_path
+		self.map_path = Path(map_path).as_posix()
 		self.episode_seconds = episode_seconds
 		self.tick_rate = tick_rate
 		self.action_repeat = max(1, action_repeat)
@@ -162,6 +162,10 @@ class Generation:
 		self._updating = False  # True while the policy is being updated, which the HUD says and the window survives
 		self._drawn = False  # Whether this update's one frame has gone out, since nothing moves for the rest of it
 
+		self.spawn_mode = spawn_mode
+		self.spawn_spacing = spawn_spacing
+		self.menu: 'Menu | None' = None  # The map list, open over a held simulation
+		self._map_requested: str | None = None  # Level picked in it, swapped in between two rollouts
 		spawns = self.world.ground_spawns(spawn_spacing)
 		self.curriculum = SpawnCurriculum(spawns, spawn_mode if len(spawns) > 1 else 'start')
 		self.ppo: PPOTrainer | None = None
@@ -203,7 +207,8 @@ class Generation:
 				(pygame.K_TAB, renderer.toggle_hud, 'HUD'),
 				(pygame.K_c, renderer.toggle_camera_lock, 'Camera lock'),
 				(pygame.K_1, lambda: self.set_speed(1.0), 'Speed x1'),
-				(pygame.K_m, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
+				(pygame.K_f, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
+				(pygame.K_m, self.toggle_menu, 'Maps'),
 				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), 'Slower'),
 				(pygame.K_EQUALS, lambda: self.scale_speed(SPEED_STEP), 'Faster'),
 				(pygame.K_g, self.skip_checkpoint, 'Next rung' if trainer == 'ppo' else 'Skip ckpt'),
@@ -212,6 +217,11 @@ class Generation:
 				# Same two on the numpad, described nowhere so the legend keeps one line per action
 				(pygame.K_KP_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), ''),
 				(pygame.K_KP_PLUS, lambda: self.scale_speed(SPEED_STEP), ''),
+				# The menu's own keys, which do nothing while it is closed
+				(pygame.K_UP, lambda: self.move_menu(-1), ''),
+				(pygame.K_DOWN, lambda: self.move_menu(1), ''),
+				(pygame.K_RETURN, self.pick_map, ''),
+				(pygame.K_KP_ENTER, self.pick_map, ''),
 			]
 			for key, action, description in bindings:
 				renderer.add_key_action(key, action, description)
@@ -298,6 +308,68 @@ class Generation:
 	def stop_generation(self) -> None:
 		self.manual_stop = True
 
+	def toggle_menu(self) -> None:
+		"""Opens the map list over a held simulation, or closes it without changing anything."""
+		if self.menu is not None:
+			self.menu = None
+			return
+		from game.render import Menu
+
+		maps = list_maps()  # Listed again on every open, so a level imported mid-run shows up
+		self.menu = Menu('Maps', maps, maps.index(self.map_path) if self.map_path in maps else 0)
+
+	def move_menu(self, step: int) -> None:
+		if self.menu is not None and self.menu.items:
+			self.menu.selected = (self.menu.selected + step) % len(self.menu.items)
+
+	def pick_map(self) -> None:
+		"""Asks for the selected level: what is in flight is dropped and the swap happens between two rollouts."""
+		if self.menu is not None and self.menu.items:
+			self._map_requested = self.menu.items[self.menu.selected]
+			self.menu = None
+
+	def _load_map(self, map_path: str) -> None:
+		"""
+		Swaps the level under a running trainer, keeping the policy that was learned on the last one.
+
+		Everything the map is baked into is built again: both worlds, the runner holding the compiled window and
+		its captured graph, and the curriculum ladder read off the new floor. That costs a compile and a capture,
+		which is why it happens between two rollouts rather than inside one. The network and its optimiser carry
+		over, which is the point of switching at all, while every record and tracker starts from scratch since
+		a score on one level says nothing about another.
+		"""
+		self.map_path = Path(map_path).as_posix()
+		self._map_requested = None
+		print(f'Loading {self.map_path}, which compiles and captures the simulation again')
+
+		self.world = World(map_path, self.population_size)
+		device = self.population.device
+		self.cuda_world = CudaWorld(self.world, device) if device.type == 'cuda' or self.trainer == 'ppo' else None
+		self.runner = DeviceRunner(self.cuda_world, self.population, self.action_repeat) if self.cuda_world and self.trainer == 'ga' else None
+
+		spawns = self.world.ground_spawns(self.spawn_spacing)
+		self.curriculum = SpawnCurriculum(spawns, self.spawn_mode if len(spawns) > 1 else 'start')
+		if self.ppo is not None and self.buffer is not None:
+			assert self.cuda_world is not None
+			self.ppo_runner = PPORunner(self.cuda_world, self.population, self.buffer, self.action_repeat, self.max_ticks, self.curriculum)
+			self.ppo.restart_exploration()
+
+		self.best_fitness_ever = -float('inf') if self.ppo is not None else 0.0
+		self.best_time_ever = 0.0
+		self.fitness_history.clear()
+		self.position_history.clear()
+		self.last_stats = {}
+		self.rewards.fill(0.0)
+		self._rewards_banked.fill(0.0)
+		self.max_x_reached.fill(0.0)
+		self.max_x_tick.fill(0.0)
+		self.ticks_stationary.fill(0)
+		self._collected = 0
+		self._stuck_owed = 0
+		self._anyone_alive = True
+		if self.renderer is not None:
+			self.renderer.set_world(self.world)
+
 	def spawn_points(self) -> list[tuple[int, int]]:
 		points = [self.world.spawn_point]
 		if self.use_checkpoints:
@@ -306,6 +378,8 @@ class Generation:
 
 	def play_agents(self) -> None:
 		"""Plays what the trainer scores on: a rollout of transitions for PPO, a full episode for evolution."""
+		if self._map_requested is not None:
+			self._load_map(self._map_requested)
 		if self.ppo_runner is not None:
 			self.collect_rollout()
 			return
@@ -326,11 +400,11 @@ class Generation:
 
 		wanted = self.buffer.steps
 		played = 0
-		while played < wanted and not (self.manual_stop or self.restart_requested):
+		while played < wanted and not (self.manual_stop or self.restart_requested or self._map_requested is not None):
 			steps = wanted - played
 			if self.renderer is not None:
 				self.render(0, 1, played * self.action_repeat)
-				if self.paused:
+				if self.paused or self.menu is not None:
 					self._tick_budget = 0.0
 					continue
 				self._tick_budget += self.ticks_per_frame
@@ -377,7 +451,7 @@ class Generation:
 				steps = max_ticks - tick
 				if self.renderer is not None:
 					self.render(checkpoint_index, len(points), tick)
-					if self.paused:
+					if self.paused or self.menu is not None:
 						# Nothing accumulates while paused, so unpausing does not fire a burst of catch up ticks
 						self._tick_budget = 0.0
 						continue
@@ -409,7 +483,7 @@ class Generation:
 		self.best_time_ever = best if self.best_time_ever == 0.0 else min(self.best_time_ever, best)
 
 	def episode_over(self) -> bool:
-		if self.should_skip_checkpoint or self.manual_stop or self.restart_requested:
+		if self.should_skip_checkpoint or self.manual_stop or self.restart_requested or self._map_requested is not None:
 			return True
 		# The device path answers from the last sampled alive mask, because reading one costs a full sync
 		return not (self._anyone_alive if self.runner is not None else self.world.alive().any())
@@ -529,7 +603,7 @@ class Generation:
 		vsync on, waiting for the next refresh is indistinguishable from working, so only the framerate
 		itself says whether there is headroom left.
 		"""
-		if not self.auto_speed or self.renderer is None or self.paused:
+		if not self.auto_speed or self.renderer is None or self.paused or self.menu is not None:
 			return
 		self._frames_since_adapt += 1
 		if self._frames_since_adapt < SPEED_ADAPT_FRAMES:
@@ -651,6 +725,7 @@ class Generation:
 			]
 		return [
 			*rows,
+			('Map', self.map_path.removeprefix('maps/').removesuffix('.txt')),
 			('Coin', f'+{COIN_REWARD:g} x{self.world.coin_count}'),
 			('Act Repeat', f'{self.action_repeat}'),
 			('Speed', MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),
@@ -698,6 +773,7 @@ class Generation:
 			right=[Panel('Training', self.training_rows())],
 			legend=Legend(TRAINING_LEGEND, self.renderer.key_hints(), ramp=True),
 			fitness=Fitness(self.rewards, self.fitness_history),
+			menu=self.menu,
 			elite_count=elite_count,
 			random_count=random_count,
 		))
@@ -706,6 +782,9 @@ class Generation:
 		"""Improves the policy on what was just played: a PPO update, or selection and breeding."""
 		if self.restart_requested:
 			self._restart()
+			return
+		# The level is about to change, so what was just played belongs to the old one and is dropped
+		if self._map_requested is not None:
 			return
 		if self.ppo is not None:
 			self._update_policy()
