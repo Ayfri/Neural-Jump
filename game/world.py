@@ -52,7 +52,7 @@ def resolve_map_path(map_path: str) -> Path:
 	return search_maps_folder(path.parent) / path.name
 
 
-def closest_tile(windows: NDArray[np.float32]) -> NDArray[np.float32]:
+def closest_tile(windows: NDArray[np.float32 | np.bool_]) -> NDArray[np.float32]:
 	"""
 	Summarises the non-zero tiles of a window: whether one is in view and where it sits.
 

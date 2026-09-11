@@ -41,7 +41,9 @@ class CudaWorld:
 		self.windows = constant(world.windows, torch.float16)
 		self.move_speeds = constant(MOVE_SPEEDS, POSITION_DTYPE)
 
-		zeros = lambda dtype: torch.zeros(self.count, device=device, dtype=dtype)
+		def zeros(dtype: torch.dtype) -> Tensor:
+			return torch.zeros(self.count, device=device, dtype=dtype)
+
 		self.x, self.y = zeros(POSITION_DTYPE), zeros(POSITION_DTYPE)
 		self.change_x, self.change_y = zeros(POSITION_DTYPE), zeros(POSITION_DTYPE)
 		self.dead, self.win = zeros(torch.bool), zeros(torch.bool)

@@ -585,7 +585,7 @@ class Generation:
 		"""How much of the episode was still left after `ticks`, bent by `WIN_SPEED_EXPONENT`, in [0, 1]."""
 		return np.clip(1.0 - ticks / self.max_ticks, 0.0, 1.0) ** WIN_SPEED_EXPONENT
 
-	def final_rewards(self) -> NDArray[np.float64]:
+	def final_rewards(self) -> NDArray[np.floating]:
 		"""End of episode reward: win bonus, reward tile value, or distance travelled minus the death penalty."""
 		world = self.world
 		# Winners are ranked by the tick the flag was touched on: the whole episode is the scale, so there is a
