@@ -17,13 +17,20 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument('--map', default='maps/level_1.txt', help='level file to play')
 	parser.add_argument('--tick-rate', type=int, default=DEFAULT_TICK_RATE, help='simulation ticks per in-game second')
 	parser.add_argument('--fps', type=int, default=0, help='target framerate, 0 uses the display refresh rate')
-	parser.add_argument('--spawn', type=int, default=0, help='spawn point to start on, 0 is the start and the rest are the checkpoints')
+	parser.add_argument('--spawn', type=int, default=0, help='spawn point to start on, 0 is the start and the rest are the checkpoints, only with --no-menu')
+	parser.add_argument('--no-menu', action='store_true', help='skip the title screen and drop straight into the level')
 	return parser
 
 
 def main() -> None:
 	args = build_parser().parse_args()
-	start_game(map_path=args.map, tick_rate=args.tick_rate, fps=args.fps, spawn=args.spawn)
+	if args.no_menu:
+		start_game(map_path=args.map, tick_rate=args.tick_rate, fps=args.fps, spawn=args.spawn)
+		return
+
+	from shell import Shell
+
+	Shell(map_path=args.map, tick_rate=args.tick_rate, fps=args.fps).run()
 
 
 if __name__ == '__main__':

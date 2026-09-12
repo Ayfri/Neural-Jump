@@ -1,7 +1,6 @@
 import argparse
 import os
-import time
-from typing import override
+from typing import TYPE_CHECKING, override
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
 
@@ -17,6 +16,9 @@ from ai.ppo import (
 	DEFAULT_CLIP_RANGE, DEFAULT_ENTROPY_COEF, DEFAULT_EPOCHS, DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA,
 	DEFAULT_LEARNING_RATE, DEFAULT_MINIBATCHES, DEFAULT_ROLLOUT_STEPS, DEFAULT_TARGET_KL,
 )
+
+if TYPE_CHECKING:
+	from game.render import Renderer
 
 DEFAULT_THREADS: int = 4  # More threads than this only adds synchronisation overhead on batches this small
 
@@ -89,30 +91,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 	display = parser.add_argument_group('display', 'Only meaningful together with --show-window')
 	display.add_argument('--show-window', action='store_true', help='render the run instead of training headless')
+	display.add_argument('--no-menu', action='store_true', help='skip the title screen and start training straight away')
 	display.add_argument('--speed', type=speed_value, default=1.0, metavar='S', help="simulation speed multiplier, or 'max' to run as fast as the framerate survives")
 	display.add_argument('--fps', type=int, default=0, help='target framerate, 0 uses the display refresh rate')
 
 	return parser
 
 
-def main() -> None:
-	args = build_parser().parse_args()
-	if args.population_size is None:
-		args.population_size = DEFAULT_ENV_COUNT if args.trainer == 'ppo' else DEFAULT_POPULATION_SIZE
+def resolve_size(args: argparse.Namespace, trainer: str) -> int:
+	"""
+	Environments under PPO, agents under evolution.
 
-	torch.set_num_threads(max(1, min(args.threads, os.cpu_count() or 1)))
-	if not args.show_window:
-		os.environ['SDL_VIDEODRIVER'] = 'dummy'
+	The default depends on the trainer, and the title screen can switch trainers after the command line was
+	parsed, so it is resolved per trainer rather than once: an explicit `--population-size` still wins.
+	"""
+	if args.population_size is not None:
+		return int(args.population_size)
+	return DEFAULT_ENV_COUNT if trainer == 'ppo' else DEFAULT_POPULATION_SIZE
 
-	generation = Generation(
-		args.population_size,
-		trainer=args.trainer,
+
+def build_generation(args: argparse.Namespace, map_path: str = '', trainer: str = '', renderer: 'Renderer | None' = None) -> Generation:
+	"""Everything the command line set, on whichever level and trainer the title screen picked instead."""
+	trainer = trainer or args.trainer
+	return Generation(
+		resolve_size(args, trainer),
+		trainer=trainer,
 		elite_count=args.elite_count,
 		mutation_rate=args.mutation_rate,
 		mutation_strength=args.mutation_strength,
 		hidden_sizes=tuple(args.hidden_sizes),
 		device=args.device,
-		map_path=args.map,
+		map_path=map_path or args.map,
 		episode_seconds=args.episode_seconds,
 		tick_rate=args.tick_rate,
 		action_repeat=args.action_repeat,
@@ -133,45 +142,30 @@ def main() -> None:
 		show_window=args.show_window,
 		speed=args.speed,
 		fps=args.fps,
+		renderer=renderer,
 	)
 
-	if args.trainer == 'ppo':
-		print(f"--- PPO, {args.population_size} environments on {generation.population.device}, "
-			  f"{args.rollout_steps * args.population_size:,} transitions per update ---")
-	else:
-		print(f"--- Generation {generation.generation}, {args.population_size} agents on {generation.population.device}, "
-			  f"mutation rate: {generation.mutation_rate:.3f} - strength: {generation.mutation_strength:.3f} ---")
 
-	ticks = generation.total_ticks
-	started = time.perf_counter()
+def main() -> None:
+	args = build_parser().parse_args()
+	torch.set_num_threads(max(1, min(args.threads, os.cpu_count() or 1)))
+	if not args.show_window:
+		os.environ['SDL_VIDEODRIVER'] = 'dummy'
+
+	# The title screen only means anything with a window: a headless run trains and prints, and nothing else
+	if args.show_window and not args.no_menu:
+		from shell import Shell
+
+		Shell(
+			map_path=args.map, trainer=args.trainer, tick_rate=args.tick_rate, fps=args.fps,
+			generations=args.generations,
+			build_trainer=lambda map_path, trainer, renderer: build_generation(args, map_path, trainer, renderer),
+		).run()
+		return
+
+	generation = build_generation(args)
 	try:
-		while True:
-			generation.play_agents()
-			print(f"--- {'Update' if args.trainer == 'ppo' else 'Generation'} {generation.generation} ---")
-			if args.trainer == 'ppo':
-				generation.evolve_generation()
-				stats = generation.last_stats
-				record = f"{generation.best_fitness_ever:.2f}" if generation.best_fitness_ever > -float('inf') else '-'
-				print(f"  Episodes: {stats['episodes']:,.0f} | Wins: {stats['wins']:,.0f} | Return: {stats['mean_return']:.2f} | Best: {record}"
-					  + (f" | Fastest: {generation.best_time_ever:.2f}s" if generation.best_time_ever else ''))
-				front = f"{stats['front_cleared']:,.0f}/{stats['front_episodes']:,.0f}"
-				print(f"  Front: rung {generation.curriculum.front} of {len(generation.curriculum.spawns) - 1}, cleared {front} | Entropy: {stats['entropy']:.3f}")
-				print(f"  Policy: {stats['policy_loss']:+.4f} | Value: {stats['value_loss']:.4f} | KL: {stats['approx_kl']:.4f} | Clipped: {stats['clip_fraction']:.1%} | Scale: {stats['return_scale']:.1f}")
-			else:
-				rewards = generation.rewards
-				print(f"  Best: {rewards.max():.2f} | Avg: {rewards.mean():.2f} | Worst: {rewards.min():.2f}")
-				generation.evolve_generation()
-			# Two numbers under PPO: what the simulation runs at, and what the wall clock sees once the
-			# update in front of it is paid for, which is most of a cycle at these batch sizes
-			elapsed = time.perf_counter() - started
-			overall = (generation.total_ticks - ticks) / elapsed if elapsed else 0.0
-			ticks, started = generation.total_ticks, time.perf_counter()
-			print(f"  Speed: {generation.last_speed:,.0f} ticks/s ({generation.last_speed * args.population_size:,.0f} agent-steps/s)"
-				  + (f" | {overall:,.0f} ticks/s counting the update" if args.trainer == 'ppo' else ''))
-			if args.generations and generation.generation > args.generations:
-				break
-	except (KeyboardInterrupt, SystemExit):
-		print("Stopped.")
+		generation.run(args.generations)
 	finally:
 		generation.quit()
 
