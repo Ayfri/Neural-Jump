@@ -23,12 +23,13 @@ from ai.rewards import (
 	WIN_SPEED_EXPONENT,
 )
 from game.art import COIN_COLOR
+from game.menu import Item, MenuStack, Page, Screen
 from game.settings import TILE_SIZE
 from game.world import World, list_maps
 from game.world_cuda import CudaWorld
 
 if TYPE_CHECKING:
-	from game.render import Menu, Renderer, Row
+	from game.render import Renderer, Row
 
 # Evolution
 DEFAULT_POPULATION_SIZE: Final[int] = 300
@@ -63,6 +64,23 @@ DEFAULT_SPAWN_MODE: Final[str] = 'curriculum'
 DEFAULT_SPAWN_SPACING: Final[int] = 20  # Tiles between two rungs of the curriculum's ladder
 
 ALIVE_CHECK_TICKS: Final[int] = 90  # Ticks between two host reads of the alive mask, on the device path
+
+MENU_FOOTER: Final[str] = 'Up/Down move   Enter pick   Esc back'
+SETTINGS_FOOTER: Final[str] = 'Left/Right change   Enter toggle   Esc back'
+
+TRAINING_CONTROLS: Final[tuple[tuple[str, str], ...]] = (
+	('Esc', 'Open this menu, or step back out of it'),
+	('Space', 'Pause and resume, the window stays live'),
+	('Tab', 'Hide the panels, leaving the level and the agents'),
+	('F, 1, -, =', 'Speed max, x1, halve, double, also on the numpad'),
+	('S', 'End the rollout or generation now and learn from it'),
+	('G', 'Move the curriculum on a rung, or skip the checkpoint'),
+	('R', 'Start the whole run over with random weights'),
+	('C', 'Camera lock, which only advances toward the furthest agent'),
+	('V, drag', 'Free the camera and pan it'),
+	('Wheel, PgUp, PgDn', 'Zoom, x0.2 out to x4 in'),
+	('0', 'Back to x1 on the followed agent'),
+)
 
 WEIGHTS_FOLDER: Final[Path] = Path('weights')
 
@@ -106,6 +124,7 @@ class Generation:
 		show_window: bool = True,
 		speed: float | str = 1.0,
 		fps: int = 0,
+		renderer: 'Renderer | None' = None,
 	) -> None:
 		self.population_size = population_size
 		self.trainer = trainer
@@ -134,6 +153,7 @@ class Generation:
 		self.should_skip_checkpoint = False
 		self.manual_stop = False
 		self.paused = False
+		self.to_title = False  # Whether the run ended by asking for the title screen rather than by closing the window
 		self.restart_requested = False
 		self.last_speed = 0.0
 		self.live_speed = 0.0
@@ -164,7 +184,7 @@ class Generation:
 
 		self.spawn_mode = spawn_mode
 		self.spawn_spacing = spawn_spacing
-		self.menu: 'Menu | None' = None  # The map list, open over a held simulation
+		self.menu = MenuStack()  # Empty while training, and anything on it holds the simulation behind its page
 		self._map_requested: str | None = None  # Level picked in it, swapped in between two rollouts
 		spawns = self.world.ground_spawns(spawn_spacing)
 		self.curriculum = SpawnCurriculum(spawns, spawn_mode if len(spawns) > 1 else 'start')
@@ -201,27 +221,28 @@ class Generation:
 
 			from game.render import Renderer
 
-			renderer = self.renderer = Renderer(self.world, fps)
+			# A shell hands its window on rather than building a second one, which would re-initialise the display
+			if renderer is None:
+				renderer = Renderer(self.world, fps)
+			else:
+				renderer.reset_key_actions()
+				renderer.set_world(self.world)
+			self.renderer = renderer
+			# Only what is worth a key while training: everything else is a row on the pause menu
 			bindings: list[tuple[int, Callable[[], None], str]] = [
+				(pygame.K_ESCAPE, self.open_menu, 'Menu'),
 				(pygame.K_SPACE, self.toggle_pause, 'Pause'),
-				(pygame.K_TAB, renderer.toggle_hud, 'HUD'),
-				(pygame.K_c, renderer.toggle_camera_lock, 'Camera lock'),
-				(pygame.K_1, lambda: self.set_speed(1.0), 'Speed x1'),
+				(pygame.K_TAB, renderer.toggle_hud, 'Panels'),
 				(pygame.K_f, lambda: self.set_speed(MAX_SPEED), 'Speed max'),
-				(pygame.K_m, self.toggle_menu, 'Maps'),
-				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), 'Slower'),
-				(pygame.K_EQUALS, lambda: self.scale_speed(SPEED_STEP), 'Faster'),
-				(pygame.K_g, self.skip_checkpoint, 'Next rung' if trainer == 'ppo' else 'Skip ckpt'),
-				(pygame.K_s, self.stop_generation, 'End rollout' if trainer == 'ppo' else 'Stop gen'),
-				(pygame.K_r, self.restart_run, 'Restart'),
-				# Same two on the numpad, described nowhere so the legend keeps one line per action
+				(pygame.K_1, lambda: self.set_speed(1.0), ''),
+				(pygame.K_c, renderer.toggle_camera_lock, ''),
+				(pygame.K_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), ''),
+				(pygame.K_EQUALS, lambda: self.scale_speed(SPEED_STEP), ''),
 				(pygame.K_KP_MINUS, lambda: self.scale_speed(1 / SPEED_STEP), ''),
 				(pygame.K_KP_PLUS, lambda: self.scale_speed(SPEED_STEP), ''),
-				# The menu's own keys, which do nothing while it is closed
-				(pygame.K_UP, lambda: self.move_menu(-1), ''),
-				(pygame.K_DOWN, lambda: self.move_menu(1), ''),
-				(pygame.K_RETURN, self.pick_map, ''),
-				(pygame.K_KP_ENTER, self.pick_map, ''),
+				(pygame.K_g, self.skip_checkpoint, ''),
+				(pygame.K_s, self.stop_generation, ''),
+				(pygame.K_r, self.restart_run, ''),
 			]
 			for key, action, description in bindings:
 				renderer.add_key_action(key, action, description)
@@ -308,25 +329,79 @@ class Generation:
 	def stop_generation(self) -> None:
 		self.manual_stop = True
 
-	def toggle_menu(self) -> None:
-		"""Opens the map list over a held simulation, or closes it without changing anything."""
-		if self.menu is not None:
-			self.menu = None
-			return
-		from game.render import Menu
+	# --- Menus ---------------------------------------------------------------------------------------------
 
-		maps = list_maps()  # Listed again on every open, so a level imported mid-run shows up
-		self.menu = Menu('Maps', maps, maps.index(self.map_path) if self.map_path in maps else 0)
+	@property
+	def level_name(self) -> str:
+		return self.map_path.removeprefix('maps/').removesuffix('.txt')
 
-	def move_menu(self, step: int) -> None:
-		if self.menu is not None and self.menu.items:
-			self.menu.selected = (self.menu.selected + step) % len(self.menu.items)
+	def open_menu(self) -> None:
+		self.menu.push(self.pause_page())
 
-	def pick_map(self) -> None:
-		"""Asks for the selected level: what is in flight is dropped and the swap happens between two rollouts."""
-		if self.menu is not None and self.menu.items:
-			self._map_requested = self.menu.items[self.menu.selected]
-			self.menu = None
+	def _resuming(self, action: Callable[[], None]) -> Callable[[], None]:
+		"""Wraps a row so it does its work and hands the run straight back, which is what most of them want."""
+		def run() -> None:
+			action()
+			self.menu.close()
+		return run
+
+	def pause_page(self) -> Page:
+		ppo = self.ppo is not None
+		return Page(Screen.PAUSED, 'Paused', [
+			Item('Resume', self.menu.close),
+			Item('End the rollout now' if ppo else 'Stop the generation now', self._resuming(self.stop_generation)),
+			Item('Next curriculum rung' if ppo else 'Skip this checkpoint', self._resuming(self.skip_checkpoint)),
+			Item('Restart from scratch', self._resuming(self.restart_run)),
+			Item('Settings', lambda: self.menu.push(self.settings_page())),
+			Item('Select level', lambda: self.menu.push(self.maps_page())),
+			Item('Controls', lambda: self.menu.push(self.controls_page())),
+			Item('Quit to title', self.quit_to_title),
+		], subtitle=f'{self.trainer.upper()} on {self.level_name}, update {self.generation}', footer=MENU_FOOTER)
+
+	def settings_page(self) -> Page:
+		from game.render import ZOOM_STEP
+
+		renderer = self.renderer
+		assert renderer is not None
+		return Page(Screen.SETTINGS, 'Settings', [
+			Item('Simulation speed', adjust=lambda step: self.scale_speed(SPEED_STEP ** step),
+				value=lambda: MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),
+			Item('Tune the speed to the framerate', lambda: self.set_speed(MAX_SPEED)),
+			Item('Zoom', adjust=lambda step: renderer.set_zoom(renderer.zoom * ZOOM_STEP ** step), value=lambda: f'x{renderer.zoom:.2f}'),
+			Item('Free camera', renderer.toggle_freecam, value=lambda: 'on' if renderer.freecam else 'off'),
+			Item('Camera lock', renderer.toggle_camera_lock, value=lambda: 'on' if renderer.camera_lock else 'off'),
+			Item('Panels', renderer.toggle_hud, value=lambda: 'shown' if renderer.show_hud else 'hidden'),
+			Item('Reset the view', renderer.reset_view),
+			Item('Back', self.menu.back),
+		], subtitle='The camera lock only ever advances toward the furthest agent', footer=SETTINGS_FOOTER)
+
+	def maps_page(self) -> Page:
+		"""The levels under `maps/`, listed again on every open so one imported mid-run shows up."""
+		maps = list_maps()
+		items = [Item(path.removeprefix('maps/').removesuffix('.txt'), self._loader(path)) for path in maps]
+		page = Page(Screen.MAPS, 'Select level', items,
+			subtitle='The policy carries over, everything the map is baked into is rebuilt', footer=MENU_FOOTER)
+		page.select(maps.index(self.map_path) if self.map_path in maps else 0)
+		return page
+
+	def _loader(self, map_path: str) -> Callable[[], None]:
+		"""Asks for a level: what is in flight is dropped and the swap happens between two rollouts."""
+		def pick() -> None:
+			self._map_requested = map_path
+			self.menu.close()
+		return pick
+
+	def controls_page(self) -> Page:
+		return Page(Screen.HELP, 'Controls', [
+			*(Item(key, value=lambda text=description: text) for key, description in TRAINING_CONTROLS),
+			Item('Back', self.menu.back),
+		], footer='Esc back')
+
+	def quit_to_title(self) -> None:
+		"""Ends the run and hands the window back, which the shell turns into the title screen again."""
+		self.menu.close()
+		self.to_title = True
+		self.manual_stop = True
 
 	def _load_map(self, map_path: str) -> None:
 		"""
@@ -341,6 +416,8 @@ class Generation:
 		self.map_path = Path(map_path).as_posix()
 		self._map_requested = None
 		print(f'Loading {self.map_path}, which compiles and captures the simulation again')
+		if self.renderer is not None:
+			self.renderer.draw_message(f'Loading {self.level_name}', 'compiling and capturing, a few seconds')
 
 		self.world = World(map_path, self.population_size)
 		device = self.population.device
@@ -404,7 +481,7 @@ class Generation:
 			steps = wanted - played
 			if self.renderer is not None:
 				self.render(0, 1, played * self.action_repeat)
-				if self.paused or self.menu is not None:
+				if self.paused or self.menu.open:
 					self._tick_budget = 0.0
 					continue
 				self._tick_budget += self.ticks_per_frame
@@ -451,7 +528,7 @@ class Generation:
 				steps = max_ticks - tick
 				if self.renderer is not None:
 					self.render(checkpoint_index, len(points), tick)
-					if self.paused or self.menu is not None:
+					if self.paused or self.menu.open:
 						# Nothing accumulates while paused, so unpausing does not fire a burst of catch up ticks
 						self._tick_budget = 0.0
 						continue
@@ -603,7 +680,7 @@ class Generation:
 		vsync on, waiting for the next refresh is indistinguishable from working, so only the framerate
 		itself says whether there is headroom left.
 		"""
-		if not self.auto_speed or self.renderer is None or self.paused or self.menu is not None:
+		if not self.auto_speed or self.renderer is None or self.paused or self.menu.open:
 			return
 		self._frames_since_adapt += 1
 		if self._frames_since_adapt < SPEED_ADAPT_FRAMES:
@@ -736,7 +813,7 @@ class Generation:
 		assert self.renderer is not None
 		from game.render import TRAINING_LEGEND, Fitness, Gauge, Hud, Legend, Panel
 
-		self.renderer.poll_events()
+		self.renderer.poll_events(self.menu)
 		self._sample_live_speed()
 		if self.cuda_world is not None and not self._updating:
 			self._sync_from_device()  # A frame is the one place the whole device state is worth reading back
@@ -774,7 +851,7 @@ class Generation:
 			right=[Panel('Training', self.training_rows())],
 			legend=Legend(TRAINING_LEGEND, self.renderer.key_hints(), ramp=True),
 			fitness=Fitness(self.rewards, self.fitness_history),
-			menu=self.menu,
+			menu=self.menu.page,
 			elite_count=elite_count,
 			random_count=random_count,
 		))
@@ -843,7 +920,7 @@ class Generation:
 		if self.renderer is None:
 			return
 		if self._drawn:
-			self.renderer.poll_events()
+			self.renderer.poll_events(self.menu)
 			return
 		self._drawn = True
 		self.render(0, 1, self._collected * self.action_repeat)
@@ -889,6 +966,62 @@ class Generation:
 		# A file saved against another observation size fails the shape check as a RuntimeError
 		except (FileNotFoundError, ValueError, KeyError, RuntimeError) as error:
 			print(f'No usable weights found, starting with random weights: {error}')
+
+	def run(self, generations: int = 0) -> bool:
+		"""
+		Trains until asked to stop, printing what every update scored.
+
+		Returns whether the window is still open, so a shell can put its title screen back up rather than tear
+		the process down. A headless run has no window to hand back and always answers False.
+		"""
+		ppo = self.ppo is not None
+		if ppo and self.buffer is not None:
+			print(f'--- PPO, {self.population_size} environments on {self.population.device}, '
+				  f'{self.buffer.steps * self.population_size:,} transitions per update ---')
+		else:
+			print(f'--- Generation {self.generation}, {self.population_size} agents on {self.population.device}, '
+				  f'mutation rate: {self.mutation_rate:.3f} - strength: {self.mutation_strength:.3f} ---')
+
+		ticks = self.total_ticks
+		started = time.perf_counter()
+		try:
+			while not self.to_title:
+				self.play_agents()
+				if self.to_title:
+					break
+				print(f"--- {'Update' if ppo else 'Generation'} {self.generation} ---")
+				if ppo:
+					self.evolve_generation()
+					self._print_update()
+				else:
+					print(f'  Best: {self.rewards.max():.2f} | Avg: {self.rewards.mean():.2f} | Worst: {self.rewards.min():.2f}')
+					self.evolve_generation()
+				# Two numbers under PPO: what the simulation runs at, and what the wall clock sees once the
+				# update in front of it is paid for, which is most of a cycle at these batch sizes
+				elapsed = time.perf_counter() - started
+				overall = (self.total_ticks - ticks) / elapsed if elapsed else 0.0
+				ticks, started = self.total_ticks, time.perf_counter()
+				print(f'  Speed: {self.last_speed:,.0f} ticks/s ({self.last_speed * self.population_size:,.0f} agent-steps/s)'
+					  + (f' | {overall:,.0f} ticks/s counting the update' if ppo else ''))
+				if generations and self.generation > generations:
+					break
+		except (KeyboardInterrupt, SystemExit):
+			print('Stopped.')
+			self.to_title = False
+		return self.to_title
+
+	def _print_update(self) -> None:
+		"""What one PPO update scored, which is the only place the run's numbers are written down."""
+		stats = self.last_stats
+		if not stats:
+			return
+		record = f'{self.best_fitness_ever:.2f}' if self.best_fitness_ever > -float('inf') else '-'
+		print(f"  Episodes: {stats['episodes']:,.0f} | Wins: {stats['wins']:,.0f} | Return: {stats['mean_return']:.2f} | Best: {record}"
+			  + (f" | Fastest: {self.best_time_ever:.2f}s" if self.best_time_ever else ''))
+		front = f"{stats['front_cleared']:,.0f}/{stats['front_episodes']:,.0f}"
+		print(f"  Front: rung {self.curriculum.front} of {len(self.curriculum.spawns) - 1}, cleared {front} | Entropy: {stats['entropy']:.3f}")
+		print(f"  Policy: {stats['policy_loss']:+.4f} | Value: {stats['value_loss']:.4f} | KL: {stats['approx_kl']:.4f} "
+			  f"| Clipped: {stats['clip_fraction']:.1%} | Scale: {stats['return_scale']:.1f}")
 
 	def quit(self) -> None:
 		if self.renderer is not None:
