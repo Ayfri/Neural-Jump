@@ -14,6 +14,7 @@ from game.art import (
 	CHECKPOINT_COLOR, COIN_COLOR, COLORKEY, ENEMY_COLOR, Background, bake_level, body_sprite, checkpoint_sprite,
 	coin_sprite, enemy_sprite, jump_sprite, ring_sprite,
 )
+from game.menu import MenuStack, Page
 from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
 from game.world import ENEMY_H, ENEMY_W, PLAYER_H, PLAYER_W, World
 
@@ -40,6 +41,7 @@ LABEL_COLOR: Final[Color] = (182, 189, 206)
 VALUE_COLOR: Final[Color] = (245, 247, 252)
 ACCENT_COLOR: Final[Color] = (120, 232, 176)
 GRID_COLOR: Final[Color] = (92, 100, 122)
+BACKDROP: Final[Color] = (10, 12, 22)  # What a frame with no world on it is cleared to, matching the top of the sky
 
 MARGIN: Final[int] = 12
 PADDING: Final[int] = 10
@@ -57,8 +59,12 @@ LEGEND_WIDTH: Final[int] = 250
 HISTOGRAM_BINS: Final[int] = 18
 HISTORY_LENGTH: Final[int] = 80
 SPARKLINE_GUTTER: Final[int] = 34  # Room kept on the right of the curve for its scale labels
-MENU_WIDTH: Final[int] = 420
-MENU_ROWS: Final[int] = 16  # Items shown at once, the list scrolls to keep the selected one in the middle
+MENU_WIDTH: Final[int] = 460
+MENU_ROWS: Final[int] = 12  # Rows shown at once, the page scrolls to keep the selected one in the middle
+MENU_ROW_HEIGHT: Final[int] = 28  # Tall enough that a row is a mouse target rather than a line of text
+MENU_VALUE_COLUMN: Final[int] = 170  # Room kept on the right of a row for a setting's current value
+MENU_TITLE_SIZE: Final[int] = 22
+MENU_DIM: Final[tuple[int, int, int, int]] = (10, 12, 22, 170)  # Veil over the frozen world, so the page reads as the thing in front
 DEFAULT_FPS: Final[int] = 60
 
 # Zoom range: under x1 the world is drawn on a surface larger than the screen, and only the band the level
@@ -100,14 +106,6 @@ class Fitness:
 
 
 @dataclass(slots=True)
-class Menu:
-	"""A centred list with one row selected, drawn over everything else, panels hidden or not."""
-	title: str
-	items: Sequence[str]
-	selected: int = 0
-
-
-@dataclass(slots=True)
 class Hud:
 	"""
 	Everything drawn over the level.
@@ -120,7 +118,7 @@ class Hud:
 	legend: Legend | None = None
 	fitness: Fitness | None = None
 	banner: str = ''  # Centred message, drawn even with the panels hidden
-	menu: Menu | None = None
+	menu: Page | None = None  # The open menu page, drawn over everything else, panels hidden or not
 	elite_count: int = 0
 	random_count: int = 0
 	solo: bool = False  # One human body instead of a ranked population
@@ -158,6 +156,14 @@ def _font(size: int) -> Font:
 @lru_cache(maxsize=2048)
 def _text(size: int, text: str, color: Color) -> Surface:
 	return _font(size).render(text, True, color).convert_alpha()
+
+
+@lru_cache(maxsize=1)
+def _dim_veil() -> Surface:
+	"""One translucent sheet the size of the screen: a menu dims the frozen world so the page reads in front of it."""
+	surface = Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+	surface.fill(MENU_DIM)
+	return surface.convert_alpha()
 
 
 @lru_cache(maxsize=32)
@@ -236,15 +242,9 @@ class Renderer:
 		self._draw_y = 0
 		self._band_x = 0  # And where it sits in the camera, for the translucent sprites drawn on the screen
 		self._band_y = 0
+		self._menu_rects: list[tuple[int, Rect]] = []  # Where the last frame put each menu row, for the mouse to hit-test
 		self.set_world(world)
-		for key, action, description in (
-			(pygame.K_v, self.toggle_freecam, 'Freecam'),
-			(pygame.K_PAGEUP, lambda: self.set_zoom(self.zoom * ZOOM_STEP), 'Zoom'),
-			(pygame.K_PAGEDOWN, lambda: self.set_zoom(self.zoom / ZOOM_STEP), ''),
-			(pygame.K_0, self.reset_view, 'Reset view'),
-			(pygame.K_KP_0, self.reset_view, ''),
-		):
-			self.add_key_action(key, action, description)
+		self._add_view_bindings()
 
 	def set_world(self, world: World) -> None:
 		"""Points the renderer at a world and bakes its level, which is everything a map change costs here."""
@@ -285,6 +285,22 @@ class Renderer:
 
 	def add_key_action(self, key: int, action: Callable[[], None], description: str = '') -> None:
 		self.key_actions[key] = (action, description)
+
+	def _add_view_bindings(self) -> None:
+		"""The camera keys, which mean the same thing in every run and are listed on the controls page, not the legend."""
+		for key, action in (
+			(pygame.K_v, self.toggle_freecam),
+			(pygame.K_PAGEUP, lambda: self.set_zoom(self.zoom * ZOOM_STEP)),
+			(pygame.K_PAGEDOWN, lambda: self.set_zoom(self.zoom / ZOOM_STEP)),
+			(pygame.K_0, self.reset_view),
+			(pygame.K_KP_0, self.reset_view),
+		):
+			self.add_key_action(key, action)
+
+	def reset_key_actions(self) -> None:
+		"""Drops what a session bound and keeps the camera's own, so the next one starts on a clean slate."""
+		self.key_actions.clear()
+		self._add_view_bindings()
 
 	def key_hints(self) -> list[tuple[str, str]]:
 		"""The described bindings, as the legend prints them: an empty description hides a binding."""
@@ -334,10 +350,20 @@ class Renderer:
 		"""How the camera is set, for the panel the caller owns: its zoom, and whether it is off the followed agent."""
 		return ('free ' if self.freecam else '') + f'x{self.zoom:.2f}'
 
-	def poll_events(self) -> None:
+	def poll_events(self, menu: MenuStack | None = None) -> None:
+		"""
+		Pumps the event queue, handing input to whichever of the menu and the camera is in front.
+
+		While a page is open the world is frozen, so the mouse drives the page rather than the camera and the
+		app's own bindings are held back: a key means what the menu says it means and fires nothing underneath it.
+		"""
+		page = menu.page if menu is not None else None
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				raise SystemExit
+			if menu is not None and page is not None:
+				self._menu_event(event, menu, page)
+				continue
 			if event.type == pygame.KEYDOWN and event.key in self.key_actions:
 				self.key_actions[event.key][0]()
 			elif event.type == pygame.MOUSEWHEEL:
@@ -348,6 +374,40 @@ class Renderer:
 				self._dragging = False
 			elif event.type == pygame.MOUSEMOTION and self._dragging:
 				self.pan(*event.rel)
+
+	def _menu_event(self, event: pygame.event.Event, menu: MenuStack, page: Page) -> None:
+		"""One event while a page is open: the arrows and Enter, or the mouse over the rows the last frame drew."""
+		if event.type == pygame.KEYDOWN:
+			if event.key in (pygame.K_UP, pygame.K_w, pygame.K_z):
+				page.move(-1)
+			elif event.key in (pygame.K_DOWN, pygame.K_s):
+				page.move(1)
+			elif event.key in (pygame.K_LEFT, pygame.K_a, pygame.K_q):
+				page.adjust(-1)
+			elif event.key in (pygame.K_RIGHT, pygame.K_d):
+				page.adjust(1)
+			elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+				page.activate()
+			elif event.key == pygame.K_ESCAPE:
+				menu.back()
+			return
+
+		# A drag never survives into a menu: the camera is not what the mouse is pointing at any more
+		self._dragging = False
+		if event.type == pygame.MOUSEMOTION:
+			page.select(self._row_at(event.pos))
+		elif event.type == pygame.MOUSEWHEEL:
+			page.move(-event.y)
+		elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self._row_at(event.pos) >= 0:
+			page.select(self._row_at(event.pos))
+			page.activate()
+
+	def _row_at(self, position: tuple[int, int]) -> int:
+		"""Which menu row the cursor is over, out of the rectangles the last frame laid out, or -1 for none of them."""
+		for index, rect in self._menu_rects:
+			if rect.collidepoint(position):
+				return index
+		return -1
 
 	def draw(self, focus_index: int, fitness: NDArray[np.float64], hud: Hud) -> None:
 		self._move_camera(focus_index)
@@ -574,23 +634,65 @@ class Renderer:
 		self.screen.blit(_panel_background(width, height), (x, y))
 		self.screen.blit(label, (x + 2 * PADDING, y + PADDING))
 
-	def _draw_menu(self, menu: Menu) -> None:
-		"""The list in the middle of the screen, scrolled so the selected row stays in view."""
-		first = min(max(0, menu.selected - MENU_ROWS // 2), max(0, len(menu.items) - MENU_ROWS))
-		shown = menu.items[first:first + MENU_ROWS]
-		height = PADDING * 3 + ROW_HEIGHT * (len(shown) + 2) + 4
+	def _draw_menu(self, page: Page) -> None:
+		"""
+		The open page, centred over a dimmed world and scrolled so the selected row stays in view.
+
+		Every drawn row records its rectangle, which is what the next frame's mouse events hit-test against, so
+		the cursor lands on the row it is actually over rather than on the one the keyboard last left behind.
+		"""
+		self._menu_rects.clear()
+		self.screen.blit(_dim_veil(), (0, 0))
+
+		first = min(max(0, page.selected - MENU_ROWS // 2), max(0, len(page.items) - MENU_ROWS))
+		shown = page.items[first:first + MENU_ROWS]
+		head = PADDING * 2 + MENU_TITLE_SIZE + (ROW_HEIGHT if page.subtitle else 0)
+		height = head + MENU_ROW_HEIGHT * len(shown) + PADDING * 2 + (ROW_HEIGHT if page.footer else 0)
 		x, y = (SCREEN_WIDTH - MENU_WIDTH) // 2, (SCREEN_HEIGHT - height) // 2
 		self.screen.blit(_panel_background(MENU_WIDTH, height), (x, y))
-		self.screen.blit(_text(TITLE_SIZE, f'{menu.title}  {menu.selected + 1}/{len(menu.items)}', TITLE_COLOR), (x + PADDING, y + PADDING))
+		self.screen.blit(_text(MENU_TITLE_SIZE, page.title, TITLE_COLOR), (x + PADDING * 2, y + PADDING))
+		if page.subtitle:
+			self.screen.blit(_text(SMALL_SIZE, page.subtitle, LABEL_COLOR), (x + PADDING * 2, y + PADDING + MENU_TITLE_SIZE + 2))
 
-		row_y = y + PADDING + ROW_HEIGHT + 4
+		row_y = y + head
 		for index, item in enumerate(shown, first):
-			chosen = index == menu.selected
+			rect = Rect(x + PADDING, row_y, MENU_WIDTH - 2 * PADDING, MENU_ROW_HEIGHT)
+			self._menu_rects.append((index, rect))
+			# A heading carries nothing to fire and nothing to show, so it is drawn as the label it is and skipped over
+			if not item.usable and item.value is None:
+				self.screen.blit(_text(SMALL_SIZE, item.label.upper(), TITLE_COLOR), (rect.x + PADDING, row_y + 8))
+				row_y += MENU_ROW_HEIGHT
+				continue
+
+			chosen = index == page.selected and item.usable
 			if chosen:
-				pygame.draw.rect(self.screen, GRID_COLOR, Rect(x + 4, row_y - 1, MENU_WIDTH - 8, ROW_HEIGHT), border_radius=3)
-			self.screen.blit(_text(BODY_SIZE, ('> ' if chosen else '  ') + item, ACCENT_COLOR if chosen else VALUE_COLOR), (x + PADDING, row_y))
-			row_y += ROW_HEIGHT
-		self.screen.blit(_text(SMALL_SIZE, 'UP/DOWN pick   ENTER load   M/ESC close', LABEL_COLOR), (x + PADDING, row_y + PADDING))
+				pygame.draw.rect(self.screen, GRID_COLOR, rect, border_radius=4)
+			self.screen.blit(_text(BODY_SIZE, item.label, ACCENT_COLOR if chosen else VALUE_COLOR), (rect.x + PADDING, row_y + 6))
+			if item.value is not None:
+				# The arrows say the row is one Left/Right changes rather than one Enter fires
+				text = f'< {item.value()} >' if item.adjust is not None else item.value()
+				label = _text(BODY_SIZE, text, VALUE_COLOR if chosen else LABEL_COLOR)
+				self.screen.blit(label, (max(rect.x + MENU_VALUE_COLUMN, rect.right - PADDING - label.get_width()), row_y + 6))
+			row_y += MENU_ROW_HEIGHT
+
+		if page.footer:
+			self.screen.blit(_text(SMALL_SIZE, page.footer, LABEL_COLOR), (x + PADDING * 2, row_y + PADDING))
+
+	def draw_message(self, text: str, subtitle: str = '') -> None:
+		"""
+		One frame that is nothing but a centred message.
+
+		Loading a map compiles and captures the simulation again, which is seconds the window would otherwise
+		spend frozen on its last frame looking hung. The queue is pumped so the OS keeps the window responsive.
+		"""
+		pygame.event.pump()
+		self.screen.fill(BACKDROP)
+		label = _text(MENU_TITLE_SIZE, text, VALUE_COLOR)
+		self.screen.blit(label, ((SCREEN_WIDTH - label.get_width()) // 2, SCREEN_HEIGHT // 2 - MENU_TITLE_SIZE))
+		if subtitle:
+			note = _text(BODY_SIZE, subtitle, LABEL_COLOR)
+			self.screen.blit(note, ((SCREEN_WIDTH - note.get_width()) // 2, SCREEN_HEIGHT // 2 + MENU_TITLE_SIZE // 2))
+		pygame.display.flip()
 
 	@staticmethod
 	def _panel_height(panel: Panel) -> int:
