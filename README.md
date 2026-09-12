@@ -16,11 +16,16 @@ networks are one set of `(agents, in, out)` weight tensors, and a tick steps all
 ```bash
 uv sync
 uv run run-ai.py                              # headless PPO, as fast as the machine allows
-uv run run-ai.py --show-window --speed max    # watch it, as fast as the framerate survives
+uv run run-ai.py --show-window                # the title screen, and the run it starts
 uv run run-ai.py --trainer ga                 # the genetic algorithm instead
-uv run run-game.py                            # play the level yourself
-uv run run-game.py --spawn 3                  # start on the third checkpoint
+uv run run-game.py                            # the title screen, then play the level yourself
+uv run run-ai.py --show-window --no-menu --speed max   # straight into training, no title screen
+uv run run-game.py --no-menu --spawn 3                 # straight onto the third checkpoint
 ```
+
+A window opens on the title screen, which is where the trainer and the level are picked and where every run
+comes back to. `--no-menu` skips it and starts the run the flags describe, which is what a benchmark or a
+scripted run wants. Headless has no window and no menus at all.
 
 Python 3.13+, pygame-ce for the window, and `uv sync` pulls torch with CUDA 13 on Windows and Linux, plus
 the triton wheel torch does not ship on Windows, which is what compiles the simulation. CPU works too, it is
@@ -78,6 +83,8 @@ The first generation of a run is slower than the rest, because that is where the
 *display* - only meaningful together with `--show-window`
 
 - `--show-window`: render the run instead of training headless
+- `--no-menu`: start training straight away instead of on the title screen, on the trainer and level the
+  flags name rather than the ones picked there
 - `--speed S`: simulation speed multiplier, or `max` to run as fast as the framerate survives (default: 1)
 - `--fps N`: target framerate (default: 0, uses the display refresh rate)
 
@@ -115,25 +122,46 @@ quarter of a million transitions takes about two seconds, and the simulation is 
 of it. The window stays live, it just has nothing new to draw. What that costs to watch depends on `--speed`,
 since it is a fixed two seconds against however long the rollout in front of it took.
 
+## Menus
+
+The title screen is the state the app sits in when nothing is running: it picks the trainer and the level,
+plays the level by hand or trains on it, and takes the window back when either ends. A run is started on that
+same window rather than a second one, so moving between playing a level and training on it costs nothing but
+the simulation each of them needs.
+
+`Escape` opens the pause menu over a frozen run, and steps back out of it one page at a time. Its pages are:
+
+- **Settings**: speed, zoom, free camera, camera lock and the panels, plus the spawn point in `run-game.py`.
+  `Left` / `Right` changes the row under the cursor and the world behind it stands still while it happens
+- **Select level**: every `.txt` under `maps/`, read again each time the page opens
+- **Controls**: every key of the run, which is what keeps the legend down to the four it leans on
+- **Quit to title**: ends the run, prints what it scored and puts the title screen back on the same window
+
+Every page is driven with `Up` / `Down` and `Enter`, or with the mouse: moving over a row picks it, clicking
+one fires it, and the wheel walks the list. A row that shows a value between arrows is one `Left` / `Right`
+changes rather than one `Enter` fires.
+
 ## Keys
 
 | Key | What it does |
 | --- | --- |
+| `Escape` | Open the pause menu, or step back out of the page it is showing |
 | `Space` | Pause and resume, the window stays live |
 | `Tab` | Hide the panels, leaving the level and the agents |
-| `1` | Back to speed x1 |
 | `F` | Speed `max`, which tunes itself to the framerate |
-| `M` | Open the map list: `Up` / `Down` to pick, `Enter` to load it under the run, `M` to close |
+| `1` | Back to speed x1 |
 | `-` / `=` | Halve or double the speed, also on the numpad. From `max` it starts at the multiplier it had reached |
 | `G` | Skip to the next spawn point, or under PPO move the curriculum on a rung by hand |
 | `S` | End the generation now and breed from what it scored, or under PPO update on the rollout so far |
 | `R` | Start the whole run over: random weights, generation 1, records cleared |
+| `C` | Camera lock, which only ever advances toward the furthest agent |
 | `V` | Free the camera from the followed agent, or give it back |
 | `Page Up` / `Page Down` | Zoom, x0.2 out to x4 in |
 | `0` | Back to x1 on the followed agent, also on the numpad |
 | Drag, wheel | Pan the camera, and zoom around the cursor |
 
-They are listed in the legend at the bottom left, and the speed shows in the Training panel.
+The legend at the bottom left carries the four a run reaches for constantly, the Controls page carries all of
+them, and the speed shows in the Training panel.
 
 ## Moving the camera
 
@@ -151,8 +179,9 @@ scaled and the frame is exactly what it has always been.
 
 ## Switching maps mid-run
 
-`M` opens the map list over a held simulation. Picking a level drops whatever rollout or generation is in
-flight, since it was played on the old map, and the swap happens between two of them rather than inside one.
+The pause menu's **Select level** page opens over a held simulation. Picking a level drops whatever rollout or
+generation is in flight, since it was played on the old map, and the swap happens between two of them rather
+than inside one. The window says it is compiling while that happens, instead of sitting on its last frame.
 
 What is rebuilt is everything the map is baked into: both worlds, the runner holding the compiled window and its
 captured graph, and the curriculum ladder read off the new floor. That is a compile and a capture, so the window
@@ -166,37 +195,39 @@ one already knowing how.
 ## Playing it yourself
 
 `run-game.py` puts you on the same `World` the agents train on, drawn through the same renderer, so the
-physics under your feet and the panels around them are the ones they are scored on. A run ends on the flag or
-on a death, a banner says what it was worth, and the next attempt starts a second later.
+physics under your feet and the panels around them are the ones they are scored on. It opens on the title
+screen, where **Play the level yourself** starts it. A run ends on the flag or on a death, a banner says what
+it was worth, and the next attempt starts a second later.
 
 - `--map PATH`: level file to play (default: maps/level_1.txt)
 - `--tick-rate N`: simulation ticks per in-game second (default: 90)
 - `--fps N`: target framerate (default: 0, uses the display refresh rate)
-- `--spawn N`: spawn point to start on (default: 0, the start, the rest are the checkpoints)
+- `--no-menu`: drop straight into the level instead of opening on the title screen
+- `--spawn N`: spawn point to start on (default: 0, the start, the rest are the checkpoints), only with
+  `--no-menu`, since the title screen starts a level on its own spawn point
 
 | Key | What it does |
 | --- | --- |
 | `Arrows`, `WASD`, `ZQSD` | Move |
 | `Space`, `Up`, `W` | Jump, aimed by the direction held on the same tick |
+| `Escape` | Open the pause menu, or step back out of the page it is showing |
 | `P` | Pause and resume |
 | `Tab` | Hide the panels, the banner stays |
 | `R` | Retry from the current spawn point |
 | `G` | Start on the next spawn point, wrapping back to the beginning of the level |
 | `1` | Back to speed x1 |
 | `-` / `=` | Halve or double the simulation speed, down to x0.1 and up to x4, also on the numpad |
-| `M` | Open the map list over a frozen run: `Up` / `Down` to pick, `Enter` to load, `M` or `Escape` to close |
 | `V`, drag, wheel | Free the camera, pan it, zoom it: see [Moving the camera](#moving-the-camera) |
 | `0` | Back to x1 on yourself |
-| `Escape` | Quit, printing what the session scored |
 
 The Run panel tracks the session: time, best time, progress through the map, coins, attempts, wins and
 deaths. The Player panel is the debug view: pixel position, tile, both speed components, ground contact,
 spawn point and simulation speed. Slow motion is the useful one there, a jump arc lasts about 42 ticks and at
 x0.1 it can be read frame by frame.
 
-The map list holds every `.txt` under `maps/`, read again each time it opens, so a level imported while the game
-runs shows up, and loading one starts the session's records over. `run-ai.py` has the same list under the same
-key, where a swap costs rather more: see [Switching maps mid-run](#switching-maps-mid-run).
+The **Select level** page holds every `.txt` under `maps/`, read again each time it opens, so a level imported
+while the game runs shows up, and loading one starts the session's records over. `run-ai.py` has the same page
+on its own pause menu, where a swap costs rather more: see [Switching maps mid-run](#switching-maps-mid-run).
 
 ## The network
 
@@ -557,7 +588,9 @@ copies surfaces.
 batched network, `device_runner.py` plays whole action windows on the device, `rewards.py` is what a run pays
 out. `game/` holds the engine: `world.py` is the batched numpy simulation and `world_cuda.py` the same
 physics as tensors, `render.py` the camera-culled renderer and the panels drawn over it, `art.py` every
-sprite it draws with, `play.py` the human-played session on top of both. Both entry points fill the same `Hud` and the renderer only lays it out.
+sprite it draws with, `menu.py` the pages a menu is made of, `play.py` the human-played session on top of
+both. `shell.py` sits at the root because it is the one module that sees both halves: it owns the window, puts
+the title screen on it and hands it to whichever run is picked. Both entry points fill the same `Hud` and the renderer only lays it out.
 Levels are text files in `maps/`, `import-smb.py` fetches the Super Mario Bros ones into `maps/smb/`, `tiles.py`
 maps their characters to a `TileKind`, weights land in `weights/`,
 screen and physics constants live in `game/settings.py`.
