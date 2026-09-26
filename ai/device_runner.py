@@ -33,6 +33,78 @@ def compiled(function: Callable[[], None]) -> Callable[[], None]:
 	return candidate
 
 
+def captured(function: Callable[[], None], warmups: int) -> torch.cuda.CUDAGraph | None:
+	"""Plays `function` `warmups` times on a side stream then captures it, or returns None if the capture fails."""
+	warmup = torch.cuda.Stream()
+	warmup.wait_stream(torch.cuda.current_stream())
+	with torch.cuda.stream(warmup):
+		for _ in range(warmups):
+			function()
+	torch.cuda.current_stream().wait_stream(warmup)
+
+	graph = torch.cuda.CUDAGraph()
+	try:
+		with torch.cuda.graph(graph):
+			function()
+	except RuntimeError as error:
+		print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
+		return None
+	return graph
+
+
+class Shaping:
+	"""The per-tick shaping terms and the trackers they read, paid in the order and the precision the numpy loop pays them in."""
+
+	def __init__(self, world: CudaWorld) -> None:
+		self.world = world
+		count, device = world.count, world.device
+		self.max_x_reached = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
+		self.max_x_tick = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
+		self.ticks_stationary = torch.zeros(count, device=device, dtype=torch.int32)
+		self._previous_x = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
+		self._previous_y = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
+
+	def reset(self) -> None:
+		"""Seeds the trackers from a freshly reset world."""
+		self.max_x_reached.copy_(self.world.x)
+		self.max_x_tick.zero_()
+		self.ticks_stationary.zero_()
+
+	def restart(self, mask: Tensor) -> None:
+		"""Seeds the trackers of the players `mask` selects, once the world has put them back on a spawn point."""
+		torch.where(mask, self.world.x, self.max_x_reached, out=self.max_x_reached)
+		self.max_x_tick *= ~mask
+		self.ticks_stationary *= ~mask
+
+	def step(self, actions: Tensor) -> Tensor:
+		"""Steps the world one tick and returns what it paid every player, the dead scoring nothing."""
+		world = self.world
+		alive = world.alive()
+		self._previous_x.copy_(world.x)
+		self._previous_y.copy_(world.y)
+		world.step(actions)
+
+		x_delta = world.x - self._previous_x
+		forward = x_delta > 0
+		rewards = forward.to(POSITION_DTYPE) * FORWARD_MOVEMENT_REWARD
+		# Only a living player ever moves, so a step forward is already proof the agent was alive for it
+		record = forward & (world.x > self.max_x_reached)
+		rewards += record.to(POSITION_DTYPE) * NEW_MAX_POSITION_BONUS
+		# The tick counter has already been stepped by the physics, so the record is stamped with the tick just played
+		torch.where(record, (world.tick - 1).to(POSITION_DTYPE), self.max_x_tick, out=self.max_x_tick)
+		torch.where(record, world.x, self.max_x_reached, out=self.max_x_reached)
+
+		rewards += (x_delta < 0).to(POSITION_DTYPE) * BACKWARD_MOVEMENT_PENALTY
+
+		still = x_delta == 0
+		self.ticks_stationary += still
+		self.ticks_stationary *= still
+		rewards += (self.ticks_stationary > STATIONARY_THRESHOLD).to(POSITION_DTYPE) * STATIONARY_PENALTY
+
+		rewards += ((world.y - self._previous_y) > FALLING_THRESHOLD).to(POSITION_DTYPE) * FALLING_PENALTY
+		return rewards * alive
+
+
 class DeviceRunner:
 	"""
 	Plays whole action windows on the device: physics, per-tick rewards and the next decision, in one graph.
@@ -58,12 +130,7 @@ class DeviceRunner:
 		self.observations = torch.zeros(count, 1, OBSERVATION_SIZE, device=device, dtype=population.dtype)
 
 		self.rewards = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self.max_x_reached = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self.max_x_tick = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self.ticks_stationary = torch.zeros(count, device=device, dtype=torch.int32)
-		self._tick_rewards = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self._previous_x = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self._previous_y = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
+		self.shaping = Shaping(world)
 		self._history: list[Tensor] = []
 
 		self.buckets = [count]
@@ -77,16 +144,12 @@ class DeviceRunner:
 
 		# Compiling and capturing both play real windows, so they happen here, on the state a reset throws away
 		self._window = compiled(self._play_window)
-		self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
-		for bucket in self.buckets:
-			self._capture(bucket)
+		self._graphs = {bucket: captured(lambda bucket=bucket: self._play_and_decide(bucket), 3) for bucket in self.buckets}
 
 	def start(self) -> None:
 		"""Seeds the trackers from a freshly reset world and takes the decision its first window plays."""
 		self.rewards.zero_()
-		self.max_x_reached.copy_(self.world.x)
-		self.max_x_tick.zero_()
-		self.ticks_stationary.zero_()
+		self.shaping.reset()
 		self._history.clear()
 		self.bucket = self.buckets[0]
 		torch.arange(self.world.count, device=self.world.device, out=self._slots)
@@ -108,66 +171,20 @@ class DeviceRunner:
 
 	def _play_window(self) -> None:
 		"""One action window: the held action is played for every tick of it, then the next one is chosen."""
-		world = self.world
 		for _ in range(self.action_repeat):
-			alive = world.alive()
-			self._previous_x.copy_(world.x)
-			self._previous_y.copy_(world.y)
-			world.step(self.actions)
-			self._add_tick_rewards(alive)
-		world.observe(self.observations)
+			self.rewards += self.shaping.step(self.actions)
+		self.world.observe(self.observations)
 
-	def _add_tick_rewards(self, alive: Tensor) -> None:
-		"""Per-tick micro rewards, in the order and the precision the numpy loop pays them in."""
-		world = self.world
-		x_delta = world.x - self._previous_x
-		rewards = self._tick_rewards
-		rewards.zero_()
-
-		forward = x_delta > 0
-		rewards += forward.to(POSITION_DTYPE) * FORWARD_MOVEMENT_REWARD
-		# Only a living player ever moves, so a step forward is already proof the agent was alive for it
-		record = forward & (world.x > self.max_x_reached)
-		rewards += record.to(POSITION_DTYPE) * NEW_MAX_POSITION_BONUS
-		# The tick counter has already been stepped by the physics, so the record is stamped with the tick just played
-		torch.where(record, (world.tick - 1).to(POSITION_DTYPE), self.max_x_tick, out=self.max_x_tick)
-		torch.where(record, world.x, self.max_x_reached, out=self.max_x_reached)
-
-		rewards += (x_delta < 0).to(POSITION_DTYPE) * BACKWARD_MOVEMENT_PENALTY
-
-		still = x_delta == 0
-		self.ticks_stationary += still
-		self.ticks_stationary *= still
-		rewards += (self.ticks_stationary > STATIONARY_THRESHOLD).to(POSITION_DTYPE) * STATIONARY_PENALTY
-
-		rewards += ((world.y - self._previous_y) > FALLING_THRESHOLD).to(POSITION_DTYPE) * FALLING_PENALTY
-		self.rewards += rewards * alive
-
-	def _capture(self, bucket: int) -> None:
-		"""Captures a whole window, the decision over `bucket` slots included, so playing one is a single launch."""
-		warmup = torch.cuda.Stream()
-		warmup.wait_stream(torch.cuda.current_stream())
-		with torch.cuda.stream(warmup):
-			for _ in range(3):
-				self._window()
-				self._decide(bucket)
-		torch.cuda.current_stream().wait_stream(warmup)
-
-		graph = torch.cuda.CUDAGraph()
-		try:
-			with torch.cuda.graph(graph):
-				self._window()
-				self._decide(bucket)
-			self._graphs[bucket] = graph
-		except RuntimeError as error:
-			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
+	def _play_and_decide(self, bucket: int) -> None:
+		"""A whole window and the decision over `bucket` slots, which is what one captured graph covers."""
+		self._window()
+		self._decide(bucket)
 
 	def play_window(self) -> None:
 		"""Plays `action_repeat` ticks and decides the action the next window holds."""
-		graph = self._graphs.get(self.bucket)
+		graph = self._graphs[self.bucket]
 		if graph is None:
-			self._window()
-			self._decide(self.bucket)
+			self._play_and_decide(self.bucket)
 			return
 		graph.replay()
 

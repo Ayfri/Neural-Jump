@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ai.device_runner import captured
 from ai.population import HOST_DTYPE, Population
 from game.world import OBSERVATION_SIZE
 
@@ -139,25 +140,11 @@ class CapturedCall:
 	def __call__(self) -> None:
 		if self.graph is not None:
 			self.graph.replay()
-			return
-		if not self.capturable:
+		elif not self.capturable:
 			self.function()
-			return
-
-		warmup = torch.cuda.Stream()
-		warmup.wait_stream(torch.cuda.current_stream())
-		with torch.cuda.stream(warmup):
-			self.function()
-		torch.cuda.current_stream().wait_stream(warmup)
-
-		graph = torch.cuda.CUDAGraph()
-		try:
-			with torch.cuda.graph(graph):
-				self.function()
-			self.graph = graph
-		except RuntimeError as error:
-			print(f'CUDA graph capture of the update unavailable, falling back to eager mode: {error}')
-			self.capturable = False
+		else:
+			self.graph = captured(self.function, 1)
+			self.capturable = self.graph is not None
 
 
 class PPOTrainer:

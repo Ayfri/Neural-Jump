@@ -6,14 +6,10 @@ import torch
 from numpy.typing import NDArray
 from torch import Tensor
 
-from ai.device_runner import STUCK_SNAPSHOTS, compiled
+from ai.device_runner import STUCK_SNAPSHOTS, Shaping, captured, compiled
 from ai.population import HOST_DTYPE, Population
 from ai.ppo import RolloutBuffer
-from ai.rewards import (
-	BACKWARD_MOVEMENT_PENALTY, COIN_REWARD, DEATH_PENALTY, FALLING_PENALTY, FALLING_THRESHOLD,
-	FORWARD_MOVEMENT_REWARD, NEW_MAX_POSITION_BONUS, STATIONARY_PENALTY, STATIONARY_THRESHOLD, WIN_BASE_BONUS,
-	WIN_SPEED_BONUS, WIN_SPEED_EXPONENT,
-)
+from ai.rewards import COIN_REWARD, DEATH_PENALTY, WIN_BASE_BONUS, WIN_SPEED_BONUS, WIN_SPEED_EXPONENT
 from game.world import OBSERVATION_SIZE
 from game.world_cuda import POSITION_DTYPE, CudaWorld
 
@@ -138,11 +134,7 @@ class PPORunner:
 		self.values = torch.zeros(1, count, device=device)
 
 		self.episode_return = torch.zeros(count, device=device)
-		self.max_x_reached = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self.max_x_tick = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self.ticks_stationary = torch.zeros(count, device=device, dtype=torch.int32)
-		self._previous_x = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
-		self._previous_y = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
+		self.shaping = Shaping(world)
 		self._previous_coins = torch.zeros(count, device=device, dtype=torch.int32)
 		self._window_reward = torch.zeros(count, device=device)
 		self._history: list[Tensor] = []
@@ -160,8 +152,8 @@ class PPORunner:
 
 		self.reset_all()
 		self._compiled_step = compiled(self._step)
-		self._graph: torch.cuda.CUDAGraph | None = None
-		self._capture()
+		# Captured so collecting a step costs a single launch instead of a few hundred
+		self._graph = captured(self._compiled_step, 3) if device.type == 'cuda' else None
 		self.reset_all()
 
 	def apply_curriculum(self) -> None:
@@ -176,9 +168,7 @@ class PPORunner:
 		world.reset(0, 0)
 		self._place(torch.ones(world.count, device=world.device, dtype=torch.bool))
 		self.episode_return.zero_()
-		self.max_x_reached.copy_(world.x)
-		self.max_x_tick.zero_()
-		self.ticks_stationary.zero_()
+		self.shaping.reset()
 		self._previous_coins.zero_()
 		self.judged.zero_()
 		self._history.clear()
@@ -201,45 +191,19 @@ class PPORunner:
 		self.values.copy_(values)
 
 	def _play_window(self) -> None:
-		"""One action window: the held action played for every tick of it, and what those ticks are worth."""
-		world = self.world
-		self._window_reward.zero_()
-		for _ in range(self.action_repeat):
-			alive = world.alive()
-			self._previous_x.copy_(world.x)
-			self._previous_y.copy_(world.y)
-			world.step(self.actions.squeeze(0))
-			self._add_tick_rewards(alive)
-
-	def _add_tick_rewards(self, alive: Tensor) -> None:
 		"""
-		Per-tick shaping, plus the coins banked on this tick.
+		One action window: the held action played for every tick of it, and what those ticks are worth.
 
 		Evolution pays the coins at the end of the episode, because all it needs is a number to rank on.
 		A policy gradient needs to know which decision earned them, so they are paid the tick they are taken.
 		"""
 		world = self.world
-		x_delta = world.x - self._previous_x
-		rewards = torch.zeros_like(self._window_reward)
-
-		forward = x_delta > 0
-		rewards += forward * FORWARD_MOVEMENT_REWARD
-		record = forward & (world.x > self.max_x_reached)
-		rewards += record * NEW_MAX_POSITION_BONUS
-		torch.where(record, (world.tick - 1).to(POSITION_DTYPE), self.max_x_tick, out=self.max_x_tick)
-		torch.where(record, world.x, self.max_x_reached, out=self.max_x_reached)
-
-		rewards += (x_delta < 0) * BACKWARD_MOVEMENT_PENALTY
-
-		still = x_delta == 0
-		self.ticks_stationary += still
-		self.ticks_stationary *= still
-		rewards += (self.ticks_stationary > STATIONARY_THRESHOLD) * STATIONARY_PENALTY
-		rewards += ((world.y - self._previous_y) > FALLING_THRESHOLD) * FALLING_PENALTY
-
-		rewards += (world.coins - self._previous_coins) * COIN_REWARD
-		self._previous_coins.copy_(world.coins)
-		self._window_reward += rewards * alive
+		self._window_reward.zero_()
+		for _ in range(self.action_repeat):
+			self._window_reward += self.shaping.step(self.actions.squeeze(0))
+			# Only a living player banks a coin, so the gain needs no alive mask of its own
+			self._window_reward += (world.coins - self._previous_coins) * COIN_REWARD
+			self._previous_coins.copy_(world.coins)
 
 	def _finish_step(self) -> None:
 		"""
@@ -275,7 +239,7 @@ class PPORunner:
 		full_run = done & won & (self.spawn_index == 0)
 		torch.minimum(self.best_win_tick, torch.where(full_run, world.win_tick, self.best_win_tick).min(), out=self.best_win_tick)
 		# Touching the flag clears whatever rung the run started on, whether or not it walked past the tile
-		cleared = ~self.judged & (won | (self.max_x_reached >= self.cleared_x[self.spawn_index]))
+		cleared = ~self.judged & (won | (self.shaping.max_x_reached >= self.cleared_x[self.spawn_index]))
 		judged = cleared | (done & ~self.judged)
 		self.front_episodes.scatter_add_(0, self.spawn_index, judged.to(torch.int64))
 		self.front_cleared.scatter_add_(0, self.spawn_index, cleared.to(torch.int64))
@@ -285,9 +249,7 @@ class PPORunner:
 
 		self._draw_spawns(done)
 		self._place(done)
-		torch.where(done, world.x, self.max_x_reached, out=self.max_x_reached)
-		torch.where(done, torch.zeros_like(self.max_x_tick), self.max_x_tick, out=self.max_x_tick)
-		self.ticks_stationary *= ~done
+		self.shaping.restart(done)
 		self._previous_coins *= ~done
 
 	def _step(self) -> None:
@@ -301,26 +263,6 @@ class PPORunner:
 		self._play_window()
 		self._finish_step()
 		self._decide()
-
-	def _capture(self) -> None:
-		"""Captures a rollout step so collecting one costs a single launch instead of a few hundred."""
-		if self.world.device.type != 'cuda':
-			return
-		warmup = torch.cuda.Stream()
-		warmup.wait_stream(torch.cuda.current_stream())
-		with torch.cuda.stream(warmup):
-			for _ in range(3):
-				self._compiled_step()
-		torch.cuda.current_stream().wait_stream(warmup)
-
-		graph = torch.cuda.CUDAGraph()
-		try:
-			with torch.cuda.graph(graph):
-				self._compiled_step()
-			self._graph = graph
-		except RuntimeError as error:
-			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
-			self._graph = None
 
 	def collect_step(self) -> None:
 		"""Plays one decision's worth of every environment and stores it in the rollout buffer."""

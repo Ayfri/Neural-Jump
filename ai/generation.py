@@ -565,13 +565,13 @@ class Generation:
 		if self.ppo_runner is not None:
 			# What the HUD ranks agents on under PPO is the return of the episode each one is still playing
 			np.copyto(self.rewards, self.ppo_runner.episode_return.cpu().numpy())
-			np.copyto(self.max_x_reached, self.ppo_runner.max_x_reached.cpu().numpy())
+			np.copyto(self.max_x_reached, self.ppo_runner.shaping.max_x_reached.cpu().numpy())
 			return
 
 		assert self.runner is not None
 		self.rewards[:] = self._rewards_banked + self.runner.rewards.cpu().numpy()
-		np.copyto(self.max_x_reached, self.runner.max_x_reached.cpu().numpy())
-		np.copyto(self.max_x_tick, self.runner.max_x_tick.cpu().numpy())
+		np.copyto(self.max_x_reached, self.runner.shaping.max_x_reached.cpu().numpy())
+		np.copyto(self.max_x_tick, self.runner.shaping.max_x_tick.cpu().numpy())
 
 	def _simulate(self, tick: int, steps: int) -> int:
 		"""Advances the simulation by up to `steps` ticks, returning how many were actually played."""
