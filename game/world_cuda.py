@@ -38,6 +38,7 @@ class CudaWorld:
 		self.solid = constant(world.flat_solid, torch.bool)
 		self.goal = constant(world.flat_goal, torch.float32)
 		self.coin_ids = constant(world.flat_coins, torch.int64)
+		self.coin_columns = torch.arange(max(1, world.coin_count), device=device)
 		self.windows = constant(world.windows, torch.float16)
 		self.move_speeds = constant(MOVE_SPEEDS, POSITION_DTYPE)
 		self.enemy_count = world.enemy_count
@@ -247,15 +248,14 @@ class CudaWorld:
 			return
 
 		top_row, bottom_row, left, right = block
-		# Still one corner at a time, because a box wide enough to touch the same coin twice must only bank it once
+		# Every coin id compared against the four corners rather than a gather and a scatter per corner: it fuses
+		# into one kernel where those do not, and a coin two corners touch is still one bit and one coin
+		touched = torch.zeros_like(self.collected)
 		for corner in (top_row + left, top_row + right, bottom_row + left, bottom_row + right):
-			ids = self.coin_ids[corner]
-			# Clamped index: an agent standing on no coin reads slot 0 and is masked out anyway
-			slots = ids.clamp_min(0).unsqueeze(1)
-			banked = self.collected.gather(1, slots).squeeze(1)
-			fresh = (ids >= 0) & alive & ~banked
-			self.collected.scatter_(1, slots, (banked | fresh).unsqueeze(1))
-			self.coins += fresh
+			touched |= self.coin_ids[corner].unsqueeze(1) == self.coin_columns
+		fresh = touched & ~self.collected & alive.unsqueeze(1)
+		self.collected |= fresh
+		self.coins += fresh.sum(dim=1, dtype=torch.int32)
 
 	def observe(self, out: Tensor) -> Tensor:
 		"""
