@@ -553,19 +553,13 @@ and multiply instead of two masked writes and an invert, and the terms accumulat
 through one masked add rather than a mask multiply and a separate `+=`.
 
 **Vision is baked.** The window of every tile in the map, terrain and reward vector both, is built once at
-load time, so an observation is a single gather of one row. It is written in half precision straight into a
-page-locked buffer the device copies from, so a tick crosses PCIe once each way with no staging copy in
-between.
+load time, so an observation is a single gather of one row, in half precision.
 
-**The forward pass is one graph replay.** A pass is a few dozen tiny kernels, so it is bound by launch
-latency: the action pass is captured as a CUDA graph, which is about 3x faster than launching its kernels one
-by one, and the capture falls back to eager mode if the device cannot do it. The network
-runs in half precision, which nearly halves the pass and costs nothing when only the argmax is read.
-
-**The device works while the CPU does.** Waiting on the device is most of what a decision costs, so a pass is
-started at the end of the tick before the one that plays it, and that tick's physics runs while the device
-decides. The observation is taken at the same point either way, so a run is identical to a serial one, down
-to the last float.
+**The forward pass is part of the window's graph.** A pass is a few dozen tiny kernels, so it is bound by
+launch latency: it is captured together with the physics of its window, and the capture falls back to eager
+mode if the device cannot do it. The network runs in half precision, which nearly halves the pass and costs
+nothing when only the argmax is read. The numpy path only ever runs on the CPU, where the pass is a plain
+synchronous call on the observations the world just wrote.
 
 What is left is the pass itself, bound by reading the living agents' weights: 300 agents of 57k half
 precision parameters is 34 MB, which the card reads out of its 32 MB L2 at 460 to 630 GB/s. That is also why
