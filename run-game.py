@@ -3,8 +3,7 @@ import os
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
 
-from game.main import start_game
-from game.play import DEFAULT_TICK_RATE
+from game.play import DEFAULT_TICK_RATE, PlaySession
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,7 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
 	args = build_parser().parse_args()
 	if args.no_menu:
-		start_game(map_path=args.map, tick_rate=args.tick_rate, fps=args.fps, spawn=args.spawn)
+		session = PlaySession(args.map, args.tick_rate, args.fps, args.spawn)
+		session.run()
+		session.renderer.quit()
 		return
 
 	from shell import Shell
