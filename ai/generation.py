@@ -547,7 +547,6 @@ class Generation:
 			self.runner.start()
 			return
 
-		self.decide()
 		self.max_x_reached[:] = self.world.x
 		self.max_x_tick.fill(0.0)
 		self.ticks_stationary.fill(0)
@@ -618,29 +617,18 @@ class Generation:
 
 		Holding an action for `action_repeat` ticks is both cheaper and easier to learn from: a jump arc lasts
 		about 42 ticks, so at one decision per tick no reachable discount factor reaches the far side of a gap.
-		A window cut short by the end of an episode is simply dropped, its observation slot gets reused.
 		"""
 		alive = self.world.alive()
 		if tick % self.action_repeat == 0:
-			self._actions = self.population.collect()
+			self._actions = self.population.act(self.world.observe())
 
 		np.copyto(self._previous_x, self.world.x)
 		np.copyto(self._previous_y, self.world.y)
 		self.world.step(self._actions, tick)
-
-		# The next window is decided from right here, so the device works through the rest of the tick
-		if (tick + 1) % self.action_repeat == 0:
-			self.decide()
-
 		self.add_continuous_rewards(alive, self._previous_x, self._previous_y, tick)
 
 		self.check_agent_positions(tick)
 		self.total_ticks += 1
-
-	def decide(self) -> None:
-		"""Stages the current observations and starts the pass whose actions the next window plays."""
-		self.world.observe(self.population.observations)
-		self.population.submit()
 
 	def _adapt_ticks_per_frame(self) -> None:
 		"""

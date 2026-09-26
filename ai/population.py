@@ -64,7 +64,6 @@ class Population:
 	) -> None:
 		self.size = size
 		self.batch = batch
-		self.critic = critic
 		self.device = device if device is not None else pick_device()
 		# Evolution only ever reads the argmax of the logits, so half precision drops nothing it uses; a
 		# gradient does care, so a critic pins the whole policy to float32 rather than to a loss scaler
@@ -96,18 +95,6 @@ class Population:
 			# Evolution rewrites these tensors by hand; a policy gradient needs autograd to reach them instead
 			for tensor in self.parameters():
 				tensor.requires_grad_(True)
-
-		# Page-locked staging buffers: the world writes its observations straight into `observations`, and the
-		# actions come back into `actions`, so a tick copies twice over PCIe instead of through pageable memory
-		pinned = self.device.type == 'cuda'
-		self._host_observations = torch.empty(size, batch, OBSERVATION_SIZE, dtype=HOST_DTYPE, pin_memory=pinned)
-		self.observations: NDArray[np.float16] = self._host_observations.numpy().reshape(size * batch, OBSERVATION_SIZE)
-		self._host_actions = torch.empty(size * batch, dtype=torch.int64, pin_memory=pinned)
-		self.actions: NDArray[np.int64] = self._host_actions.numpy()
-
-		self._pending: Tensor | None = None  # Result of a pass run eagerly, where no graph could be captured
-		self._graph: tuple[torch.cuda.CUDAGraph, Tensor] | None = None
-		self._capture_graph()
 
 	def parameters(self) -> list[Tensor]:
 		return [*self.weights.values(), *self.biases.values()]
@@ -177,79 +164,10 @@ class Population:
 		return taken, entropy, values.float()
 
 	@torch.no_grad()
-	def _greedy(self, observations: Tensor) -> Tensor:
-		return self.forward(observations).squeeze(1).argmax(dim=-1)
-
-	def _capture_graph(self) -> None:
-		"""
-		Captures the action pass as a CUDA graph.
-
-		One tick is a few dozen tiny kernels, so the pass is bound by launch latency rather than by maths.
-		Replaying a captured graph collapses those launches into one, and the shapes never change here.
-		The weights are updated in place by evolution, so the graph keeps reading the current values.
-		"""
-		if self.device.type != 'cuda' or self.critic:
-			return
-		try:
-			self._graph_input = torch.zeros(self.size, self.batch, OBSERVATION_SIZE, device=self.device, dtype=self.dtype)
-			warmup = torch.cuda.Stream()
-			warmup.wait_stream(torch.cuda.current_stream())
-			with torch.cuda.stream(warmup):
-				for _ in range(3):
-					self._greedy(self._graph_input)
-			torch.cuda.current_stream().wait_stream(warmup)
-
-			graph = torch.cuda.CUDAGraph()
-			with torch.cuda.graph(graph):
-				self._graph = (graph, self._greedy(self._graph_input))
-		except RuntimeError as error:
-			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
-			self._graph = None
-
-	def act(self) -> NDArray[np.int64]:
-		"""Picks one action per agent from the observations staged in `self.observations`."""
-		self.submit()
-		return self.collect()
-
-	def submit(self) -> None:
-		"""
-		Starts the pass over the staged observations and returns before it lands.
-
-		Waiting for the device is most of what a decision costs, so the caller starts the pass one tick
-		early and spends that tick on physics instead. Nothing reads the staging buffers until `collect`.
-		"""
-		if self._graph is None:
-			# Half precision observations halve the transfer; the widening happens on the device
-			batch = self._host_observations.to(self.device, self.dtype, non_blocking=True)
-			self._pending = self._greedy(batch)
-			return
-
-		graph, output = self._graph
-		self._graph_input.copy_(self._host_observations, non_blocking=True)
-		graph.replay()
-		self._host_actions.copy_(output, non_blocking=True)
-		self._pending = None
-
-	def collect(self) -> NDArray[np.int64]:
-		"""Waits for the pass started by `submit` and returns its actions."""
-		if self._pending is not None:
-			actions = self._pending.cpu().numpy()
-			self._pending = None
-			return actions
-
-		torch.cuda.synchronize()
-		return self.actions
-
-	def snapshot(self, indices: Tensor) -> list[Tensor]:
-		"""Copies the given agents out of the population, in `parameters()` order."""
-		with torch.no_grad():
-			return [tensor[indices].clone() for tensor in self.parameters()]
-
-	def restore(self, snapshot: list[Tensor], start: int = 0) -> None:
-		"""Writes a snapshot back into `len(snapshot[0])` consecutive slots starting at `start`."""
-		with torch.no_grad():
-			for tensor, saved in zip(self.parameters(), snapshot, strict=True):
-				tensor[start:start + saved.shape[0]] = saved
+	def act(self, observations: NDArray[np.float16]) -> NDArray[np.int64]:
+		"""The greedy action of every agent on the world's `(agents, OBSERVATION_SIZE)` observations, for the numpy path."""
+		batch = torch.from_numpy(observations).to(self.device, self.dtype).view(self.size, self.batch, OBSERVATION_SIZE)
+		return self.forward(batch).squeeze(1).argmax(dim=-1).cpu().numpy()
 
 	def evolve(self, fitness: NDArray[np.float32], elite_count: int, random_count: int, mutation_rate: float, mutation_strength: float) -> NDArray[np.int64]:
 		"""
