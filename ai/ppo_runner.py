@@ -34,7 +34,8 @@ class SpawnCurriculum:
 	FRONT_SHARE: Final[float] = 0.6  # Episodes spent on the checkpoint being learned, the rest replay the easier ones
 	PROMOTE_RATE: Final[float] = 0.6  # Win rate from the front that moves it one checkpoint back
 	MIN_EPISODES: Final[int] = 200  # Episodes the front is judged on before it can move
-	PATIENCE: Final[int] = 25  # Rollouts clearing nothing at all before the front is called stuck
+	PATIENCE: Final[int] = 25  # Rollouts under `STALL_RATE` in a row before the front is called stuck
+	STALL_RATE: Final[float] = 0.1  # Win rate from the front under which a rollout counts toward a stall
 
 	def __init__(self, spawns: list[tuple[int, int]], mode: str) -> None:
 		self.spawns = spawns
@@ -67,12 +68,16 @@ class SpawnCurriculum:
 		The rate is a moving estimate rather than a total: the rollouts spent learning a rung all score zero,
 		and averaging those in with the ones that follow would hold the front where it is long after the
 		policy has outgrown it. A rollout weighs on the estimate in proportion to what it played.
+
+		A rollout counts toward a stall while the rate sits under `STALL_RATE`, not only when nothing clears.
+		A rung the policy has settled away from still lets the odd lucky episode through, and a count that any
+		single clear resets never fires on it while the entropy bonus anneals the policy into the failure.
 		"""
 		if self.mode != 'curriculum' or self.front == 0 or episodes == 0:
 			return False
 		self.rate += (cleared / episodes - self.rate) * min(1.0, episodes / self.MIN_EPISODES)
 		self.seen += episodes
-		self.idle = 0 if cleared else self.idle + 1
+		self.idle = 0 if self.rate >= self.STALL_RATE else self.idle + 1
 		if self.seen < self.MIN_EPISODES or self.rate < self.PROMOTE_RATE:
 			return False
 		self.promote()
@@ -148,6 +153,7 @@ class PPORunner:
 		self.finished_return = torch.zeros((), device=device)
 		self.front_episodes = torch.zeros(len(spawns), device=device, dtype=torch.int64)
 		self.front_cleared = torch.zeros(len(spawns), device=device, dtype=torch.int64)
+		self.judged = torch.zeros(count, device=device, dtype=torch.bool)  # Whether the running episode is already counted
 		# Records, which outlive a rollout: the best episode ever returned and the fastest run to the flag
 		self.best_return = torch.full((), -float('inf'), device=device)
 		self.best_win_tick = torch.full((), NO_WIN, device=device, dtype=torch.int64)
@@ -174,6 +180,7 @@ class PPORunner:
 		self.max_x_tick.zero_()
 		self.ticks_stationary.zero_()
 		self._previous_coins.zero_()
+		self.judged.zero_()
 		self._history.clear()
 		self._decide()
 
@@ -245,6 +252,10 @@ class PPORunner:
 		An episode that runs out its tick budget ends the same way a death does, bootstrap cut and all. The
 		budget is part of what a run is scored on here rather than a limit imposed on top of it, so a state
 		near the end of one really is worth less than the same state at the start.
+
+		The curriculum judges an episode the moment it reaches the next rung, and at its end only if it never
+		did. A policy that clears its rung carries on toward the flag, and judged at the end its success would
+		reach the curriculum up to a whole episode late, while its failures, being short, arrive first.
 		"""
 		world = self.world
 		won = world.win
@@ -263,10 +274,13 @@ class PPORunner:
 		# Only a run that started where the level does counts as a time: one from a rung had less to cover
 		full_run = done & won & (self.spawn_index == 0)
 		torch.minimum(self.best_win_tick, torch.where(full_run, world.win_tick, self.best_win_tick).min(), out=self.best_win_tick)
-		self.front_episodes.scatter_add_(0, self.spawn_index, done.to(torch.int64))
 		# Touching the flag clears whatever rung the run started on, whether or not it walked past the tile
-		cleared = done & (won | (self.max_x_reached >= self.cleared_x[self.spawn_index]))
+		cleared = ~self.judged & (won | (self.max_x_reached >= self.cleared_x[self.spawn_index]))
+		judged = cleared | (done & ~self.judged)
+		self.front_episodes.scatter_add_(0, self.spawn_index, judged.to(torch.int64))
 		self.front_cleared.scatter_add_(0, self.spawn_index, cleared.to(torch.int64))
+		self.judged |= judged
+		self.judged &= ~done
 		self.episode_return *= ~done
 
 		self._draw_spawns(done)
