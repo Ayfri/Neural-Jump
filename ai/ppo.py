@@ -46,6 +46,8 @@ class RolloutBuffer:
 		self.values = torch.zeros(steps, envs, device=device)
 		self.rewards = torch.zeros(steps, envs, device=device)
 		self.dones = torch.zeros(steps, envs, device=device, dtype=torch.bool)
+		self.advantages = torch.zeros(steps, envs, device=device)
+		self.returns = torch.zeros(steps, envs, device=device)
 		self.cursor = torch.zeros(1, device=device, dtype=torch.int64)
 
 	def rewind(self) -> None:
@@ -72,7 +74,8 @@ class ReturnScaler:
 
 	Touching the flag is worth a thousand ticks of shaping, and a critic regressing that raw would spend the
 	whole run chasing the spike instead of the gradient that leads to it. The estimate carries across
-	rollouts, so an episode that spans several of them is scaled by one consistent number.
+	rollouts, so an episode that spans several of them is scaled by one consistent number. Every piece of it
+	is updated in place, so the scan that feeds it can be replayed from a captured graph.
 	"""
 
 	def __init__(self, envs: int, gamma: float, device: torch.device) -> None:
@@ -104,7 +107,7 @@ class ReturnScaler:
 		for step in range(rewards.shape[0]):
 			running = torch.addcmul(rewards[step], running, carry[step])
 			returns[step] = running
-		self._running = running * keep[-1]
+		self._running.copy_(running * keep[-1])
 		self._absorb(returns)
 		return rewards / self.scale
 
@@ -114,9 +117,47 @@ class ReturnScaler:
 		mean, var = returns.mean(), returns.var(unbiased=False)
 		delta = mean - self._mean
 		total = self._count + count
-		self._mean = self._mean + delta * (count / total)
-		self._var = (self._var * self._count + var * count + delta.square() * self._count * count / total) / total
-		self._count = total
+		self._var.copy_((self._var * self._count + var * count + delta.square() * self._count * count / total) / total)
+		self._mean.add_(delta * (count / total))
+		self._count.copy_(total)
+
+
+class CapturedCall:
+	"""
+	Runs a function eagerly the first time, then captures it and replays the capture on every later call.
+
+	The first call is real work that doubles as the warmup a capture needs, so nothing is played twice and no
+	state has to be saved around it. Everything the function touches has to live at a fixed address, since the
+	graph replays the addresses it saw. Off CUDA, or if the capture fails, it keeps running eagerly.
+	"""
+
+	def __init__(self, function: Callable[[], None], device: torch.device) -> None:
+		self.function = function
+		self.capturable = device.type == 'cuda'
+		self.graph: torch.cuda.CUDAGraph | None = None
+
+	def __call__(self) -> None:
+		if self.graph is not None:
+			self.graph.replay()
+			return
+		if not self.capturable:
+			self.function()
+			return
+
+		warmup = torch.cuda.Stream()
+		warmup.wait_stream(torch.cuda.current_stream())
+		with torch.cuda.stream(warmup):
+			self.function()
+		torch.cuda.current_stream().wait_stream(warmup)
+
+		graph = torch.cuda.CUDAGraph()
+		try:
+			with torch.cuda.graph(graph):
+				self.function()
+			self.graph = graph
+		except RuntimeError as error:
+			print(f'CUDA graph capture of the update unavailable, falling back to eager mode: {error}')
+			self.capturable = False
 
 
 class PPOTrainer:
@@ -157,12 +198,22 @@ class PPOTrainer:
 		self.target_kl = target_kl
 		self.updates = 0
 		self.rung_updates = 0  # Updates since the curriculum last moved, which is what the entropy bonus anneals on
-		self.optimizer = torch.optim.Adam(population.parameters(), lr=learning_rate, eps=ADAM_EPS)
-		self.scaler = ReturnScaler(envs, gamma, population.device)
+		device = population.device
+		cuda = device.type == 'cuda'
+		# Capturable keeps Adam's step count on the device, which is what lets a whole epoch sit in one graph
+		self.optimizer = torch.optim.Adam(population.parameters(), lr=learning_rate, eps=ADAM_EPS, fused=cuda, capturable=cuda)
+		self.scaler = ReturnScaler(envs, gamma, device)
 		# Inductor fuses the trunk's norms and activations into fewer passes over them, which is what a
 		# minibatch is bound by, and is worth about a third of one
 		self._compiled = torch.compile(population.evaluate, dynamic=False)
 		self._compiles = True
+
+		# What the captured halves of an update read and write, at addresses that never move
+		self._bootstrap = torch.zeros(envs, device=device)
+		self._entropy_weight = torch.zeros((), device=device)
+		self._totals = torch.zeros(5, device=device)
+		self._epoch_kl = torch.zeros((), device=device)
+		self._graphs: tuple[RolloutBuffer, int, CapturedCall, CapturedCall, Tensor] | None = None
 
 	def evaluate(self, observations: Tensor, actions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 		"""The policy under inductor, falling back to eager for the rest of the run if it cannot compile."""
@@ -175,26 +226,89 @@ class PPOTrainer:
 			self._compiles = False
 			return self.population.evaluate(observations, actions)
 
-	def _advantages(self, rewards: Tensor, values: Tensor, dones: Tensor, last_value: Tensor) -> tuple[Tensor, Tensor]:
+	def _estimate(self, buffer: RolloutBuffer, steps: int) -> None:
 		"""
-		GAE(lambda) over the rollout and the value targets that go with it.
+		GAE(lambda) over the first `steps` of the rollout, written into the buffer's advantages and value targets.
 
 		An episode that ended inside the rollout cuts the bootstrap at its last step, which is what stops the
 		next episode's return from leaking backwards across the reset. The one that is still running at the
 		far end bootstraps from the value of the observation the runner is holding.
 		"""
+		dones, values = buffer.dones[:steps], buffer.values[:steps]
+		rewards = self.scaler.rescale(buffer.rewards[:steps], dones)
 		keep = (~dones).to(rewards.dtype)
 		# Every term but the recurrence itself is the same whole-rollout call, so the loop is left with one
-		next_values = torch.cat((values[1:], last_value.unsqueeze(0)))
+		next_values = torch.cat((values[1:], self._bootstrap.unsqueeze(0)))
 		deltas = rewards + self.gamma * next_values * keep - values
 		decay = keep * (self.gamma * self.gae_lambda)
 
-		advantages = torch.empty_like(rewards)
-		running = torch.zeros_like(last_value)
-		for step in range(rewards.shape[0] - 1, -1, -1):
+		advantages = buffer.advantages[:steps]
+		running = torch.zeros_like(self._bootstrap)
+		for step in range(steps - 1, -1, -1):
 			running = torch.addcmul(deltas[step], running, decay[step])
 			advantages[step] = running
-		return advantages, advantages + values
+		torch.add(advantages, values, out=buffer.returns[:steps])
+
+	def _epoch(self, buffer: RolloutBuffer, steps: int, order: Tensor) -> None:
+		"""One pass of clipped minibatch ascent over the rollout in `order`, adding what it measured to the totals."""
+		observations = buffer.observations[:steps].view(-1, OBSERVATION_SIZE)
+		actions = buffer.actions[:steps].view(-1)
+		old_log_probs = buffer.log_probs[:steps].view(-1)
+		advantages = buffer.advantages[:steps].view(-1)
+		returns = buffer.returns[:steps].view(-1)
+
+		size = max(1, order.shape[0] // self.minibatches)
+		for start in range(0, order.shape[0], size):
+			batch = order[start:start + size]
+			log_probs, entropy, values = self.evaluate(
+				observations.index_select(0, batch).to(self.population.dtype).unsqueeze(0),
+				actions.index_select(0, batch).unsqueeze(0),
+			)
+			log_probs, entropy, values = log_probs.squeeze(0), entropy.squeeze(0), values.squeeze(0)
+			old = old_log_probs.index_select(0, batch)
+
+			# Normalised per minibatch, which is what every reference implementation converged on
+			batch_advantages = advantages.index_select(0, batch)
+			batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
+
+			ratio = (log_probs - old).exp()
+			clipped = ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range)
+			policy_loss = -torch.min(ratio * batch_advantages, clipped * batch_advantages).mean()
+			value_loss = F.mse_loss(values, returns.index_select(0, batch))
+			entropy_loss = entropy.mean()
+			loss = policy_loss + self.value_coef * value_loss - self._entropy_weight * entropy_loss
+
+			self.optimizer.zero_grad(set_to_none=True)
+			loss.backward()
+			torch.nn.utils.clip_grad_norm_(self.population.parameters(), self.max_grad_norm)
+			self.optimizer.step()
+
+			with torch.no_grad():
+				# Schulman's k3 estimator: unbiased and never negative, unlike the plain log ratio mean
+				divergence = ((ratio - 1.0) - (log_probs - old)).mean()
+				clip_fraction = ((ratio - 1.0).abs() > self.clip_range).float().mean()
+				self._totals += torch.stack([policy_loss.detach(), value_loss.detach(), entropy_loss.detach(), divergence, clip_fraction])
+				self._epoch_kl += divergence
+
+	def _halves(self, buffer: RolloutBuffer, steps: int) -> tuple[CapturedCall, CapturedCall, Tensor]:
+		"""
+		The estimate and the epoch for a rollout of `steps` in `buffer`, with the order tensor the epoch reads.
+
+		Launching them kernel by kernel left the device idle for more than half of an update, so both are
+		captured. A graph only fits the rollout length it was captured on, and a rollout stopped by hand is
+		shorter than the rest, so it gets its own pair and the full length is captured again after it.
+		"""
+		if self._graphs is None or self._graphs[0] is not buffer or self._graphs[1] != steps:
+			device = self.population.device
+			order = torch.empty(steps * buffer.envs, device=device, dtype=torch.int64)
+			self._graphs = (
+				buffer, steps,
+				CapturedCall(lambda: self._estimate(buffer, steps), device),
+				CapturedCall(lambda: self._epoch(buffer, steps, order), device),
+				order,
+			)
+		_, _, estimate, epoch, order = self._graphs
+		return estimate, epoch, order
 
 	def anneal_entropy(self, floor: float = DEFAULT_ENTROPY_FINAL, updates: int = DEFAULT_ENTROPY_UPDATES) -> None:
 		"""
@@ -225,7 +339,7 @@ class PPOTrainer:
 		buffer: RolloutBuffer,
 		last_value: Tensor,
 		steps: int | None = None,
-		on_batch: Callable[[], None] | None = None,
+		on_epoch: Callable[[], None] | None = None,
 	) -> dict[str, float]:
 		"""
 		Runs the clipped epochs over one rollout and returns what the run's log and HUD show of them.
@@ -233,73 +347,35 @@ class PPOTrainer:
 		`steps` is how much of the buffer was filled, which is all of it unless the rollout was stopped by
 		hand. Anything past it is the previous rollout's data and is left out rather than trained on twice.
 
-		`on_batch` runs after every minibatch. An update over a quarter of a million transitions takes a
-		couple of seconds, which is a couple of seconds of a dead window unless something draws inside it.
+		`on_epoch` runs once an epoch has been launched, while the device works through it. An update over a
+		quarter of a million transitions takes a good fraction of a second, which is a dead window unless
+		something draws inside it.
 		"""
 		steps = buffer.steps if steps is None else min(steps, buffer.steps)
-		dones = buffer.dones[:steps]
-		rewards = self.scaler.rescale(buffer.rewards[:steps], dones)
-		advantages, returns = self._advantages(rewards, buffer.values[:steps], dones, last_value)
+		total = steps * buffer.envs
+		per_epoch = -(-total // max(1, total // self.minibatches))
+		estimate, epoch, order = self._halves(buffer, steps)
 
-		observations = buffer.observations[:steps].reshape(-1, OBSERVATION_SIZE)
-		actions = buffer.actions[:steps].reshape(-1)
-		old_log_probs = buffer.log_probs[:steps].reshape(-1)
-		flat_advantages = advantages.reshape(-1)
-		flat_returns = returns.reshape(-1)
-
-		total = observations.shape[0]
-		size = max(1, total // self.minibatches)
-		totals = torch.zeros(5, device=self.population.device)
-		batches = 0
-
+		self._bootstrap.copy_(last_value)
+		self._entropy_weight.fill_(self.entropy_coef)
+		self._totals.zero_()
+		estimate()
+		epochs = 0
 		for _ in range(self.epochs):
-			order = torch.randperm(total, device=self.population.device)
-			epoch_kl = torch.zeros((), device=self.population.device)
-			epoch_steps = 0
-			for start in range(0, total, size):
-				batch = order[start:start + size]
-				log_probs, entropy, values = self.evaluate(
-					observations.index_select(0, batch).to(self.population.dtype).unsqueeze(0),
-					actions.index_select(0, batch).unsqueeze(0),
-				)
-				log_probs, entropy, values = log_probs.squeeze(0), entropy.squeeze(0), values.squeeze(0)
-				old = old_log_probs.index_select(0, batch)
-
-				# Normalised per minibatch, which is what every reference implementation converged on
-				batch_advantages = flat_advantages.index_select(0, batch)
-				batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
-
-				ratio = (log_probs - old).exp()
-				clipped = ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range)
-				policy_loss = -torch.min(ratio * batch_advantages, clipped * batch_advantages).mean()
-				value_loss = F.mse_loss(values, flat_returns.index_select(0, batch))
-				entropy_loss = entropy.mean()
-				loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
-
-				self.optimizer.zero_grad(set_to_none=True)
-				loss.backward()
-				torch.nn.utils.clip_grad_norm_(self.population.parameters(), self.max_grad_norm)
-				self.optimizer.step()
-
-				with torch.no_grad():
-					# Schulman's k3 estimator: unbiased and never negative, unlike the plain log ratio mean
-					divergence = ((ratio - 1.0) - (log_probs - old)).mean()
-					clip_fraction = ((ratio - 1.0).abs() > self.clip_range).float().mean()
-				totals += torch.stack([policy_loss.detach(), value_loss.detach(), entropy_loss.detach(), divergence, clip_fraction])
-				epoch_kl += divergence
-				epoch_steps += 1
-				batches += 1
-				if on_batch is not None:
-					on_batch()
-
+			torch.randperm(total, device=self.population.device, out=order)
+			self._epoch_kl.zero_()
+			epoch()
+			epochs += 1
+			if on_epoch is not None:
+				on_epoch()
 			# The one host read of the update: the rollout is off policy as soon as the weights have moved far enough
-			if float(epoch_kl) / max(1, epoch_steps) > self.target_kl:
+			if float(self._epoch_kl) / per_epoch > self.target_kl:
 				break
 
 		self.updates += 1
 		self.rung_updates += 1
 		self.anneal_entropy()
-		averages = (totals / max(1, batches)).tolist()
+		averages = (self._totals / (per_epoch * epochs)).tolist()
 		return {
 			'policy_loss': averages[0],
 			'value_loss': averages[1],

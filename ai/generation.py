@@ -913,9 +913,9 @@ class Generation:
 		Keeps the window alive through an update, which the simulation spends standing still.
 
 		The world does not move during an update, so there is exactly one frame worth drawing and the rest of
-		the minibatches only pump the event queue. Drawing every one of them would be far worse than wasted:
-		a frame reads the device state back, and every one of those reads blocks on the gradient kernels
-		already queued in front of it, which serialises the whole update behind the window.
+		the epochs only pump the event queue. Drawing every one of them would be far worse than wasted: a frame
+		reads the device state back, and every one of those reads blocks on the gradient kernels already queued
+		in front of it, which serialises the whole update behind the window.
 		"""
 		if self.renderer is None:
 			return
