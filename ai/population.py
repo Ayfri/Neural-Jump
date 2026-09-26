@@ -125,27 +125,33 @@ class Population:
 				self.weights[name][indices] = 1.0
 				self.biases[name][indices] = 0.0
 
-	def _linear(self, x: Tensor, name: str) -> Tensor:
-		return torch.baddbmm(self.biases[name], x, self.weights[name])
+	@staticmethod
+	def _trunk(observations: Tensor, weights: dict[str, Tensor], biases: dict[str, Tensor]) -> Tensor:
+		def linear(x: Tensor, name: str) -> Tensor:
+			return torch.baddbmm(biases[name], x, weights[name])
 
-	def _layer_norm(self, x: Tensor, name: str) -> Tensor:
-		# The fused kernel does the normalisation, the affine part stays per agent
-		normalized = F.layer_norm(x, (x.shape[-1],), eps=LAYER_NORM_EPS)
-		return normalized * self.weights[name] + self.biases[name]
+		def layer_norm(x: Tensor, name: str) -> Tensor:
+			# The fused kernel does the normalisation, the affine part stays per agent
+			return F.layer_norm(x, (x.shape[-1],), eps=LAYER_NORM_EPS) * weights[name] + biases[name]
 
-	def _trunk(self, observations: Tensor) -> Tensor:
-		x = F.leaky_relu(self._layer_norm(self._linear(observations, 'fc1'), 'norm1'))
-		x = F.leaky_relu(self._layer_norm(self._linear(x, 'fc2'), 'norm2'))
-		return F.leaky_relu(self._linear(x, 'fc3'))
+		x = F.leaky_relu(layer_norm(linear(observations, 'fc1'), 'norm1'))
+		x = F.leaky_relu(layer_norm(linear(x, 'fc2'), 'norm2'))
+		return F.leaky_relu(linear(x, 'fc3'))
+
+	@staticmethod
+	def forward_with(observations: Tensor, weights: dict[str, Tensor], biases: dict[str, Tensor]) -> Tensor:
+		"""The policy's logits under any set of weights shaped like the population's, a subset of its agents included."""
+		return torch.baddbmm(biases['actor'], Population._trunk(observations, weights, biases), weights['actor'])
 
 	def forward(self, observations: Tensor) -> Tensor:
 		"""Runs the population on `(agents, batch, OBSERVATION_SIZE)` observations, returning `(agents, batch, 3)` logits."""
-		return self._linear(self._trunk(observations), 'actor')
+		return self.forward_with(observations, self.weights, self.biases)
 
 	def forward_actor_critic(self, observations: Tensor) -> tuple[Tensor, Tensor]:
 		"""Logits and state values off one trunk pass, `(agents, batch, 3)` and `(agents, batch)`."""
-		features = self._trunk(observations)
-		return self._linear(features, 'actor'), self._linear(features, 'critic').squeeze(-1)
+		features = self._trunk(observations, self.weights, self.biases)
+		actor = torch.baddbmm(self.biases['actor'], features, self.weights['actor'])
+		return actor, torch.baddbmm(self.biases['critic'], features, self.weights['critic']).squeeze(-1)
 
 	@torch.no_grad()
 	def sample(self, observations: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -199,10 +205,6 @@ class Population:
 		except RuntimeError as error:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
 			self._graph = None
-
-	def decide(self, observations: Tensor) -> Tensor:
-		"""Picks one action per agent from observations already on the device, for a caller that never leaves it."""
-		return self._greedy(observations)
 
 	def act(self) -> NDArray[np.int64]:
 		"""Picks one action per agent from the observations staged in `self.observations`."""

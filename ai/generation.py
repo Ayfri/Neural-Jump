@@ -637,7 +637,7 @@ class Generation:
 				self.runner.check_positions()
 			if done - self._alive_checked_tick >= ALIVE_CHECK_TICKS:
 				self._alive_checked_tick = done
-				self._anyone_alive = self.runner.anyone_alive()
+				self._anyone_alive = self.runner.check_alive()
 				if self.episode_over():
 					break
 		return played

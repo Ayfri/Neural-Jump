@@ -13,6 +13,7 @@ from game.world import OBSERVATION_SIZE
 from game.world_cuda import POSITION_DTYPE, CudaWorld
 
 STUCK_SNAPSHOTS: Final[int] = 4  # Position samples kept, so the oldest is the far end of the stuck window
+BUCKET_FLOOR: Final[int] = 16  # Smallest action pass captured, under which a halving saves less than the extra graph costs
 
 
 def compiled(function: Callable[[], None]) -> Callable[[], None]:
@@ -39,6 +40,12 @@ class DeviceRunner:
 	Nothing crosses back to the host inside a window, which is what makes the graph capturable, so the
 	trackers a reward needs live here as tensors rather than in the training loop. The loop reads them back
 	between windows, when it renders or when a checkpoint ends.
+
+	The action pass is bound by reading every agent's weights, and most of a long episode is played by a
+	handful of survivors. Death is final within an episode, so each alive check moves the pass to the smallest
+	bucket of a halving ladder that still holds the living: their weights are copied once into `_weights`,
+	living agents first, and every window after that reads only that prefix. `_slots` maps a slot of it back
+	to its agent. Each bucket is its own captured graph, and the full one reads the population directly.
 	"""
 
 	def __init__(self, world: CudaWorld, population: Population, action_repeat: int) -> None:
@@ -59,10 +66,20 @@ class DeviceRunner:
 		self._previous_y = torch.zeros(count, device=device, dtype=POSITION_DTYPE)
 		self._history: list[Tensor] = []
 
+		self.buckets = [count]
+		while self.buckets[-1] // 2 >= BUCKET_FLOOR:
+			self.buckets.append(self.buckets[-1] // 2)
+		self.bucket = count
+		self._slots = torch.arange(count, device=device)
+		half = self.buckets[1] if len(self.buckets) > 1 else 0
+		self._weights = {name: torch.zeros(half, *tensor.shape[1:], device=device, dtype=tensor.dtype) for name, tensor in population.weights.items()}
+		self._biases = {name: torch.zeros(half, *tensor.shape[1:], device=device, dtype=tensor.dtype) for name, tensor in population.biases.items()}
+
 		# Compiling and capturing both play real windows, so they happen here, on the state a reset throws away
 		self._window = compiled(self._play_window)
-		self._graph: torch.cuda.CUDAGraph | None = None
-		self._capture()
+		self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+		for bucket in self.buckets:
+			self._capture(bucket)
 
 	def start(self) -> None:
 		"""Seeds the trackers from a freshly reset world and takes the decision its first window plays."""
@@ -71,11 +88,23 @@ class DeviceRunner:
 		self.max_x_tick.zero_()
 		self.ticks_stationary.zero_()
 		self._history.clear()
-		self._decide()
-
-	def _decide(self) -> None:
+		self.bucket = self.buckets[0]
+		torch.arange(self.world.count, device=self.world.device, out=self._slots)
 		self.world.observe(self.observations)
-		self.actions.copy_(self.population.decide(self.observations))
+		self._decide(self.bucket)
+
+	@torch.no_grad()
+	def _decide(self, bucket: int) -> None:
+		"""Picks the actions of the agents in the first `bucket` slots, leaving the rest, all dead, as they were."""
+		if bucket == self.buckets[0]:
+			actions = self.population.forward(self.observations).squeeze(1).argmax(dim=-1)
+			self.actions.copy_(actions)
+			return
+		slots = self._slots[:bucket]
+		weights = {name: tensor[:bucket] for name, tensor in self._weights.items()}
+		biases = {name: tensor[:bucket] for name, tensor in self._biases.items()}
+		logits = Population.forward_with(self.observations.index_select(0, slots), weights, biases)
+		self.actions.index_copy_(0, slots, logits.squeeze(1).argmax(dim=-1))
 
 	def _play_window(self) -> None:
 		"""One action window: the held action is played for every tick of it, then the next one is chosen."""
@@ -114,33 +143,33 @@ class DeviceRunner:
 		rewards += ((world.y - self._previous_y) > FALLING_THRESHOLD).to(POSITION_DTYPE) * FALLING_PENALTY
 		self.rewards += rewards * alive
 
-	def _capture(self) -> None:
-		"""Captures a whole window, the decision included, so playing one is a single launch."""
+	def _capture(self, bucket: int) -> None:
+		"""Captures a whole window, the decision over `bucket` slots included, so playing one is a single launch."""
 		warmup = torch.cuda.Stream()
 		warmup.wait_stream(torch.cuda.current_stream())
 		with torch.cuda.stream(warmup):
 			for _ in range(3):
 				self._window()
-				self.actions.copy_(self.population.decide(self.observations))
+				self._decide(bucket)
 		torch.cuda.current_stream().wait_stream(warmup)
 
 		graph = torch.cuda.CUDAGraph()
 		try:
 			with torch.cuda.graph(graph):
 				self._window()
-				self.actions.copy_(self.population.decide(self.observations))
-			self._graph = graph
+				self._decide(bucket)
+			self._graphs[bucket] = graph
 		except RuntimeError as error:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
-			self._graph = None
 
 	def play_window(self) -> None:
 		"""Plays `action_repeat` ticks and decides the action the next window holds."""
-		if self._graph is None:
+		graph = self._graphs.get(self.bucket)
+		if graph is None:
 			self._window()
-			self._decide()
+			self._decide(self.bucket)
 			return
-		self._graph.replay()
+		graph.replay()
 
 	def check_positions(self) -> None:
 		"""Kills agents that are stuck in place or crawling backwards, on the same schedule the loop asks for."""
@@ -153,6 +182,24 @@ class DeviceRunner:
 		if len(self._history) >= STUCK_SNAPSHOTS:
 			self.world.kill(alive & (self.world.x < self._history[0]))
 
-	def anyone_alive(self) -> bool:
-		"""The one host read a running episode needs, which is why the loop only takes it now and then."""
-		return bool(self.world.alive().any())
+	def check_alive(self) -> bool:
+		"""
+		Whether anybody is still playing, moving the action pass down to the smallest bucket that holds them.
+
+		This is the one host read a running episode needs, which is why the loop only takes it now and then,
+		and the only point where the bucket can change.
+		"""
+		alive = self.world.alive()
+		living = int(alive.sum())
+		bucket = min((size for size in self.buckets if size >= living), default=self.bucket)
+		if bucket < self.bucket:
+			# A stable sort puts the living first in agent order, and the dead behind them only pad the bucket
+			self._slots.copy_(torch.argsort(~alive, stable=True))
+			slots = self._slots[:bucket]
+			with torch.no_grad():
+				for name, tensor in self.population.weights.items():
+					torch.index_select(tensor, 0, slots, out=self._weights[name][:bucket])
+				for name, tensor in self.population.biases.items():
+					torch.index_select(tensor, 0, slots, out=self._biases[name][:bucket])
+			self.bucket = bucket
+		return living > 0
