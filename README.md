@@ -294,14 +294,18 @@ How the ladder is built is the whole thing working or not, and both refinements 
 
 The entropy bonus anneals against updates spent on the current rung rather than updates in the run, for the
 same reason: a curriculum can sit on one stretch for hundreds of updates, and a bonus annealed against the
-run is at its floor by the time the hard rungs come up. A rung that clears nothing at all for 25 rollouts is
-called stuck, and doubles what the bonus restarts on, up to a ceiling of 0.08.
+run is at its floor by the time the hard rungs come up. A rung whose clear rate stays under 10% for 25
+rollouts is called stuck, and doubles what the bonus restarts on, up to a ceiling of 0.08. The bar is a rate
+rather than zero clears because a rung the policy has settled away from still lets the odd lucky episode
+through: on a count any single clear resets, `--seed 1` sat 370 updates on rung 10 with the detector silent
+while the bonus annealed its entropy down to 0.2.
 
 That is aimed at one failure in particular. The hardest jump on `maps/level_1.txt` is a 6-tile gap taken two
 rows uphill off a 4-tile platform, at tile 639: one random agent in 16,384 lands it, against about 50 in
 16,384 for the rungs either side. A policy that has already settled explores a good deal less than a random
-one, so the way past a rung like that is to put the noise back rather than to wait. Over a run that clears
-all 57 rungs it fires exactly once, on that one.
+one, so the way past a rung like that is to put the noise back rather than to wait. On most seeds it fires
+six to ten times on that rung, the bonus pinned at its ceiling, and it is still the most expensive rung of
+the ladder by far.
 
 The front moves one rung back each time 60% of the episodes started there reach the rung in front of it.
 Reaching the *next rung* rather than the flag is what keeps every promotion asking for the same thing, one
@@ -309,14 +313,21 @@ stretch of level; asking for a full run instead makes each promotion harder than
 ladder somewhere in the middle of the map. Rungs already behind the front keep 40% of the episodes, which is
 what stops the earlier ones being forgotten.
 
+An episode is judged the moment it reaches the next rung, not when it ends. A policy that clears its rung
+carries on toward the flag, which low on the ladder is tens of seconds of play, so judged at the end a success
+would reach the curriculum several rollouts late while the failures, being short, arrive first: a front near
+the start would judge a handful of episodes a rollout and promote long after the policy is ready.
+
 `--spawn uniform` draws any rung with equal probability and `--spawn start` always uses the level's own spawn
 point, which is the honest baseline the curriculum is measured against.
 
-**What it comes to.** `--seed 1` at the defaults, 1024 environments and 262,144 transitions an update: the
-front leaves the last rung on update 3, reaches the level's own spawn point on update 429, and by update 457
-finishes the level in 156 of 160 episodes, its fastest full run 48.49 seconds against a 44 second route and a
-60 second budget. That is about two hours on a 4060 Ti. The genetic path on the same level plateaus around
-tile 700 of 764 and reaches the flag on two seeds out of five at a thousand agents.
+**What it comes to.** At the defaults, 1024 environments and 262,144 transitions an update, seeds 1 to 5
+reach the level's own spawn point on updates 357, 384, 209, 472 and 370, and by update 800 finish the level
+in 142 of 143 episodes or better, their fastest full runs 46.6 to 48.1 seconds against a 44 second route and
+a 60 second budget. At about five updates a second on a 4060 Ti, that is one to two minutes of training. Judged
+at the end of an episode and stalled on zero clears, the same five seeds reach the spawn point on three of
+them, on updates 413 to 636. The genetic path on the same level plateaus around tile 700 of 764 and reaches
+the flag on two seeds out of five at a thousand agents.
 
 **Rewards are paid where the decision is.** Evolution only needs one number per agent to rank on, so it pays
 distance, coins and the win bonus at the end of the episode. A policy gradient needs to know which decision
@@ -453,26 +464,29 @@ On CUDA the whole tick runs on the device. Measured on a 4060 Ti, on `maps/level
 
 | Trainer | Setup | Ticks/s collecting | Agent-steps/s | Ticks/s counting the update |
 | --- | --- | --- | --- | --- |
-| PPO | 1000 environments | ~7,000 | ~7,000,000 | ~1,700 |
-| Evolution | 300 agents | ~13,600 | ~4,100,000 | ~13,600 |
+| PPO | 1024 environments | ~14,000 | ~14,300,000 | ~3,300 |
+| Evolution | 300 agents | ~13,800 | ~4,100,000 | ~13,800 |
 
-PPO steps fewer ticks a second than evolution at three times the environments and still moves more
-agent-steps, because its action pass reads one network instead of a thousand. What it spends the difference on
-is the rest of a rollout step: the value head, sampling, the buffer writes and the resets.
+PPO steps as many ticks a second as evolution at three times the environments, and moves three times the
+agent-steps, because its action pass reads one network instead of a thousand. A rollout step is compiled
+whole, not just its physics: the episode bookkeeping, the observation, the sampling and the buffer writes were
+a hundred unfused kernels a step, half of what collecting a rollout cost, and inductor folds them into the
+same few kernels as the physics.
 
 **The update is three quarters of the wall clock**, and that is what PPO is. A rollout of 256 decisions on
-1000 environments takes 85 ms to collect and 250 ms to learn from, because learning walks the same 256,000
+1024 environments takes 36 ms to collect and 118 ms to learn from, because learning walks the same 262,144
 transitions four more times, forwards and backwards. Evolution has no such phase: it never learns from what it
 played, it only ranks it. The `Speed:` line reports both rates so the gap is visible rather than surprising.
 
-Getting that 250 ms down was mostly not about the gradient. GAE and the reward scaler are sequential scans
-over the rollout, and written a step at a time they were 127 ms of pure kernel launches for arithmetic on
-1000 floats: everything in them that does not depend on the step before it is now lifted out into one
-whole-rollout call each, which is 40 ms. Compiling the policy's evaluation is worth another third of a
-minibatch, since the trunk is bound by passes over its activations rather than by its matmuls. Half precision
-buys nothing here and neither does TF32; both are the wrong lever on something already at bandwidth.
+**An update is five graph replays.** Launched kernel by kernel, an epoch left the device idle for more than
+half its length, waiting on the host to queue the next of its thousands of launches. The GAE and reward
+scaler scans are captured as one graph, and each epoch as another, its eight minibatches of forward pass,
+backward pass, gradient clipping and a fused, capturable Adam included. The only host read left is the
+divergence check between two epochs. Captured, the scans cost 2 ms against 39 launched one by one, the
+update 118 ms against 287, and what is left is the device actually computing: the trunk is bound by passes over its activations rather than by
+its matmuls, which is why compiling its evaluation pays and why half precision and TF32 both measure nothing.
 
-**Watching costs almost nothing.** The window draws exactly one frame per update, not one per minibatch, and
+**Watching costs almost nothing.** The window draws exactly one frame per update, not one per epoch, and
 that frame does not read the device state back. Every one of those reads would otherwise block on the
 gradient kernels already queued in front of it, which serialises the entire update behind the window. At
 `--speed max` the update still dominates, which is the honest picture: there is nothing to watch at that
