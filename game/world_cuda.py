@@ -270,7 +270,8 @@ class CudaWorld:
 		rows += (tile_x + (GRID_PADDING - AGENT_VISION_DISTANCE)).clamp_(0, self.world.max_window_column)
 
 		flat = out.view(self.count, -1)
-		torch.index_select(self.windows, 0, rows, out=flat[:, :WINDOW_FEATURES])
+		# An assignment rather than `out=`: the slice is not contiguous, and dynamo breaks the graph on that
+		flat[:, :WINDOW_FEATURES] = self.windows.index_select(0, rows)
 		self._enemy_features(flat[:, WINDOW_FEATURES:PLAYER_START])
 		flat[:, PLAYER_START] = self.change_x * (1.0 / PLAYER_SPEED)
 		flat[:, PLAYER_START + 1] = self.change_y * (1.0 / MAX_FALL_SPEED)

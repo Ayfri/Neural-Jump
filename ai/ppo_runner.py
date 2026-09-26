@@ -153,7 +153,7 @@ class PPORunner:
 		self.best_win_tick = torch.full((), NO_WIN, device=device, dtype=torch.int64)
 
 		self.reset_all()
-		self._window = compiled(self._play_window)
+		self._compiled_step = compiled(self._step)
 		self._graph: torch.cuda.CUDAGraph | None = None
 		self._capture()
 		self.reset_all()
@@ -277,9 +277,14 @@ class PPORunner:
 		self._previous_coins *= ~done
 
 	def _step(self) -> None:
-		"""A whole rollout step, which is exactly what the capture covers."""
+		"""
+		A whole rollout step, which is exactly what the compile and the capture cover.
+
+		It is compiled whole rather than just its physics: the episode bookkeeping, the observation, the sampling
+		and the buffer writes would otherwise be a hundred tiny kernels, half of what a step costs.
+		"""
 		self.buffer.write_decision(self.observations, self.actions, self.log_probs, self.values)
-		self._window()
+		self._play_window()
 		self._finish_step()
 		self._decide()
 
@@ -291,13 +296,13 @@ class PPORunner:
 		warmup.wait_stream(torch.cuda.current_stream())
 		with torch.cuda.stream(warmup):
 			for _ in range(3):
-				self._step()
+				self._compiled_step()
 		torch.cuda.current_stream().wait_stream(warmup)
 
 		graph = torch.cuda.CUDAGraph()
 		try:
 			with torch.cuda.graph(graph):
-				self._step()
+				self._compiled_step()
 			self._graph = graph
 		except RuntimeError as error:
 			print(f'CUDA graph capture unavailable, falling back to eager mode: {error}')
@@ -306,7 +311,7 @@ class PPORunner:
 	def collect_step(self) -> None:
 		"""Plays one decision's worth of every environment and stores it in the rollout buffer."""
 		if self._graph is None:
-			self._step()
+			self._compiled_step()
 			return
 		self._graph.replay()
 
