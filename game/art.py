@@ -179,13 +179,17 @@ def shade(color: Color, factor: float) -> Color:
 	return (min(255, int(color[0] * factor)), min(255, int(color[1] * factor)), min(255, int(color[2] * factor)))
 
 
+def mix(start: Color, stop: Color, amount: float) -> Color:
+	return (
+		int(start[0] + (stop[0] - start[0]) * amount),
+		int(start[1] + (stop[1] - start[1]) * amount),
+		int(start[2] + (stop[2] - start[2]) * amount),
+	)
+
+
 def tint(color: Color, amount: float) -> Color:
 	"""Blends towards white rather than scaling, so a light already close to saturation keeps its hue."""
-	return (
-		int(color[0] + (255 - color[0]) * amount),
-		int(color[1] + (255 - color[1]) * amount),
-		int(color[2] + (255 - color[2]) * amount),
-	)
+	return mix(color, (255, 255, 255), amount)
 
 
 def _paint(rows: Sequence[str], palette: Mapping[str, Paint], size: tuple[int, int]) -> Surface:
@@ -328,12 +332,7 @@ def body_sprite(fill: Color, size: tuple[int, int], direction: int, dead: bool, 
 
 def _sky_color(ratio: float) -> Color:
 	"""Night at the top, dusk at the ground: two blends of three colours, met halfway down the layer."""
-	start, stop, blend = (SKY_TOP, SKY_MID, ratio * 2) if ratio < 0.5 else (SKY_MID, SKY_LOW, ratio * 2 - 1)
-	return (
-		int(start[0] + (stop[0] - start[0]) * blend),
-		int(start[1] + (stop[1] - start[1]) * blend),
-		int(start[2] + (stop[2] - start[2]) * blend),
-	)
+	return mix(SKY_TOP, SKY_MID, ratio * 2) if ratio < 0.5 else mix(SKY_MID, SKY_LOW, ratio * 2 - 1)
 
 
 def _bake_sky(width: int, height: int) -> Surface:

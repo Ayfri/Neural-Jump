@@ -12,7 +12,7 @@ from pygame.font import Font
 
 from game.art import (
 	CHECKPOINT_COLOR, COIN_COLOR, COLORKEY, ENEMY_COLOR, Background, bake_level, body_sprite, checkpoint_sprite,
-	coin_sprite, enemy_sprite, jump_sprite, ring_sprite,
+	coin_sprite, enemy_sprite, jump_sprite, mix, ring_sprite,
 )
 from game.menu import MenuStack, Page
 from game.settings import SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
@@ -139,13 +139,7 @@ PLAY_LEGEND: Final[tuple[tuple[Color, str], ...]] = (
 def _bucket_color(bucket: int) -> Color:
 	position = bucket / max(1, FITNESS_BUCKETS - 1) * (len(FITNESS_RAMP) - 1)
 	low = min(int(position), len(FITNESS_RAMP) - 2)
-	blend = position - low
-	start, stop = FITNESS_RAMP[low], FITNESS_RAMP[low + 1]
-	return (
-		int(start[0] + (stop[0] - start[0]) * blend),
-		int(start[1] + (stop[1] - start[1]) * blend),
-		int(start[2] + (stop[2] - start[2]) * blend),
-	)
+	return mix(FITNESS_RAMP[low], FITNESS_RAMP[low + 1], position - low)
 
 
 @lru_cache(maxsize=8)
