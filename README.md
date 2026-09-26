@@ -464,17 +464,17 @@ On CUDA the whole tick runs on the device. Measured on a 4060 Ti, on `maps/level
 
 | Trainer | Setup | Ticks/s collecting | Agent-steps/s | Ticks/s counting the update |
 | --- | --- | --- | --- | --- |
-| PPO | 1024 environments | ~14,000 | ~14,300,000 | ~3,300 |
-| Evolution | 300 agents | ~13,800 | ~4,100,000 | ~13,800 |
+| PPO | 1024 environments | ~20,600 | ~21,100,000 | ~3,800 |
+| Evolution | 300 agents | ~25,600 | ~7,700,000 | ~25,600 |
 
-PPO steps as many ticks a second as evolution at three times the environments, and moves three times the
-agent-steps, because its action pass reads one network instead of a thousand. A rollout step is compiled
-whole, not just its physics: the episode bookkeeping, the observation, the sampling and the buffer writes were
-a hundred unfused kernels a step, half of what collecting a rollout cost, and inductor folds them into the
-same few kernels as the physics.
+PPO steps nearly as many ticks a second as evolution at three times the environments, and moves three times
+the agent-steps, because its action pass reads one network instead of a thousand. A rollout step is compiled
+whole, not just its physics: the episode bookkeeping, the observation, the sampling and the buffer writes would
+otherwise be a hundred unfused kernels a step, half of what collecting a rollout costs, and inductor folds them
+into the same few kernels as the physics.
 
 **The update is three quarters of the wall clock**, and that is what PPO is. A rollout of 256 decisions on
-1024 environments takes 36 ms to collect and 118 ms to learn from, because learning walks the same 262,144
+1024 environments takes 25 ms to collect and 110 ms to learn from, because learning walks the same 262,144
 transitions four more times, forwards and backwards. Evolution has no such phase: it never learns from what it
 played, it only ranks it. The `Speed:` line reports both rates so the gap is visible rather than surprising.
 
@@ -483,7 +483,7 @@ half its length, waiting on the host to queue the next of its thousands of launc
 scaler scans are captured as one graph, and each epoch as another, its eight minibatches of forward pass,
 backward pass, gradient clipping and a fused, capturable Adam included. The only host read left is the
 divergence check between two epochs. Captured, the scans cost 2 ms against 39 launched one by one, the
-update 118 ms against 287, and what is left is the device actually computing: the trunk is bound by passes over its activations rather than by
+update 110 ms against 287, and what is left is the device actually computing: the trunk is bound by passes over its activations rather than by
 its matmuls, which is why compiling its evaluation pays and why half precision and TF32 both measure nothing.
 
 **Watching costs almost nothing.** The window draws exactly one frame per update, not one per epoch, and
@@ -493,20 +493,21 @@ gradient kernels already queued in front of it, which serialises the entire upda
 speed anyway. Watch at `--speed 2` or `--speed 4`, where a rollout takes seconds and the update is a fifth of
 the cycle, or trade sample efficiency for smoothness with `--epochs 2`.
 
-The table below is the genetic path alone, where the action pass is the whole cost. The same tick in numpy,
-which is what a CPU run falls back to, is an order of magnitude slower at that size.
+The table below is the genetic path alone, over generations 4 to 15 of `--seed 1`. The same tick in numpy,
+which is what a CPU run falls back to, is an order of magnitude slower at that size. Ticks/s depends on how
+many agents are still alive, since the action pass only reads the living, so the generation column is the one
+to compare across sizes.
 
-| Setup | Ticks/s | Agent-steps/s | Same tick in numpy |
-| --- | --- | --- | --- |
-| 100 agents | ~21,000 | ~2,100,000 | ~1,200 |
-| 300 agents | ~13,600 | ~4,100,000 | ~1,160 |
-| 600 agents | ~5,500 | ~3,300,000 | ~810 |
-| 1000 agents | ~3,300 | ~3,300,000 | ~620 |
-| 3000 agents | ~1,200 | ~3,600,000 | ~370 |
+| Setup | Ticks/s | Agent-steps/s | Median generation | Same tick in numpy |
+| --- | --- | --- | --- | --- |
+| 100 agents | ~32,000 | ~3,200,000 | 32 ms | ~1,200 |
+| 300 agents | ~25,600 | ~7,700,000 | 53 ms | ~1,160 |
+| 600 agents | ~17,500 | ~10,500,000 | 123 ms | ~810 |
+| 1000 agents | ~9,600 | ~9,600,000 | 223 ms | ~620 |
+| 3000 agents | ~7,600 | ~22,800,000 | 711 ms | ~370 |
 
-At 90 ticks per in-game second, 300 agents playing a 60 second episode take about 0.4 seconds of wall clock.
-Agent-steps flatten out around four million because past a few hundred agents a tick is no longer physics at
-all, it is the action pass reading every agent's weights.
+Past a few hundred agents a tick is no longer physics, it is the action pass reading every living agent's
+weights, which is what the generation times grow with.
 
 **A tick never leaves the device.** Physics, the per-tick rewards and the next decision are one compiled,
 captured graph replayed once per action window, so a window is a single launch and nothing crosses back to
@@ -519,7 +520,20 @@ and the whole state is copied back only when a frame is drawn or a checkpoint en
 each paying a fixed cost whatever the population size, and it measures no faster than numpy at 300 agents.
 Inductor fuses those into 14, which is the order of magnitude, and the graph capture removes what is left of
 the launch cost. Compiling the action pass on top is worth about 3%, because that one moves real bytes, so
-only the simulation is compiled.
+only the simulation is compiled. What inductor cannot fuse splits a window around it, which is why the coin
+pass compares every coin id against the four tiles a player box touches rather than gathering and scattering
+one bit per corner: the comparison is elementwise and folds into the rest of the tick, where the gathers and
+scatters were eight separate kernels a window and about a third of it. Merging the four corners before
+anything is banked is also what counts a coin two corners touch only once.
+
+**The dead are not asked.** Most of a long episode is played by a handful of survivors: over a run at 300
+agents, the share still alive averages an eighth to a half of the population per window. Death is final
+within an episode, so each alive check moves the action pass down a halving ladder of captured graphs, 300,
+150, 75, 37, 18 at the default size, to the smallest one that still holds the living, copying their weights
+once into a compact buffer that every later window reads instead of the whole population. The living get
+exactly the decisions the full pass gives them, and a run's fitness matches it generation for generation. The
+alive check stays at once a second: checking three times as often measures slower, the sync costing more than
+the earlier shrink saves.
 
 **Physics in numpy is bound by call overhead, not by data.** A 300-element `np.add` costs 0.69 us against 0.61 us
 for a one-element one, so nine tenths of a call is dispatch and the vector unit is idle waiting on Python.
@@ -553,9 +567,9 @@ started at the end of the tick before the one that plays it, and that tick's phy
 decides. The observation is taken at the same point either way, so a run is identical to a serial one, down
 to the last float.
 
-What is left is the pass itself, bound by reading every agent's weights: 300 agents of 57k half precision
-parameters is 34 MB, near the memory bandwidth of the card. That is also why the observation is worth
-keeping small, and why `--hidden-sizes` is the last lever on it.
+What is left is the pass itself, bound by reading the living agents' weights: 300 agents of 57k half
+precision parameters is 34 MB, which the card reads out of its 32 MB L2 at 460 to 630 GB/s. That is also why
+the observation is worth keeping small, and why `--hidden-sizes` is the last lever on it.
 
 **A frame is a handful of blits and two lists.** Behind everything sits a parallax backdrop: a sky gradient, a
 star field and three mountain ranges, each one a viewport-sized surface baked at startup and scrolled at its own
