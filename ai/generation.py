@@ -23,9 +23,9 @@ from ai.rewards import (
 	WIN_SPEED_EXPONENT,
 )
 from game.art import COIN_COLOR
-from game.menu import Item, MenuStack, Page, Screen
+from game.menu import MENU_FOOTER, SETTINGS_FOOTER, Item, MenuStack, Page, level_name
 from game.settings import TILE_SIZE
-from game.world import World, list_maps
+from game.world import World
 from game.world_cuda import CudaWorld
 
 if TYPE_CHECKING:
@@ -64,9 +64,6 @@ DEFAULT_SPAWN_MODE: Final[str] = 'curriculum'
 DEFAULT_SPAWN_SPACING: Final[int] = 20  # Tiles between two rungs of the curriculum's ladder
 
 ALIVE_CHECK_TICKS: Final[int] = 90  # Ticks between two host reads of the alive mask, on the device path
-
-MENU_FOOTER: Final[str] = 'Up/Down move   Enter pick   Esc back'
-SETTINGS_FOOTER: Final[str] = 'Left/Right change   Enter toggle   Esc back'
 
 TRAINING_CONTROLS: Final[tuple[tuple[str, str], ...]] = (
 	('Esc', 'Open this menu, or step back out of it'),
@@ -331,39 +328,29 @@ class Generation:
 
 	# --- Menus ---------------------------------------------------------------------------------------------
 
-	@property
-	def level_name(self) -> str:
-		return self.map_path.removeprefix('maps/').removesuffix('.txt')
-
 	def open_menu(self) -> None:
 		self.menu.push(self.pause_page())
 
-	def _resuming(self, action: Callable[[], None]) -> Callable[[], None]:
-		"""Wraps a row so it does its work and hands the run straight back, which is what most of them want."""
-		def run() -> None:
-			action()
-			self.menu.close()
-		return run
-
 	def pause_page(self) -> Page:
 		ppo = self.ppo is not None
-		return Page(Screen.PAUSED, 'Paused', [
-			Item('Resume', self.menu.close),
-			Item('End the rollout now' if ppo else 'Stop the generation now', self._resuming(self.stop_generation)),
-			Item('Next curriculum rung' if ppo else 'Skip this checkpoint', self._resuming(self.skip_checkpoint)),
-			Item('Restart from scratch', self._resuming(self.restart_run)),
-			Item('Settings', lambda: self.menu.push(self.settings_page())),
-			Item('Select level', lambda: self.menu.push(self.maps_page())),
-			Item('Controls', lambda: self.menu.push(self.controls_page())),
+		menu = self.menu
+		return Page('Paused', [
+			Item('Resume', menu.close),
+			Item('End the rollout now' if ppo else 'Stop the generation now', menu.resuming(self.stop_generation)),
+			Item('Next curriculum rung' if ppo else 'Skip this checkpoint', menu.resuming(self.skip_checkpoint)),
+			Item('Restart from scratch', menu.resuming(self.restart_run)),
+			Item('Settings', lambda: menu.push(self.settings_page())),
+			Item('Select level', lambda: menu.push(menu.maps_page(self.map_path, self.request_map, 'The policy carries over, everything the map is baked into is rebuilt'))),
+			Item('Controls', lambda: menu.push(menu.controls_page(TRAINING_CONTROLS))),
 			Item('Quit to title', self.quit_to_title),
-		], subtitle=f'{self.trainer.upper()} on {self.level_name}, update {self.generation}', footer=MENU_FOOTER)
+		], subtitle=f'{self.trainer.upper()} on {level_name(self.map_path)}, update {self.generation}', footer=MENU_FOOTER)
 
 	def settings_page(self) -> Page:
 		from game.render import ZOOM_STEP
 
 		renderer = self.renderer
 		assert renderer is not None
-		return Page(Screen.SETTINGS, 'Settings', [
+		return Page('Settings', [
 			Item('Simulation speed', adjust=lambda step: self.scale_speed(SPEED_STEP ** step),
 				value=lambda: MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),
 			Item('Tune the speed to the framerate', lambda: self.set_speed(MAX_SPEED)),
@@ -375,27 +362,10 @@ class Generation:
 			Item('Back', self.menu.back),
 		], subtitle='The camera lock only ever advances toward the furthest agent', footer=SETTINGS_FOOTER)
 
-	def maps_page(self) -> Page:
-		"""The levels under `maps/`, listed again on every open so one imported mid-run shows up."""
-		maps = list_maps()
-		items = [Item(path.removeprefix('maps/').removesuffix('.txt'), self._loader(path)) for path in maps]
-		page = Page(Screen.MAPS, 'Select level', items,
-			subtitle='The policy carries over, everything the map is baked into is rebuilt', footer=MENU_FOOTER)
-		page.select(maps.index(self.map_path) if self.map_path in maps else 0)
-		return page
-
-	def _loader(self, map_path: str) -> Callable[[], None]:
+	def request_map(self, map_path: str) -> None:
 		"""Asks for a level: what is in flight is dropped and the swap happens between two rollouts."""
-		def pick() -> None:
-			self._map_requested = map_path
-			self.menu.close()
-		return pick
-
-	def controls_page(self) -> Page:
-		return Page(Screen.HELP, 'Controls', [
-			*(Item(key, value=lambda text=description: text) for key, description in TRAINING_CONTROLS),
-			Item('Back', self.menu.back),
-		], footer='Esc back')
+		self._map_requested = map_path
+		self.menu.close()
 
 	def quit_to_title(self) -> None:
 		"""Ends the run and hands the window back, which the shell turns into the title screen again."""
@@ -417,7 +387,7 @@ class Generation:
 		self._map_requested = None
 		print(f'Loading {self.map_path}, which compiles and captures the simulation again')
 		if self.renderer is not None:
-			self.renderer.draw_message(f'Loading {self.level_name}', 'compiling and capturing, a few seconds')
+			self.renderer.draw_message(f'Loading {level_name(self.map_path)}','compiling and capturing, a few seconds')
 
 		self.world = World(map_path, self.population_size)
 		device = self.population.device
@@ -802,7 +772,7 @@ class Generation:
 			]
 		return [
 			*rows,
-			('Map', self.map_path.removeprefix('maps/').removesuffix('.txt')),
+			('Map', level_name(self.map_path)),
 			('Coin', f'+{COIN_REWARD:g} x{self.world.coin_count}'),
 			('Act Repeat', f'{self.action_repeat}'),
 			('Speed', MAX_SPEED if self.auto_speed else f'x{self.speed:g}'),

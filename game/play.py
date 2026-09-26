@@ -8,10 +8,10 @@ import pygame
 
 from game.art import COIN_COLOR
 from game.constants import MOVE_IDLE, MOVE_JUMP, MOVE_LEFT, MOVE_RIGHT
-from game.menu import Item, MenuStack, Page, Screen
+from game.menu import MENU_FOOTER, SETTINGS_FOOTER, Item, MenuStack, Page, level_name
 from game.render import ZOOM_STEP, Gauge, Hud, Legend, PLAY_LEGEND, Panel, Renderer
 from game.settings import PLAYER_SPEED, TILE_SIZE
-from game.world import World, list_maps
+from game.world import World
 
 DEFAULT_TICK_RATE: Final[int] = 90  # The rate the agents are trained at, so a human run is comparable to theirs
 SPEED_STEP: Final[float] = 2.0  # Factor the slower and faster keys apply
@@ -23,9 +23,6 @@ RESPAWN_DELAY: Final[float] = 1.2  # Seconds the end-of-run banner stays up befo
 LEFT_KEYS: Final[tuple[int, ...]] = (pygame.K_LEFT, pygame.K_a, pygame.K_q)
 RIGHT_KEYS: Final[tuple[int, ...]] = (pygame.K_RIGHT, pygame.K_d)
 JUMP_KEYS: Final[tuple[int, ...]] = (pygame.K_UP, pygame.K_w, pygame.K_z, pygame.K_SPACE)
-
-MENU_FOOTER: Final[str] = 'Up/Down move   Enter pick   Esc back'
-SETTINGS_FOOTER: Final[str] = 'Left/Right change   Enter toggle   Esc back'
 
 CONTROLS: Final[tuple[tuple[str, str], ...]] = (
 	('Arrows, WASD, ZQSD', 'Move'),
@@ -107,10 +104,6 @@ class PlaySession:
 
 		self._start_level(spawn)
 
-	@property
-	def level_name(self) -> str:
-		return self.map_path.removeprefix('maps/').removesuffix('.txt')
-
 	def _start_level(self, spawn: int) -> None:
 		"""Starts the loaded level over: its spawn points, a clean record sheet and the first attempt."""
 		self.spawn_points = [self.world.spawn_point, *self.world.checkpoints]
@@ -124,27 +117,21 @@ class PlaySession:
 	def open_menu(self) -> None:
 		self.menu.push(self.pause_page())
 
-	def _resuming(self, action: Callable[[], None]) -> Callable[[], None]:
-		"""Wraps a row so it does its work and hands the level straight back, which is what most of them want."""
-		def run() -> None:
-			action()
-			self.menu.close()
-		return run
-
 	def pause_page(self) -> Page:
-		return Page(Screen.PAUSED, 'Paused', [
-			Item('Resume', self.menu.close),
-			Item('Retry from spawn', self._resuming(self.restart)),
-			Item('Next spawn point', self._resuming(self.next_spawn), value=lambda: f'{self.spawn_index + 1}/{len(self.spawn_points)}'),
-			Item('Settings', lambda: self.menu.push(self.settings_page())),
-			Item('Select level', lambda: self.menu.push(self.maps_page())),
-			Item('Controls', lambda: self.menu.push(self.controls_page())),
+		menu = self.menu
+		return Page('Paused', [
+			Item('Resume', menu.close),
+			Item('Retry from spawn', menu.resuming(self.restart)),
+			Item('Next spawn point', menu.resuming(self.next_spawn), value=lambda: f'{self.spawn_index + 1}/{len(self.spawn_points)}'),
+			Item('Settings', lambda: menu.push(self.settings_page())),
+			Item('Select level', lambda: menu.push(menu.maps_page(self.map_path, self.load_map, 'Loading one starts the records over'))),
+			Item('Controls', lambda: menu.push(menu.controls_page(CONTROLS))),
 			Item('Quit to title', self.quit_to_title),
-		], subtitle=self.level_name, footer=MENU_FOOTER)
+		], subtitle=level_name(self.map_path), footer=MENU_FOOTER)
 
 	def settings_page(self) -> Page:
 		renderer = self.renderer
-		return Page(Screen.SETTINGS, 'Settings', [
+		return Page('Settings', [
 			Item('Simulation speed', adjust=lambda step: self.set_speed(self.speed * SPEED_STEP ** step), value=lambda: f'x{self.speed:g}'),
 			Item('Spawn point', adjust=self.step_spawn, value=lambda: f'{self.spawn_index + 1}/{len(self.spawn_points)}'),
 			Item('Zoom', adjust=lambda step: renderer.set_zoom(renderer.zoom * ZOOM_STEP ** step), value=lambda: f'x{renderer.zoom:.2f}'),
@@ -153,23 +140,6 @@ class PlaySession:
 			Item('Reset the view', renderer.reset_view),
 			Item('Back', self.menu.back),
 		], subtitle='Slow motion reads a jump arc frame by frame', footer=SETTINGS_FOOTER)
-
-	def maps_page(self) -> Page:
-		"""The levels under `maps/`, listed again on every open so one imported mid-session shows up."""
-		maps = list_maps()
-		items = [Item(path.removeprefix('maps/').removesuffix('.txt'), self._loader(path)) for path in maps]
-		page = Page(Screen.MAPS, 'Select level', items, subtitle=f'{len(maps)} levels, loading one starts the records over', footer=MENU_FOOTER)
-		page.select(maps.index(self.map_path) if self.map_path in maps else 0)
-		return page
-
-	def _loader(self, map_path: str) -> Callable[[], None]:
-		return lambda: self.load_map(map_path)
-
-	def controls_page(self) -> Page:
-		return Page(Screen.HELP, 'Controls', [
-			*(Item(key, value=lambda text=description: text) for key, description in CONTROLS),
-			Item('Back', self.menu.back),
-		], footer='Esc back')
 
 	def load_map(self, map_path: str) -> None:
 		"""Swaps the level under the session, records included, since a time on one map says nothing about another."""
@@ -301,7 +271,7 @@ class PlaySession:
 			Gauge('FPS', f'{fps:.0f}/{self.renderer.target_fps}', fps / max(1, self.renderer.target_fps)),
 		])
 		player = Panel('Player', [
-			('Map', self.level_name),
+			('Map', level_name(self.map_path)),
 			('Position', f'{int(world.x[0])}, {int(world.y[0])}'),
 			('Tile', f'{int(world.x[0]) // TILE_SIZE}/{world.width}'),
 			('Speed', f'{world.change_x[0]:+.0f}, {world.change_y[0]:+.0f}'),

@@ -12,22 +12,21 @@ from typing import Final
 
 import numpy as np
 
-from ai.generation import DEFAULT_ENV_COUNT, DEFAULT_POPULATION_SIZE, Generation
-from game.menu import Item, MenuStack, Page, Screen
+from ai.generation import DEFAULT_ENV_COUNT, DEFAULT_POPULATION_SIZE, TRAINERS, Generation
+from game.menu import Item, MenuStack, Page, level_name
 from game.play import DEFAULT_TICK_RATE, PlaySession
 from game.render import Hud, Renderer
-from game.world import World, list_maps
+from game.world import World
 
 # What the title screen needs to build a trainer: the level and the trainer it picked, on the window it owns.
 # The caller closes over everything else, so a command line's knobs reach the run the title screen starts.
 type TrainerFactory = Callable[[str, str, Renderer], Generation]
 
-TRAINERS: Final[tuple[str, ...]] = ('ppo', 'ga')
 TRAINER_LABELS: Final[dict[str, str]] = {
 	'ppo': 'PPO, one shared policy',
 	'ga': 'Evolution, a population',
 }
-MENU_FOOTER: Final[str] = 'Up/Down move   Left/Right change   Enter pick'
+TITLE_FOOTER: Final[str] = 'Up/Down move   Left/Right change   Enter pick'
 
 
 class Shell:
@@ -60,34 +59,22 @@ class Shell:
 		self.running = True
 		self._request = ''  # What a row asked for, acted on once the frame it was clicked in is out
 
-	@property
-	def level_name(self) -> str:
-		return self.map_path.removeprefix('maps/').removesuffix('.txt')
-
 	def title_page(self) -> Page:
 		"""The root page: it is never popped, so Escape inside it goes nowhere and the app always has a screen."""
-		return Page(Screen.TITLE, 'Neural-Jump', [
+		return Page('Neural-Jump', [
 			Item('Play the level yourself', self._asking('play')),
 			Item('Train a policy on it', self._asking('train')),
 			Item('Trainer', adjust=self.step_trainer, value=lambda: TRAINER_LABELS[self.trainer]),
-			Item('Level', lambda: self.menu.push(self.maps_page()), value=lambda: self.level_name),
+			Item('Level', lambda: self.menu.push(self.menu.maps_page(self.map_path, self.pick_map, 'The level both rows above start on')),
+				value=lambda: level_name(self.map_path)),
 			Item('Quit', self.quit),
-		], subtitle='A thousand networks learning one platformer', footer=MENU_FOOTER, root=True)
+		], subtitle='A thousand networks learning one platformer', footer=TITLE_FOOTER, root=True)
 
-	def maps_page(self) -> Page:
-		maps = list_maps()
-		items = [Item(path.removeprefix('maps/').removesuffix('.txt'), self._picker(path)) for path in maps]
-		page = Page(Screen.MAPS, 'Select level', items, subtitle=f'{len(maps)} levels under maps/', footer='Enter picks   Esc back')
-		page.select(maps.index(self.map_path) if self.map_path in maps else 0)
-		return page
-
-	def _picker(self, map_path: str) -> Callable[[], None]:
-		def pick() -> None:
-			self.map_path = Path(map_path).as_posix()
-			self.world = World(self.map_path, 1)
-			self.renderer.set_world(self.world)
-			self.menu.back()
-		return pick
+	def pick_map(self, map_path: str) -> None:
+		self.map_path = Path(map_path).as_posix()
+		self.world = World(self.map_path, 1)
+		self.renderer.set_world(self.world)
+		self.menu.back()
 
 	def _asking(self, request: str) -> Callable[[], None]:
 		def ask() -> None:

@@ -6,19 +6,19 @@ the same few dozen lines draw the title screen, a pause menu and a settings list
 pages exist and what their rows do. The stack is the single source of truth for the state the app is in: an
 empty one is the simulation running, anything else is a menu over a frozen one.
 """
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from typing import Final
+
+from game.world import list_maps
+
+MENU_FOOTER: Final[str] = 'Up/Down move   Enter pick   Esc back'
+SETTINGS_FOOTER: Final[str] = 'Left/Right change   Enter toggle   Esc back'
 
 
-class Screen(Enum):
-	"""What the app is showing. `PLAYING` is the only state the simulation advances in."""
-	PLAYING = auto()
-	TITLE = auto()
-	PAUSED = auto()
-	MAPS = auto()
-	SETTINGS = auto()
-	HELP = auto()
+def level_name(map_path: str) -> str:
+	"""A map path as the menus and panels print it: `maps/smb/1-1.txt` is `smb/1-1`."""
+	return map_path.removeprefix('maps/').removesuffix('.txt')
 
 
 @dataclass(slots=True)
@@ -43,7 +43,6 @@ class Item:
 @dataclass(slots=True)
 class Page:
 	"""One screen of menu. `root` marks the one page the stack refuses to pop, which is the title screen."""
-	screen: Screen
 	title: str
 	items: list[Item] = field(default_factory=list)
 	subtitle: str = ''
@@ -92,7 +91,7 @@ class MenuStack:
 	The pages currently open, the last one being the one drawn.
 
 	Pages are pushed rather than swapped, so `back` always has somewhere to return to, and the whole state of
-	the app is `open` plus the top page's `screen`. Nothing else needs to be kept in sync with it.
+	the app is `open` plus the top page. Nothing else needs to be kept in sync with it.
 	"""
 
 	def __init__(self) -> None:
@@ -101,11 +100,6 @@ class MenuStack:
 	@property
 	def page(self) -> Page | None:
 		return self.pages[-1] if self.pages else None
-
-	@property
-	def screen(self) -> Screen:
-		page = self.page
-		return page.screen if page is not None else Screen.PLAYING
 
 	@property
 	def open(self) -> bool:
@@ -128,9 +122,23 @@ class MenuStack:
 		while self.pages and not self.pages[-1].root:
 			self.pages.pop()
 
-	def toggle(self, page: Page) -> None:
-		"""Opens `page`, or closes what is open: the one thing a key that both opens and dismisses a menu needs."""
-		if self.open:
+	def resuming(self, action: Callable[[], None]) -> Callable[[], None]:
+		"""Wraps a row so it does its work and closes the menu, handing the run straight back."""
+		def run() -> None:
+			action()
 			self.close()
-			return
-		self.push(page)
+		return run
+
+	def maps_page(self, current: str, pick: Callable[[str], None], subtitle: str) -> Page:
+		"""The levels under `maps/`, listed again on every open so one imported mid-run shows up, the cursor on `current`."""
+		maps = list_maps()
+		page = Page('Select level', [Item(level_name(path), lambda path=path: pick(path)) for path in maps], subtitle=subtitle, footer=MENU_FOOTER)
+		page.select(maps.index(current) if current in maps else 0)
+		return page
+
+	def controls_page(self, controls: Sequence[tuple[str, str]]) -> Page:
+		"""A key and what it does per row, read-only, with a way back out."""
+		return Page('Controls', [
+			*(Item(key, value=lambda text=description: text) for key, description in controls),
+			Item('Back', self.back),
+		], footer='Esc back')
