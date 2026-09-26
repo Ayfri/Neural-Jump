@@ -29,10 +29,3 @@ TILE_CHARS: Final[dict[str, TileKind]] = {
 	'F': TileKind.FLAG,
 	'E': TileKind.ENEMY,
 }
-
-# Fitness every paying tile is worth, so what a level hands out is read in one place. The flag is worth far
-# more than its number says: reaching it ends the episode, and the training loop pays that out on its own
-TILE_REWARDS: Final[dict[TileKind, float]] = {
-	TileKind.COIN: 5.0,  # Paid per coin, so a full sweep is worth less than reaching the flag
-	TileKind.FLAG: 1.0,
-}

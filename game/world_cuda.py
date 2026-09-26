@@ -36,7 +36,7 @@ class CudaWorld:
 			return torch.as_tensor(np.ascontiguousarray(array), device=device).to(dtype)
 
 		self.solid = constant(world.flat_solid, torch.bool)
-		self.goal = constant(world.flat_goal, torch.float32)
+		self.goal = constant(world.flat_goal, torch.float32)  # Not bool: inductor's four bool gathers cost a window 12 us more
 		self.coin_ids = constant(world.flat_coins, torch.int64)
 		self.coin_columns = torch.arange(max(1, world.coin_count), device=device)
 		self.windows = constant(world.windows, torch.float16)
@@ -100,7 +100,7 @@ class CudaWorld:
 		self.stomped &= keep.unsqueeze(1)
 		self.tick *= keep
 
-	def sync(self) -> World:
+	def sync(self) -> None:
 		"""Writes the device state back into the numpy world the renderer and the fitness pass read."""
 		world = self.world
 		np.copyto(world.x, self.x.cpu().numpy())
@@ -114,7 +114,6 @@ class CudaWorld:
 		np.copyto(world.collected, self.collected.cpu().numpy())
 		np.copyto(world.enemy_step, self.enemy_step.cpu().numpy())
 		np.copyto(world.stomped, self.stomped.cpu().numpy())
-		return world
 
 	def enemy_lookup(self, steps: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
 		"""Position, whether it is still on the map, and heading of each enemy at its step, a sleeping one at its spawn."""

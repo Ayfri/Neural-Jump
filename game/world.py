@@ -11,7 +11,7 @@ from game.settings import (
 	ENEMY_HEIGHT, ENEMY_SPEED, ENEMY_WAKE_DISTANCE, ENEMY_WIDTH, PLAYER_GRAVITY, PLAYER_HEIGHT, PLAYER_JUMP_STRENGTH,
 	PLAYER_SPEED, PLAYER_WIDTH, SCREEN_HEIGHT, STOMP_BOUNCE, TILE_SIZE,
 )
-from game.tiles import TILE_CHARS, TILE_REWARDS, TileKind
+from game.tiles import TILE_CHARS, TileKind
 
 PLAYER_W: Final[int] = int(PLAYER_WIDTH)
 PLAYER_H: Final[int] = int(PLAYER_HEIGHT)
@@ -116,7 +116,6 @@ class World:
 
 	def __init__(self, map_path: str, count: int) -> None:
 		self.count = count
-		self.map_path = map_path
 		self._load_map(map_path)
 
 		self.x = np.zeros(count, dtype=np.float64)
@@ -163,9 +162,7 @@ class World:
 			self.kinds[y, :codes.size] = lookup[codes]
 
 		self.solid = self.kinds == TileKind.SOLID
-		# The flag is the one tile a player wins on, kept as a float grid because the vision windows read it
-		self.goal = np.zeros((self.height, self.width), dtype=np.float32)
-		self.goal[self.kinds == TileKind.FLAG] = TILE_REWARDS[TileKind.FLAG]
+		self.goal = self.kinds == TileKind.FLAG  # The one tile a player wins on
 
 		# Coins are numbered in reading order, so an agent's collected set is one bool per coin
 		coins = np.argwhere(self.kinds == TileKind.COIN)
@@ -193,7 +190,7 @@ class World:
 		self.flat_goal = self.padded_goal.ravel()
 		self.flat_coins = self.padded_coins.ravel()
 		# One lookup on the 2x2 box a player can touch then skips the whole goal or coin pass
-		self.flat_near_goal = near_grid(self.padded_goal != 0).ravel()
+		self.flat_near_goal = near_grid(self.padded_goal).ravel()
 		self.flat_near_coin = near_grid(self.padded_coins >= 0).ravel()
 
 		# Every window of the map, baked once: an observation is then a single gather of contiguous rows
@@ -488,10 +485,10 @@ class World:
 			return
 
 		goal = self.flat_goal
-		hit = goal.take(rows[0] + left) != 0
-		hit |= goal.take(rows[0] + right) != 0
-		hit |= goal.take(rows[1] + left) != 0
-		hit |= goal.take(rows[1] + right) != 0
+		hit = goal.take(rows[0] + left)
+		hit |= goal.take(rows[0] + right)
+		hit |= goal.take(rows[1] + left)
+		hit |= goal.take(rows[1] + right)
 
 		won = alive & hit
 		np.copyto(self.win_tick, tick, where=won)

@@ -1,7 +1,5 @@
-"""What a run pays out, in one place: the per-tick terms, the end of episode terms and the tile payouts."""
+"""What a run pays out, in one place: the per-tick terms and the end of episode terms."""
 from typing import Final
-
-from game.tiles import TILE_REWARDS, TileKind
 
 # Per tick, accumulated while the episode runs
 FORWARD_MOVEMENT_REWARD: Final[float] = 0.02
@@ -13,7 +11,7 @@ FALLING_PENALTY: Final[float] = -0.02
 FALLING_THRESHOLD: Final[int] = 5  # Y distance before penalty
 
 # End of episode
-COIN_REWARD: Final[float] = TILE_REWARDS[TileKind.COIN]  # Every tile's payout lives in one table
+COIN_REWARD: Final[float] = 5.0  # Paid per coin, so a full sweep is worth less than reaching the flag
 DEATH_PENALTY: Final[float] = -20.0
 WIN_BASE_BONUS: Final[float] = 200.0  # Paid for touching the flag at all, whatever the time taken
 WIN_SPEED_BONUS: Final[float] = 1200.0  # Paid on top, scaled by how much of the episode was still left
